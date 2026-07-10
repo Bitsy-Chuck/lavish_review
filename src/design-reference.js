@@ -4,13 +4,18 @@ export const TAILWIND_BROWSER_VERSION = "4.2.4";
 export const DAISYUI_VERSION = "5.5.19";
 export const MERMAID_VERSION = "11.15.0";
 
+// Served locally by this CLI's own express server (see designAssetUrls in server.js) from files
+// vendored into dist/design/ at build time - no CDN, no network egress. These are root-relative
+// paths that resolve against the Lavish session origin, so they only work while the artifact is
+// open through `lavish-axi` (not when the HTML file is double-clicked directly); `export`/`share`
+// inline them into the bundle via resolveDesignAssetPath, so those keep working too.
 export const DESIGN_CDN_URLS = {
-  tailwind: `https://cdn.jsdelivr.net/npm/@tailwindcss/browser@${TAILWIND_BROWSER_VERSION}/dist/index.global.js`,
-  daisyui: `https://cdn.jsdelivr.net/npm/daisyui@${DAISYUI_VERSION}/daisyui.css`,
-  daisyuiThemes: `https://cdn.jsdelivr.net/npm/daisyui@${DAISYUI_VERSION}/themes.css`,
+  tailwind: "/design/tailwindcss-browser.js",
+  daisyui: "/design/daisyui.css",
+  daisyuiThemes: "/design/daisyui-themes.css",
 };
 
-export const MERMAID_CDN_URL = `https://cdn.jsdelivr.net/npm/mermaid@${MERMAID_VERSION}/dist/mermaid.esm.min.mjs`;
+export const MERMAID_CDN_URL = "/design/mermaid.esm.min.mjs";
 
 export const DESIGN_CDN_SNIPPET = `<link rel="stylesheet" href="${DESIGN_CDN_URLS.daisyui}">
 <link rel="stylesheet" href="${DESIGN_CDN_URLS.daisyuiThemes}">
@@ -19,10 +24,51 @@ export const DESIGN_CDN_SNIPPET = `<link rel="stylesheet" href="${DESIGN_CDN_URL
 export const MERMAID_CDN_SNIPPET = `<script type="module">
   import mermaid from "${MERMAID_CDN_URL}";
 
+  // Mermaid's "base" theme derives its whole palette by running color math over themeVariables, and
+  // that math only understands hex/rgb/hsl - not the oklch() DaisyUI emits, and not var(). So read
+  // each DaisyUI token and rasterize it through a 1x1 canvas to get a plain sRGB hex. Tokens the
+  // theme omits (or the browser rejects) are skipped, so an artifact without DaisyUI silently keeps
+  // Mermaid's stock base theme instead of rendering with a broken palette.
+  const surface = document.createElement("canvas");
+  surface.width = surface.height = 1;
+  const ctx = surface.getContext("2d", { willReadFrequently: true });
+
+  function tokenHex(token) {
+    const value = getComputedStyle(document.documentElement).getPropertyValue(token).trim();
+    if (!value) return "";
+    ctx.fillStyle = "#010203";
+    ctx.fillStyle = value;
+    if (ctx.fillStyle === "#010203") return "";
+    ctx.clearRect(0, 0, 1, 1);
+    ctx.fillRect(0, 0, 1, 1);
+    const pixel = ctx.getImageData(0, 0, 1, 1).data;
+    return "#" + [pixel[0], pixel[1], pixel[2]].map((c) => c.toString(16).padStart(2, "0")).join("");
+  }
+
+  // Borders, arrows, and labels all key off --color-base-content rather than --color-primary: a theme
+  // is only guaranteed that base-content contrasts against its base surfaces, whereas primary is a
+  // brand accent that may collide with them (luxury's primary is pure white, which reads as a harsh
+  // outline against its gold-on-near-black surfaces).
+  const themeVariables = {};
+  for (const [variable, token] of [
+    ["background", "--color-base-100"],
+    ["primaryColor", "--color-base-200"],
+    ["primaryTextColor", "--color-base-content"],
+    ["primaryBorderColor", "--color-base-content"],
+    ["secondaryColor", "--color-base-300"],
+    ["tertiaryColor", "--color-base-100"],
+    ["lineColor", "--color-base-content"],
+    ["textColor", "--color-base-content"],
+  ]) {
+    const hex = tokenHex(token);
+    if (hex) themeVariables[variable] = hex;
+  }
+
   mermaid.initialize({
     startOnLoad: true,
     theme: "base",
     securityLevel: "strict",
+    themeVariables,
   });
 </script>`;
 

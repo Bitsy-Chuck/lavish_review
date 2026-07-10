@@ -169,7 +169,7 @@ test("top-level help renders static home output without dynamic sessions", async
   }
 });
 
-test("design output prints copy-pasteable CDN URLs so agents can opt in to DaisyUI", () => {
+test("design output prints copy-pasteable local /design URLs so agents can opt in to DaisyUI", () => {
   const output = createDesignOutput();
 
   assert.match(output.playbook_router.instruction, /MUST open each matching playbook before writing HTML/);
@@ -193,36 +193,37 @@ test("design output prints copy-pasteable CDN URLs so agents can opt in to Daisy
   assert.match(output.design.summary, /no design direction/i);
   assert.match(output.design.summary, /inspect/i);
   assert.match(output.design.summary, /check first/i);
-  assert.match(output.design.cdn_snippet, /cdn\.jsdelivr\.net\/npm\/daisyui@/);
-  assert.match(output.design.cdn_snippet, /cdn\.jsdelivr\.net\/npm\/daisyui@.*\/themes\.css/);
-  assert.match(output.design.cdn_snippet, /cdn\.jsdelivr\.net\/npm\/@tailwindcss\/browser@/);
+  assert.match(output.design.cdn_snippet, /\/design\/daisyui\.css/);
+  assert.match(output.design.cdn_snippet, /\/design\/daisyui-themes\.css/);
+  assert.match(output.design.cdn_snippet, /\/design\/tailwindcss-browser\.js/);
   assert.match(output.design.layout_safety_snippet, /min-width: 0/);
   assert.match(output.design.layout_safety_snippet, /overflow-wrap: anywhere/);
   assert.match(output.design.layout_safety_snippet, /max-width: 100%/);
   assert.match(output.design.layout_safety_note, /Optional copy-paste CSS/);
   assert.match(output.design.layout_safety_note, /never auto-injects/);
-  assert.match(
-    output.design.cdn_urls.daisyui,
-    /^https:\/\/cdn\.jsdelivr\.net\/npm\/daisyui@\d+\.\d+\.\d+\/daisyui\.css$/,
-  );
-  assert.match(
-    output.design.cdn_urls.daisyuiThemes,
-    /^https:\/\/cdn\.jsdelivr\.net\/npm\/daisyui@\d+\.\d+\.\d+\/themes\.css$/,
-  );
-  assert.match(
-    output.design.cdn_urls.tailwind,
-    /^https:\/\/cdn\.jsdelivr\.net\/npm\/@tailwindcss\/browser@\d+\.\d+\.\d+\/dist\/index\.global\.js$/,
-  );
+  assert.equal(output.design.cdn_urls.daisyui, "/design/daisyui.css");
+  assert.equal(output.design.cdn_urls.daisyuiThemes, "/design/daisyui-themes.css");
+  assert.equal(output.design.cdn_urls.tailwind, "/design/tailwindcss-browser.js");
   assert.match(output.design.other_design_systems, /different design system|other design system/i);
   assert.match(output.diagram_tooling.use_when, /flows \/ architecture \/ state \/ sequence diagrams/);
   assert.match(output.diagram_tooling.use_when, /hand-built div\/flexbox boxes/);
-  assert.match(output.diagram_tooling.mermaid_cdn_snippet, /cdn\.jsdelivr\.net\/npm\/mermaid@\d+\.\d+\.\d+/);
+  assert.match(output.diagram_tooling.mermaid_cdn_snippet, /\/design\/mermaid\.esm\.min\.mjs/);
   assert.match(output.diagram_tooling.mermaid_cdn_snippet, /mermaid\.initialize/);
   assert.match(output.diagram_tooling.mermaid_cdn_snippet, /startOnLoad: true/);
-  assert.match(
-    output.diagram_tooling.cdn_urls.mermaid,
-    /^https:\/\/cdn\.jsdelivr\.net\/npm\/mermaid@\d+\.\d+\.\d+\/dist\/mermaid\.esm\.min\.mjs$/,
-  );
+  assert.match(output.diagram_tooling.mermaid_cdn_snippet, /securityLevel: "strict"/);
+  assert.equal(output.diagram_tooling.cdn_urls.mermaid, "/design/mermaid.esm.min.mjs");
+
+  // The snippet theme-matches DaisyUI, but Mermaid runs color math (khroma) over themeVariables and
+  // khroma throws "Unsupported color format" on both oklch() - which is what DaisyUI 5 emits - and on
+  // var(). Handing either straight to Mermaid breaks every diagram, so the snippet must resolve tokens
+  // to plain sRGB hex in the browser first. Guard the shape rather than the exact colors, ignoring the
+  // snippet's own explanatory comments (which necessarily name the formats they warn against).
+  assert.match(output.diagram_tooling.mermaid_cdn_snippet, /themeVariables/);
+  assert.match(output.diagram_tooling.mermaid_cdn_snippet, /--color-base-content/);
+
+  const snippetCode = output.diagram_tooling.mermaid_cdn_snippet.replace(/^\s*\/\/.*$/gm, "");
+  assert.doesNotMatch(snippetCode, /var\(--color-/);
+  assert.doesNotMatch(snippetCode, /oklch\(/);
   assert.equal(output.diagram_tooling.versions.mermaid, "11.15.0");
   assert.equal("opt_out" in output.design, false);
   assert.equal("rule" in output.design, false);

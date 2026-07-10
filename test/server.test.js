@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
+import * as artifactSdk from "../src/artifact-sdk.js";
 import {
   createChromeHtml,
   createSdkJs,
@@ -126,6 +129,25 @@ test("artifact SDK script is valid JavaScript", () => {
   const js = createSdkJs("abc");
 
   assert.doesNotThrow(() => new Function(js));
+});
+
+// createSdkJs serializes createArtifactSdk with .toString(), which drops its module scope, so every
+// module-level helper the body calls has to be re-declared by hand in the bundle. Parsing the script
+// cannot catch a missed one - it only ReferenceErrors once that code path runs in the browser. Derive
+// the expectation from the module's own exports so adding a helper can never silently regress.
+test("artifact SDK bundle re-declares every artifact-sdk helper its body references", () => {
+  const js = createSdkJs("abc");
+  const body = artifactSdk.createArtifactSdk.toString();
+
+  const referenced = Object.entries(artifactSdk)
+    .filter(([name, value]) => typeof value === "function" && name !== "createArtifactSdk")
+    .map(([name]) => name)
+    .filter((name) => new RegExp(`\\b${name}\\b`).test(body));
+
+  assert.ok(referenced.includes("isSvgLayoutDescendant"), "layout audit should consult the SVG guard");
+  for (const name of referenced) {
+    assert.match(js, new RegExp(`const ${name}\\s*=`), `${name} is referenced but never declared in the SDK bundle`);
+  }
 });
 
 test("artifact SDK ignores Lavish-owned annotation UI", () => {
@@ -1168,9 +1190,92 @@ test("/design serves local Tailwind and DaisyUI artifact assets", async () => {
   }
 });
 
+// The artifact iframe is sandboxed without `allow-same-origin`, so its document has an opaque origin
+// and every ES module fetch leaves it as a cross-origin request (`Origin: null`). Mermaid is the only
+// design asset loaded as a module, so it is the only one that needs `access-control-allow-origin` --
+// exactly the header jsdelivr set when these files were still served from the CDN.
+test("/design serves Mermaid's module entry and lazy chunks with CORS headers for the sandboxed iframe", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const entry = await fetch(`${base}/design/mermaid.esm.min.mjs`);
+    const entrySource = await entry.text();
+
+    assert.equal(entry.status, 200);
+    assert.match(entry.headers.get("content-type") || "", /application\/javascript/);
+    assert.equal(entry.headers.get("access-control-allow-origin"), "*");
+
+    // Mermaid statically imports sibling chunks and lazily import()s one per diagram type, all
+    // relative to the entry file. Resolve one straight out of the served bytes rather than pinning a
+    // content-hashed filename that changes on every Mermaid release.
+    const chunkRef = /\.\/(chunks\/[\w.-]+\/[\w.-]+\.mjs)/.exec(entrySource);
+    assert.ok(chunkRef, "entry should reference at least one relative ./chunks/*.mjs import");
+
+    const chunk = await fetch(`${base}/design/${chunkRef[1]}`);
+    assert.equal(chunk.status, 200);
+    assert.match(chunk.headers.get("content-type") || "", /application\/javascript/);
+    assert.equal(chunk.headers.get("access-control-allow-origin"), "*");
+    assert.ok((await chunk.text()).length > 0);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("design asset resolver only trusts exact packaged design asset paths", () => {
   assert.equal(resolveDesignAssetPath("/design/daisyui.css/extra"), null);
   assert.equal(resolveDesignAssetPath("/design/tailwindcss-browser.js/extra"), null);
+});
+
+// Mermaid lazy-loads ~160 chunks via `/design/chunks/mermaid.esm.min/<hash>.mjs`; export must inline
+// them, so the resolver has to walk into the nested chunk tree - not just single-segment assets.
+test("design asset resolver inlines nested Mermaid chunks and rejects path traversal", async () => {
+  const chunkDir = fileURLToPath(new URL("../node_modules/mermaid/dist/chunks/mermaid.esm.min", import.meta.url));
+  const sample = (await readdir(chunkDir)).find((name) => name.endsWith(".mjs"));
+  assert.ok(sample, "expected at least one vendored Mermaid chunk");
+
+  const resolved = resolveDesignAssetPath(`/design/chunks/mermaid.esm.min/${sample}?v=1`);
+  assert.ok(resolved && existsSync(resolved), "a real lazy chunk should resolve to a local file");
+  assert.equal(path.basename(resolved), sample);
+
+  // The mapped path is read with the confinement guard bypassed, so traversal must be refused here.
+  assert.equal(resolveDesignAssetPath("/design/chunks/../../server.js"), null);
+  assert.equal(resolveDesignAssetPath("/design/chunks/mermaid.esm.min/../../../server.js"), null);
+  // A non-existent chunk is not fabricated.
+  assert.equal(resolveDesignAssetPath("/design/chunks/mermaid.esm.min/nope-does-not-exist.mjs"), null);
+});
+
+// The mapped chunk path is read with the export's confinement guard bypassed, so lexical containment
+// is not enough: a symlink placed inside the chunk tree (or a symlinked intermediate directory) must
+// not let the resolver hand back a file that lives OUTSIDE the design root.
+test("design asset resolver rejects symlink escapes out of the design chunk tree", async () => {
+  // Match resolveMermaidChunksDir's packaged-then-source order to find the exact dir the module uses.
+  const chunksRoot = [
+    fileURLToPath(new URL("../dist/design/chunks", import.meta.url)),
+    fileURLToPath(new URL("../node_modules/mermaid/dist/chunks", import.meta.url)),
+  ].find((dir) => existsSync(dir));
+  assert.ok(chunksRoot, "expected a vendored Mermaid chunk directory");
+
+  const outsideDir = await mkdtemp(path.join(tmpdir(), "lavish-escape-"));
+  const outsideFile = path.join(outsideDir, "secret.mjs");
+  await writeFile(outsideFile, "export const secret = 1;\n");
+
+  const fileLink = path.join(chunksRoot, "lavish-escape-file.mjs");
+  const dirLink = path.join(chunksRoot, "lavish-escape-dir");
+  try {
+    // A symlinked file inside the chunk tree pointing at an outside file.
+    await symlink(outsideFile, fileLink);
+    assert.equal(resolveDesignAssetPath("/design/chunks/lavish-escape-file.mjs"), null);
+
+    // A symlinked intermediate directory component pointing outside the root.
+    await symlink(outsideDir, dirLink);
+    assert.equal(resolveDesignAssetPath("/design/chunks/lavish-escape-dir/secret.mjs"), null);
+  } finally {
+    await rm(fileLink, { force: true });
+    await rm(dirLink, { force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
 });
 
 test("GET /api/:key/export inlines local assets and leaves remote references intact", async () => {

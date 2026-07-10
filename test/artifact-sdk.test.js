@@ -8,6 +8,7 @@ import {
   fragmentsSignificantlyOverlap,
   isModeToggleHotkeyEvent,
   isNativeInteractiveControl,
+  isSvgLayoutDescendant,
   resolveVisibleSpillCandidates,
 } from "../src/artifact-sdk.js";
 
@@ -313,4 +314,33 @@ test("isModeToggleHotkeyEvent rejects extra shift or alt modifiers", () => {
 test("isModeToggleHotkeyEvent ignores other keys even with a modifier held", () => {
   assert.equal(isModeToggleHotkeyEvent({ key: "e", metaKey: true }), false);
   assert.equal(isModeToggleHotkeyEvent({ key: "Enter", metaKey: true }), false);
+});
+
+// Regression: Mermaid renders labels as SVG <text>, which has no CSS scroll box and cannot clip its
+// own content. Chrome still answers clientWidth/scrollWidth/scrollHeight on it with numbers derived
+// from unrelated geometry (a 32px-wide "User" label reports clientWidth 257, scrollHeight 24 vs
+// clientHeight 21), so auditing SVG internals reported phantom element-scroll-overflow and
+// clipped-text findings at error severity on every sequence diagram - slamming the layout gate shut.
+test("isSvgLayoutDescendant skips SVG internals but keeps the root <svg> and foreignObject HTML", () => {
+  const svgRoot = { ownerSVGElement: null };
+  const gNode = { ownerSVGElement: svgRoot };
+  const svgText = { ownerSVGElement: svgRoot };
+  const foreignObject = { ownerSVGElement: svgRoot };
+  const htmlInsideForeignObject = {}; // HTMLElement: no ownerSVGElement property at all
+  const plainDiv = {};
+
+  // The root <svg> is a replaced element with a real CSS box, so a too-wide diagram must still flag.
+  assert.equal(isSvgLayoutDescendant(svgRoot), false);
+  // HTML re-entering the tree through <foreignObject> has real CSS boxes and can genuinely clip.
+  assert.equal(isSvgLayoutDescendant(htmlInsideForeignObject), false);
+  assert.equal(isSvgLayoutDescendant(plainDiv), false);
+
+  assert.equal(isSvgLayoutDescendant(gNode), true);
+  assert.equal(isSvgLayoutDescendant(svgText), true);
+  assert.equal(isSvgLayoutDescendant(foreignObject), true);
+});
+
+test("isSvgLayoutDescendant tolerates nullish input", () => {
+  assert.equal(isSvgLayoutDescendant(null), false);
+  assert.equal(isSvgLayoutDescendant(undefined), false);
 });

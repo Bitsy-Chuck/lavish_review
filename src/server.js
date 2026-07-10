@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -16,6 +16,7 @@ import {
   fragmentsSignificantlyOverlap,
   isModeToggleHotkeyEvent,
   isNativeInteractiveControl,
+  isSvgLayoutDescendant,
   MODE_TOGGLE_HOTKEY_KEY,
   resolveVisibleSpillCandidates,
 } from "./artifact-sdk.js";
@@ -49,7 +50,40 @@ const designAssetUrls = {
     source: new URL("../node_modules/@tailwindcss/browser/dist/index.global.js", import.meta.url),
     type: "application/javascript",
   },
+  "mermaid.esm.min.mjs": {
+    packaged: new URL("./design/mermaid.esm.min.mjs", import.meta.url),
+    source: new URL("../node_modules/mermaid/dist/mermaid.esm.min.mjs", import.meta.url),
+    type: "application/javascript",
+  },
 };
+
+// Mermaid splits its renderer across one chunk per diagram type, resolved relative to its ESM entry.
+// Same packaged/source pair as designAssetUrls: dist/design/chunks in a built CLI, node_modules in a
+// source run.
+const mermaidChunksDirUrls = {
+  packaged: new URL("./design/chunks", import.meta.url),
+  source: new URL("../node_modules/mermaid/dist/chunks", import.meta.url),
+};
+
+const mermaidChunksDir = resolveMermaidChunksDir();
+
+function resolveMermaidChunksDir() {
+  for (const url of [mermaidChunksDirUrls.packaged, mermaidChunksDirUrls.source]) {
+    const dir = fileURLToPath(url);
+    if (existsSync(dir)) return dir;
+  }
+  return null;
+}
+
+// Artifacts render in an iframe sandboxed without `allow-same-origin`, giving the document an opaque
+// origin. ES module fetches - `<script type="module">`, static imports, and dynamic import() - always
+// use CORS mode, so Mermaid's requests reach this server as cross-origin with `Origin: null` and are
+// blocked unless the response allows them. Classic `<script src>` and `<link rel="stylesheet">` are
+// no-cors, which is why Tailwind and DaisyUI load without this and only Mermaid broke once these
+// files moved off the CDN. jsdelivr answered every one of them with `access-control-allow-origin: *`.
+function allowSandboxedArtifactOrigin(res) {
+  res.setHeader("access-control-allow-origin", "*");
+}
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
 
@@ -486,11 +520,29 @@ export async function serve({
         res.status(404).send("Not found");
         return;
       }
+      allowSandboxedArtifactOrigin(res);
       res.type(asset.type).send(await readDesignAsset(asset));
     } catch (error) {
       next(error);
     }
   });
+
+  // Mermaid's ESM entry statically imports sibling chunks and lazily import()s one more per diagram
+  // type, all relative to itself (`./chunks/mermaid.esm.min/*.mjs`). Those nested paths cannot match
+  // the single-segment `/design/:asset` route, so serve the vendored chunk tree beside the entry.
+  if (mermaidChunksDir) {
+    app.use(
+      "/design/chunks",
+      express.static(mermaidChunksDir, {
+        setHeaders: (res) => {
+          allowSandboxedArtifactOrigin(res);
+          // express.static would label .mjs as text/javascript; keep the application/javascript that
+          // both the /design/:asset route and jsdelivr use, so the two paths stay indistinguishable.
+          res.setHeader("content-type", "application/javascript; charset=utf-8");
+        },
+      }),
+    );
+  }
 
   app.get("/sdk.js", (req, res) => {
     res.type("application/javascript").send(createSdkJs(String(req.query.key || "")));
@@ -599,11 +651,18 @@ async function readDesignAsset(asset) {
   }
 }
 
-// Map a legacy root-absolute `/design/<asset>` reference to the packaged design file on disk
-// (falling back to the node_modules source for source runs) so an export can inline it instead
-// of pointing back at this server's `/design` route.
+// Map a root-absolute `/design/...` reference to the packaged design file on disk (falling back to
+// the node_modules source for source runs) so an export can inline it instead of pointing back at
+// this server's `/design` route. Two shapes resolve: the single-segment legacy assets
+// (`/design/daisyui.css`) and Mermaid's nested lazy-loaded chunk tree
+// (`/design/chunks/mermaid.esm.min/<hash>.mjs`), which mirrors the `/design/chunks` static route.
 export function resolveDesignAssetPath(refPath) {
-  const match = /^\/design\/([^/?#]+)(?:[?#].*)?$/.exec(refPath);
+  const pathname = String(refPath).replace(/[?#].*$/, "");
+
+  const chunk = /^\/design\/chunks\/(.+)$/.exec(pathname);
+  if (chunk) return resolveMermaidChunkPath(chunk[1]);
+
+  const match = /^\/design\/([^/]+)$/.exec(pathname);
   if (!match) return null;
   const asset = designAssetUrls[match[1]];
   if (!asset) return null;
@@ -611,6 +670,38 @@ export function resolveDesignAssetPath(refPath) {
   if (existsSync(packaged)) return packaged;
   const source = fileURLToPath(asset.source);
   return existsSync(source) ? source : null;
+}
+
+// Resolve a `/design/chunks/<rel>` reference to a real file inside the vendored Mermaid chunk tree.
+// The mapped path is read with the export's confinement guard bypassed (`allowOutsideRoot`), so this
+// resolver is the security boundary. Lexical containment alone is not enough: a symlink placed under
+// the chunks tree (or a symlinked intermediate component) could point at a file outside the design
+// root and be returned as trusted. So canonicalize both the target and the root with realpath - the
+// same real-path check the export's guardedRead uses - and reject anything whose REAL path escapes
+// the REAL root.
+function resolveMermaidChunkPath(relRef) {
+  if (!mermaidChunksDir) return null;
+  const root = path.resolve(mermaidChunksDir);
+  const resolved = path.resolve(root, relRef);
+  // Cheap lexical guard first: reject obvious `..` escapes before touching the filesystem.
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) return null;
+  // Canonicalize to defeat symlink escapes. realpathSync resolves every symlink component and throws
+  // on a nonexistent or broken path, so a missing chunk falls through to null.
+  let realResolved;
+  try {
+    realResolved = realpathSync(resolved);
+  } catch {
+    return null;
+  }
+  let realRoot;
+  try {
+    realRoot = realpathSync(root);
+  } catch {
+    realRoot = root;
+  }
+  const rel = path.relative(realRoot, realResolved);
+  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return null;
+  return realResolved;
 }
 
 export function exportContentDisposition(file) {
@@ -956,6 +1047,7 @@ const fragmentsSignificantlyOverlap=${fragmentsSignificantlyOverlap.toString()};
 const resolveVisibleSpillCandidates=${resolveVisibleSpillCandidates.toString()};
 const classifyHorizontalOverflow=${classifyHorizontalOverflow.toString()};
 const classifyVerticalOverflow=${classifyVerticalOverflow.toString()};
+const isSvgLayoutDescendant=${isSvgLayoutDescendant.toString()};
 ${mermaidHelperDecls}
 const mermaidHelpers={ ${mermaidHelperKeys} };
 (${createArtifactSdk.toString()})(deriveQueueKey, isNativeInteractiveControl, mermaidHelpers);
