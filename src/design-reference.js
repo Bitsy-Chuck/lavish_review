@@ -7,8 +7,11 @@ export const MERMAID_VERSION = "11.15.0";
 // Served locally by this CLI's own express server (see designAssetUrls in server.js) from files
 // vendored into dist/design/ at build time - no CDN, no network egress. These are root-relative
 // paths that resolve against the Lavish session origin, so they only work while the artifact is
-// open through `lavish-axi` (not when the HTML file is double-clicked directly); `export`/`share`
-// inline them into the bundle via resolveDesignAssetPath, so those keep working too.
+// open through `lavish-axi` (not when the HTML file is double-clicked directly). `export`/`share`
+// inline them into the bundle via resolveDesignAssetPath so they keep working offline: the classic
+// Tailwind script and DaisyUI stylesheets become inline <style>/<script>, and the Mermaid inline
+// module (below) plus its lazy ./chunks tree are inlined as data: modules behind an injected import
+// map (see inlineLocalDesignModuleImports in export-bundle.js).
 export const DESIGN_CDN_URLS = {
   tailwind: "/design/tailwindcss-browser.js",
   daisyui: "/design/daisyui.css",
