@@ -147,6 +147,20 @@ export function fragmentsSignificantlyOverlap(fragmentsA, fragmentsB, { minAreaR
   return false;
 }
 
+// True for elements *inside* an <svg>. The overflow classifiers below read CSS scroll-box metrics
+// (clientWidth/scrollWidth/clientHeight/scrollHeight), which are only defined for elements that have
+// a CSS box. SVG graphics elements do not: a <text> node has no scroll box and can never clip its own
+// content, yet Chrome still answers those properties with numbers derived from unrelated geometry -
+// a 32px-wide Mermaid "User" label reports clientWidth 257 and scrollHeight 24 against clientHeight
+// 21. Auditing SVG internals therefore invents error-severity overflow and clipped-text findings on
+// every Mermaid diagram. Two cases must stay auditable, so this keys off `ownerSVGElement` rather
+// than the SVG namespace: the root <svg> (a replaced element with a real CSS box, so a genuinely
+// too-wide diagram still flags - SVGSVGElement.ownerSVGElement is null) and HTML re-entering the tree
+// through <foreignObject> (plain HTMLElements, which have no ownerSVGElement property at all).
+export function isSvgLayoutDescendant(el) {
+  return !!el && el.ownerSVGElement != null;
+}
+
 // scrollWidth/scrollHeight can only exceed clientWidth/clientHeight when something constrains
 // the box's size (a fixed height/width, or a flex/grid item smaller than its content) - a box
 // that simply grows to fit its content always has scrollHeight === clientHeight, so this never
@@ -666,7 +680,9 @@ export function createArtifactSdk(
     function walk(el) {
       if (!(el instanceof Element) || isLavishUi(el)) return;
       if (isIntentionalHorizontalScroller(el)) return;
-      elements.push(el);
+      // Skip auditing SVG internals, whose scroll-box metrics are meaningless, but keep descending:
+      // <foreignObject> re-enters HTML (Mermaid renders flowchart labels there) and that does clip.
+      if (!isSvgLayoutDescendant(el)) elements.push(el);
       for (const child of el.children) walk(child);
     }
 

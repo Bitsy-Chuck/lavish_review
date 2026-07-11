@@ -33,6 +33,7 @@
     "chokidar": "^4.0.3",
     "daisyui": "^5.5.19",
     "express": "^5.2.1",
+    "mermaid": "11.15.0",
     "open": "^10.2.0"
   },
   "devDependencies": {

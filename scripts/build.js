@@ -1,4 +1,4 @@
-import { chmod, copyFile, mkdir, readFile } from "node:fs/promises";
+import { chmod, cp, copyFile, mkdir, readFile, rm } from "node:fs/promises";
 
 import * as esbuild from "esbuild";
 
@@ -28,3 +28,12 @@ await mkdir("dist/design", { recursive: true });
 await copyFile("node_modules/daisyui/daisyui.css", "dist/design/daisyui.css");
 await copyFile("node_modules/daisyui/themes.css", "dist/design/daisyui-themes.css");
 await copyFile("node_modules/@tailwindcss/browser/dist/index.global.js", "dist/design/tailwindcss-browser.js");
+await copyFile("node_modules/mermaid/dist/mermaid.esm.min.mjs", "dist/design/mermaid.esm.min.mjs");
+// Mermaid lazy-loads each diagram type via relative dynamic import() at render time (e.g.
+// `import("./chunks/mermaid.esm.min/flowDiagram-*.mjs")`), so the chunk tree has to be vendored
+// alongside the entry file for local rendering to stay fully offline. Purge any previously copied
+// chunks first so a Mermaid upgrade that renames content-hashed chunks can't leave orphans behind.
+await rm("dist/design/chunks", { recursive: true, force: true });
+await cp("node_modules/mermaid/dist/chunks/mermaid.esm.min", "dist/design/chunks/mermaid.esm.min", {
+  recursive: true,
+});

@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
+import * as artifactSdk from "../src/artifact-sdk.js";
+import { DESIGN_CDN_SNIPPET, MERMAID_CDN_SNIPPET } from "../src/design-reference.js";
+import { buildSelfContainedHtml, splitExportWarnings } from "../src/export-bundle.js";
 import {
   createChromeHtml,
   createSdkJs,
@@ -126,6 +131,25 @@ test("artifact SDK script is valid JavaScript", () => {
   const js = createSdkJs("abc");
 
   assert.doesNotThrow(() => new Function(js));
+});
+
+// createSdkJs serializes createArtifactSdk with .toString(), which drops its module scope, so every
+// module-level helper the body calls has to be re-declared by hand in the bundle. Parsing the script
+// cannot catch a missed one - it only ReferenceErrors once that code path runs in the browser. Derive
+// the expectation from the module's own exports so adding a helper can never silently regress.
+test("artifact SDK bundle re-declares every artifact-sdk helper its body references", () => {
+  const js = createSdkJs("abc");
+  const body = artifactSdk.createArtifactSdk.toString();
+
+  const referenced = Object.entries(artifactSdk)
+    .filter(([name, value]) => typeof value === "function" && name !== "createArtifactSdk")
+    .map(([name]) => name)
+    .filter((name) => new RegExp(`\\b${name}\\b`).test(body));
+
+  assert.ok(referenced.includes("isSvgLayoutDescendant"), "layout audit should consult the SVG guard");
+  for (const name of referenced) {
+    assert.match(js, new RegExp(`const ${name}\\s*=`), `${name} is referenced but never declared in the SDK bundle`);
+  }
 });
 
 test("artifact SDK ignores Lavish-owned annotation UI", () => {
@@ -1168,9 +1192,217 @@ test("/design serves local Tailwind and DaisyUI artifact assets", async () => {
   }
 });
 
+// The artifact iframe is sandboxed without `allow-same-origin`, so its document has an opaque origin
+// and every ES module fetch leaves it as a cross-origin request (`Origin: null`). Mermaid is the only
+// design asset loaded as a module, so it is the only one that needs `access-control-allow-origin` --
+// exactly the header jsdelivr set when these files were still served from the CDN.
+test("/design serves Mermaid's module entry and lazy chunks with CORS headers for the sandboxed iframe", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const entry = await fetch(`${base}/design/mermaid.esm.min.mjs`);
+    const entrySource = await entry.text();
+
+    assert.equal(entry.status, 200);
+    assert.match(entry.headers.get("content-type") || "", /application\/javascript/);
+    assert.equal(entry.headers.get("access-control-allow-origin"), "*");
+
+    // Mermaid statically imports sibling chunks and lazily import()s one per diagram type, all
+    // relative to the entry file. Resolve one straight out of the served bytes rather than pinning a
+    // content-hashed filename that changes on every Mermaid release.
+    const chunkRef = /\.\/(chunks\/[\w.-]+\/[\w.-]+\.mjs)/.exec(entrySource);
+    assert.ok(chunkRef, "entry should reference at least one relative ./chunks/*.mjs import");
+
+    const chunk = await fetch(`${base}/design/${chunkRef[1]}`);
+    assert.equal(chunk.status, 200);
+    assert.match(chunk.headers.get("content-type") || "", /application\/javascript/);
+    assert.equal(chunk.headers.get("access-control-allow-origin"), "*");
+    assert.ok((await chunk.text()).length > 0);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("design asset resolver only trusts exact packaged design asset paths", () => {
   assert.equal(resolveDesignAssetPath("/design/daisyui.css/extra"), null);
   assert.equal(resolveDesignAssetPath("/design/tailwindcss-browser.js/extra"), null);
+});
+
+// Mermaid lazy-loads ~160 chunks via `/design/chunks/mermaid.esm.min/<hash>.mjs`; export must inline
+// them, so the resolver has to walk into the nested chunk tree - not just single-segment assets.
+test("design asset resolver inlines nested Mermaid chunks and rejects path traversal", async () => {
+  const chunkDir = fileURLToPath(new URL("../node_modules/mermaid/dist/chunks/mermaid.esm.min", import.meta.url));
+  const sample = (await readdir(chunkDir)).find((name) => name.endsWith(".mjs"));
+  assert.ok(sample, "expected at least one vendored Mermaid chunk");
+
+  const resolved = resolveDesignAssetPath(`/design/chunks/mermaid.esm.min/${sample}?v=1`);
+  assert.ok(resolved && existsSync(resolved), "a real lazy chunk should resolve to a local file");
+  assert.equal(path.basename(resolved), sample);
+
+  // The mapped path is read with the confinement guard bypassed, so traversal must be refused here.
+  assert.equal(resolveDesignAssetPath("/design/chunks/../../server.js"), null);
+  assert.equal(resolveDesignAssetPath("/design/chunks/mermaid.esm.min/../../../server.js"), null);
+  // A non-existent chunk is not fabricated.
+  assert.equal(resolveDesignAssetPath("/design/chunks/mermaid.esm.min/nope-does-not-exist.mjs"), null);
+});
+
+// The mapped chunk path is read with the export's confinement guard bypassed, so lexical containment
+// is not enough: a symlink placed inside the chunk tree (or a symlinked intermediate directory) must
+// not let the resolver hand back a file that lives OUTSIDE the design root.
+test("design asset resolver rejects symlink escapes out of the design chunk tree", async () => {
+  // Match resolveMermaidChunksDir's packaged-then-source order to find the exact dir the module uses.
+  const chunksRoot = [
+    fileURLToPath(new URL("../dist/design/chunks", import.meta.url)),
+    fileURLToPath(new URL("../node_modules/mermaid/dist/chunks", import.meta.url)),
+  ].find((dir) => existsSync(dir));
+  assert.ok(chunksRoot, "expected a vendored Mermaid chunk directory");
+
+  const outsideDir = await mkdtemp(path.join(tmpdir(), "lavish-escape-"));
+  const outsideFile = path.join(outsideDir, "secret.mjs");
+  await writeFile(outsideFile, "export const secret = 1;\n");
+
+  const fileLink = path.join(chunksRoot, "lavish-escape-file.mjs");
+  const dirLink = path.join(chunksRoot, "lavish-escape-dir");
+  try {
+    // A symlinked file inside the chunk tree pointing at an outside file.
+    await symlink(outsideFile, fileLink);
+    assert.equal(resolveDesignAssetPath("/design/chunks/lavish-escape-file.mjs"), null);
+
+    // A symlinked intermediate directory component pointing outside the root.
+    await symlink(outsideDir, dirLink);
+    assert.equal(resolveDesignAssetPath("/design/chunks/lavish-escape-dir/secret.mjs"), null);
+  } finally {
+    await rm(fileLink, { force: true });
+    await rm(dirLink, { force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
+});
+
+// The de-CDN Mermaid snippet is an inline `type="module"` that imports `/design/mermaid.esm.min.mjs`.
+// Left as a reference, that specifier 404s from file://` or a hosted export and aborts the whole
+// module (dead diagram + dead theme/handler setup). Exporting must inline the entry AND its lazy
+// ./chunks graph as data: modules behind an injected import map so it renders offline, zero network.
+test("export inlines the Mermaid module + its chunk graph as offline data: modules", async () => {
+  const html =
+    `<!doctype html><html><head><meta charset="utf-8"><title>T</title>${DESIGN_CDN_SNIPPET}</head>` +
+    `<body data-theme="luxury"><pre class="mermaid">graph TD; A[Start]-->B-->C[End];</pre>` +
+    `${MERMAID_CDN_SNIPPET}</body></html>`;
+
+  let reads = 0;
+  const { html: out, warnings } = await buildSelfContainedHtml(html, {
+    baseDir: process.cwd(),
+    resolveAbsolute: resolveDesignAssetPath,
+    readLocalFile: async (p) => {
+      reads += 1;
+      return readFile(p);
+    },
+  });
+
+  // (a) No dangling /design/... module specifier survives anywhere in the output.
+  assert.doesNotMatch(out, /\/design\//, "no /design/ reference should remain after inlining");
+  // The inline module now imports a bare id that the injected import map resolves.
+  assert.match(out, /import mermaid from "lavish-mod-\d+"/);
+
+  // (b) Exactly one import map is injected, all entries are self-contained data: modules, and it
+  // precedes the CONSUMING module script in document order (required for the browser to honor it).
+  const maps = out.match(/<script type="importmap">/g) || [];
+  assert.equal(maps.length, 1, "exactly one import map");
+  // The import map is the first child of <head> ...
+  assert.match(out, /<head\b[^>]*>\s*<script type="importmap">/, "import map is the first head child");
+  // ... and its closing tag ends strictly before the real module script that references the bare id.
+  const mapStart = out.indexOf('<script type="importmap">');
+  const mapEnd = out.indexOf("</script>", mapStart) + "</script>".length;
+  const consumerRef = out.search(/import\s+mermaid\s+from\s+"lavish-mod-\d+"/);
+  assert.ok(consumerRef > -1, "found the consuming import statement");
+  const moduleTagStart = out.lastIndexOf("<script", consumerRef);
+  assert.ok(moduleTagStart > mapEnd, "found the consuming <script type=module> after the map");
+  assert.ok(
+    mapEnd < moduleTagStart,
+    `import map (ends @${mapEnd}) must end before the consuming module script (@${moduleTagStart})`,
+  );
+  const map = JSON.parse(out.match(/<script type="importmap">([\s\S]*?)<\/script>/)[1]);
+  const ids = Object.keys(map.imports);
+  assert.ok(ids.length > 50, `expected the full Mermaid chunk graph inlined, got ${ids.length}`);
+  assert.ok(
+    ids.every((id) => map.imports[id].startsWith("data:text/javascript;base64,")),
+    "every module is inlined as a data: URL",
+  );
+
+  // The Mermaid entry is present inline and its own imports were rewritten to bare ids (so the graph
+  // is self-referential through the import map, not through dead /design paths); at least one lazy
+  // diagram chunk is present too.
+  const decoded = ids.map((id) => Buffer.from(map.imports[id].split(",")[1], "base64").toString("utf8"));
+  const entry = decoded.find((src) => /"initialize"/.test(src) && /"render"/.test(src));
+  assert.ok(entry, "the Mermaid entry module is inlined");
+  assert.match(entry, /(?:from|import)\s*\(?\s*"lavish-mod-\d+"/, "entry imports are rewritten to bare ids");
+  assert.ok(
+    decoded.some((src) => /flowchart|flowDiagram/i.test(src)),
+    "a lazy-loaded diagram chunk is inlined",
+  );
+
+  // (c) Zero network egress: no http(s) / CDN / protocol-relative references for the Mermaid stack,
+  // and the transform reported no unresolved local assets.
+  assert.doesNotMatch(out, /https?:\/\/[^"')]*(?:mermaid|jsdelivr|cdn)/i);
+  assert.doesNotMatch(out, /mermaid[^"']*\.mjs/);
+  const { unresolved } = splitExportWarnings(warnings);
+  assert.deepEqual(unresolved, [], `no unresolved local assets; got ${JSON.stringify(unresolved)}`);
+  assert.ok(reads > 50, `read the whole graph locally (${reads} reads), no fetches`);
+});
+
+// One import map is allowed per document. If the artifact already ships one, do NOT inject a second
+// (which browsers reject) - fall back to the previous behavior and let the warn path flag it.
+test("export leaves the Mermaid module alone when the artifact already has an import map", async () => {
+  const html =
+    `<!doctype html><html><head><script type="importmap">{"imports":{}}</script></head>` +
+    `<body>${MERMAID_CDN_SNIPPET}</body></html>`;
+  const { html: out, warnings } = await buildSelfContainedHtml(html, {
+    baseDir: process.cwd(),
+    resolveAbsolute: resolveDesignAssetPath,
+    readLocalFile: async (p) => readFile(p),
+  });
+  assert.equal((out.match(/<script type="importmap">/g) || []).length, 1, "no second import map injected");
+  assert.match(out, /import mermaid from "\/design\/mermaid\.esm\.min\.mjs"/, "specifier left untouched");
+  assert.ok(
+    warnings.some((w) => w.kind === "inline-module-import"),
+    "the unresolved local module import is still reported",
+  );
+});
+
+// A local import nested INSIDE a recursively-inlined module - one that can't be interned (missing
+// file, or a computed/template-literal specifier) - stays verbatim in the data: module where relative
+// resolution can't work. It can't be made portable, but it must be surfaced with its containing module
+// for context, matching the contract that unresolvable/computed local imports are always warned.
+test("export warns for unresolvable local imports nested inside an inlined module", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-nested-"));
+  const entryPath = path.join(dir, "entry.mjs");
+  await writeFile(entryPath, 'import "./missing.mjs";\nconst t = 1;\nimport(`./gen-${t}.mjs`);\nexport default 1;\n');
+  const resolveAbsolute = (ref) => (ref === "/design/entry.mjs" ? entryPath : null);
+  const html =
+    `<!doctype html><html><head></head><body>` +
+    `<script type="module">import x from "/design/entry.mjs";</script></body></html>`;
+  try {
+    const { html: out, warnings } = await buildSelfContainedHtml(html, {
+      baseDir: dir,
+      resolveAbsolute,
+      readLocalFile: async (p) => readFile(p),
+    });
+    // The entry itself IS inlined (resolvable) - so the graph got walked ...
+    assert.match(out, /<script type="importmap">/, "the resolvable entry was inlined");
+    // ... and both un-interned nested locals (missing sibling + template-literal) are warned with context.
+    const nested = warnings.filter(
+      (w) => w.kind === "inline-module-import" && /inlined module \/design\/entry\.mjs/.test(w.reason || ""),
+    );
+    const refs = nested.map((w) => w.ref);
+    assert.ok(refs.includes("./missing.mjs"), `missing sibling warned; got ${JSON.stringify(refs)}`);
+    assert.ok(
+      refs.some((r) => /gen-/.test(r)),
+      `template-literal specifier warned; got ${JSON.stringify(refs)}`,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("GET /api/:key/export inlines local assets and leaves remote references intact", async () => {

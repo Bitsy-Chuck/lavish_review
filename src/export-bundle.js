@@ -146,9 +146,48 @@ export async function buildSelfContainedHtml(html, options = {}) {
     maxDepth: Number.isFinite(options.maxDepth) ? options.maxDepth : DEFAULT_MAX_DEPTH,
     inlinedBytes: 0,
     warnings: /** @type {Array<{ kind: string, ref: string, reason?: string }>} */ ([]),
+    // Inline ES-module graph inlining (e.g. Mermaid's `/design/...` entry + its ./chunks tree). Each
+    // reachable module is base64'd ONCE into a `data:text/javascript` URL, and every import specifier
+    // is rewritten to a stable bare id resolved through a single injected `<script type="importmap">`.
+    // A flat bare-id map is the only feasible shape: value-nesting each module's data URI inside its
+    // parents' base64 blows the Mermaid graph up multiplicatively (measured in the GBs), whereas the
+    // flat map keeps it linear (~one base64 copy per module) and resolves cyclic/shared graphs the
+    // way the browser's own module loader does. Skipped entirely if the document already ships an
+    // import map (only one is allowed per document), falling back to the previous warn-only behavior.
+    moduleRegistry: /** @type {Map<string, { id: string, dataUri: string|null }>} */ (new Map()),
+    importMapEntries: /** @type {Record<string, string>} */ ({}),
+    moduleIdSeq: 0,
+    canInjectImportMap: !hasExistingImportMap(html),
   };
-  const out = await transform(html, ctx);
+  let out = await transform(html, ctx);
+  out = injectDesignImportMap(out, ctx);
   return { html: out, warnings: ctx.warnings };
+}
+
+function hasExistingImportMap(html) {
+  return /<script\b[^>]*\btype\s*=\s*["']?\s*importmap\b/i.test(String(html || ""));
+}
+
+// Inject the accumulated module import map as the first child of <head> so it precedes every module
+// script in document order (a prerequisite for the browser to honor it). The map values are
+// `data:text/javascript;base64,...` URLs whose alphabet cannot contain `<`, but defensively split any
+// `</` so the JSON can never terminate the <script> element early.
+function injectDesignImportMap(out, ctx) {
+  const entries = ctx.importMapEntries;
+  if (!entries || Object.keys(entries).length === 0) return out;
+  const json = JSON.stringify({ imports: entries }).replace(/<\//g, "<\\/");
+  const tag = `<script type="importmap">${json}</script>`;
+  const headOpen = /<head\b[^>]*>/i.exec(out);
+  if (headOpen) {
+    const at = headOpen.index + headOpen[0].length;
+    return `${out.slice(0, at)}${tag}${out.slice(at)}`;
+  }
+  const htmlOpen = /<html\b[^>]*>/i.exec(out);
+  if (htmlOpen) {
+    const at = htmlOpen.index + htmlOpen[0].length;
+    return `${out.slice(0, at)}${tag}${out.slice(at)}`;
+  }
+  return `${tag}${out}`;
 }
 
 /** Derive a portable download name for an exported artifact (report.html -> report.export.html). */
@@ -725,6 +764,7 @@ async function inlineScript(tag, attrs, body, closeTag, baseDir, ctx) {
     let inlineBody = body;
     if (isModuleScript(attrs)) {
       inlineBody = redactInlineModuleFileRefs(inlineBody, ctx, { warnUnresolved: true });
+      inlineBody = await inlineLocalDesignModuleImports(inlineBody, ctx);
       warnInlineModuleImports(inlineBody, baseDir, ctx);
       inlineBody = scrubClassicScriptFileUrlComments(inlineBody, ctx);
     }
@@ -2688,6 +2728,106 @@ function warnInlineModuleImports(body, baseDir, ctx) {
     if (!isLocalModuleImport(normalized)) continue;
     warnInlineModuleImport(normalized, baseDir, ctx);
   }
+}
+
+// Rewrite root-absolute module specifiers in an inline `<script type="module">` (e.g. Mermaid's
+// `import mermaid from "/design/mermaid.esm.min.mjs"`) to bare ids that a single injected import map
+// resolves to inlined `data:` modules, so the module - and everything it lazily import()s - loads with
+// zero network egress from a file:// or hosted export. Anything that does not resolve through
+// ctx.resolveAbsolute is left untouched for the existing warn path to report.
+async function inlineLocalDesignModuleImports(body, ctx) {
+  if (!ctx.canInjectImportMap) return body;
+  const rewrites = [];
+  for (const tok of findInlineModuleImportRefTokens(body)) {
+    if (tok.quote !== '"' && tok.quote !== "'") continue; // skip template-literal / computed specifiers
+    const normalized = normalizeJsRefForScheme(tok.value);
+    if (!isLocalModuleImport(normalized)) continue;
+    const pathname = normalized.replace(/[?#].*$/, "");
+    if (!pathname.startsWith("/")) continue; // only root-absolute refs map through resolveAbsolute
+    const id = await internDesignModule(pathname, ctx);
+    if (id) rewrites.push({ tok, id });
+  }
+  return applyModuleSpecifierRewrites(body, rewrites);
+}
+
+// Memoized, recursive inlining of a design module and its transitive import graph. Each module is read
+// once (budgeted), its own import specifiers are rewritten to bare ids, and its rewritten source is
+// base64'd into one `data:` URL registered in the import map. Returns the module's bare id, or null if
+// it does not resolve or cannot be read. The id is reserved before recursing so shared/cyclic graphs
+// converge (Mermaid's chunk graph is a shared-heavy DAG). Every path resolution flows through
+// ctx.resolveAbsolute (resolveDesignAssetPath), reusing its realpath/traversal hardening.
+async function internDesignModule(designUrl, ctx) {
+  const pathname = String(designUrl).replace(/[?#].*$/, "");
+  const realPath = ctx.resolveAbsolute(pathname);
+  if (!realPath) return null;
+  const key = path.resolve(realPath);
+  const existing = ctx.moduleRegistry.get(key);
+  if (existing) return existing.id;
+  const id = `lavish-mod-${ctx.moduleIdSeq++}`;
+  ctx.moduleRegistry.set(key, { id, dataUri: null }); // reserve before recursing to break cycles
+  const buffer = await readBudgeted({ kind: "file", path: realPath, allowOutsideRoot: true }, pathname, ctx);
+  if (!buffer) {
+    ctx.moduleRegistry.delete(key);
+    return null;
+  }
+  let text = buffer.toString("utf8");
+  const rewrites = [];
+  for (const tok of findInlineModuleImportRefTokens(text)) {
+    let childId = null;
+    if (tok.quote === '"' || tok.quote === "'") {
+      const childUrl = resolveDesignModuleChildUrl(pathname, tok.value);
+      if (childUrl) childId = await internDesignModule(childUrl, ctx);
+    }
+    if (childId) {
+      rewrites.push({ tok, id: childId });
+      continue;
+    }
+    // A local specifier we could not intern (read/resolve failure, or a computed/template-literal
+    // specifier we can't statically follow) stays verbatim inside this data: module, where relative
+    // resolution has no base URL to work against. We can't make it portable, but the contract is that
+    // unresolvable local imports are always warned - so surface it with the containing module for
+    // context. Remote/bare specifiers are left as references, exactly as the outer warn pass treats them.
+    if (isLocalModuleImport(normalizeJsRefForScheme(tok.value))) {
+      ctx.warnings.push({
+        kind: "inline-module-import",
+        ref: tok.value,
+        reason: `unresolved local import inside inlined module ${pathname}`,
+      });
+    }
+  }
+  text = applyModuleSpecifierRewrites(text, rewrites);
+  const dataUri = `data:text/javascript;base64,${Buffer.from(text, "utf8").toString("base64")}`;
+  ctx.moduleRegistry.get(key).dataUri = dataUri;
+  ctx.importMapEntries[id] = dataUri;
+  return id;
+}
+
+// Resolve a module's import specifier to the design URL of its target: relative specifiers are joined
+// against the importing module's own design URL (normalizing `.`/`..`, which also lexically prevents
+// escaping /design before resolveAbsolute's realpath guard runs); root-absolute specifiers pass
+// through; remote/bare/file specifiers return null so they are left as references.
+function resolveDesignModuleChildUrl(parentPathname, spec) {
+  const normalized = normalizeJsRefForScheme(spec);
+  if (!isLocalModuleImport(normalized)) return null;
+  const specPath = normalized.replace(/[?#].*$/, "");
+  if (specPath.startsWith("/")) return specPath;
+  const baseDir = parentPathname.slice(0, parentPathname.lastIndexOf("/") + 1);
+  const out = [];
+  for (const seg of `${baseDir}${specPath}`.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") out.pop();
+    else out.push(seg);
+  }
+  return `/${out.join("/")}`;
+}
+
+function applyModuleSpecifierRewrites(source, rewrites) {
+  if (rewrites.length === 0) return source;
+  let out = source;
+  for (const { tok, id } of [...rewrites].sort((a, b) => b.tok.rawStart - a.tok.rawStart)) {
+    out = `${out.slice(0, tok.rawStart)}${quoteJsModuleSpecifier(id, tok.quote)}${out.slice(tok.rawEnd)}`;
+  }
+  return out;
 }
 
 function warnClassicScriptDynamicImports(body, baseDir, ctx) {
