@@ -10,6 +10,10 @@ import { fileURLToPath } from "node:url";
 import * as artifactSdk from "../src/artifact-sdk.js";
 import { DESIGN_CDN_SNIPPET, MERMAID_CDN_SNIPPET } from "../src/design-reference.js";
 import { buildSelfContainedHtml, splitExportWarnings } from "../src/export-bundle.js";
+
+process.env.LAVISH_AXI_HOST = "127.0.0.1";
+process.env.LAVISH_AXI_LINK_HOST = "127.0.0.1";
+
 import {
   createChromeHtml,
   createSdkJs,

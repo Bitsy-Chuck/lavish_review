@@ -37,3 +37,35 @@ await rm("dist/design/chunks", { recursive: true, force: true });
 await cp("node_modules/mermaid/dist/chunks/mermaid.esm.min", "dist/design/chunks/mermaid.esm.min", {
   recursive: true,
 });
+
+// Whiteboard frame: a self-contained browser bundle (Excalidraw + the Mermaid
+// converter + its exactly-pinned mermaid + React) served from
+// /whiteboard-assets/ by an embedded frame for every rendered Mermaid diagram
+// in a `.mermaid` container.
+// Everything is vendored so the eagerly loaded whiteboards work fully offline.
+await mkdir("dist/whiteboard", { recursive: true });
+await esbuild.build({
+  entryPoints: { whiteboard: "src/whiteboard-frame.js" },
+  outdir: "dist/whiteboard",
+  bundle: true,
+  minify: true,
+  format: "iife",
+  platform: "browser",
+  conditions: ["production"],
+  loader: { ".woff2": "file", ".woff": "file", ".ttf": "file" },
+  define: {
+    "process.env.NODE_ENV": '"production"',
+    "process.env.IS_PREACT": '"false"',
+  },
+});
+
+// Excalidraw lazily fetches canvas fonts from `EXCALIDRAW_ASSET_PATH/fonts/`.
+// Vendor every family except Xiaolai (12 MB of CJK glyphs; those fall back to
+// Excalidraw's CDN fallback or the system font when missing locally).
+const fontFamilies = ["Assistant", "Cascadia", "ComicShanns", "Excalifont", "Liberation", "Lilita", "Nunito", "Virgil"];
+await mkdir("dist/whiteboard/fonts", { recursive: true });
+for (const family of fontFamilies) {
+  await cp(`node_modules/@excalidraw/excalidraw/dist/prod/fonts/${family}`, `dist/whiteboard/fonts/${family}`, {
+    recursive: true,
+  });
+}
