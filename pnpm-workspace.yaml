@@ -1,6 +1,17 @@
 packages:
   - "."
 
+# The @excalidraw/mermaid-to-excalidraw whiteboard converter declares
+# mermaid: "^11.12.1", but it only converts correctly against EXACTLY 11.12.1 -
+# 11.13.0+ silently degrade class/ER/state diagrams and subgraph flowcharts to
+# image fallbacks (see test/whiteboard-pins.test.js). The caret would let a fresh
+# resolve pick a newer 11.x, so pin the converter's nested mermaid here. This is
+# scoped to the converter only and deliberately does NOT touch the top-level
+# mermaid: "11.15.0" dependency artifacts use for offline rendering.
+# (pnpm v11 reads overrides from this workspace file, not package.json's "pnpm".)
+overrides:
+  "@excalidraw/mermaid-to-excalidraw>mermaid": "11.12.1"
+
 minimumReleaseAge: 10080
 minimumReleaseAgeStrict: true
 minimumReleaseAgeExclude:
