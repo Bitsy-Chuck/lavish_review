@@ -195,12 +195,12 @@ export const LAYOUT_SAFETY_CSS_SNIPPET = `<style>
 // the `lavish-axi design` summary, and the design command help. Edit the rule here only;
 // other surfaces embed it or point at it instead of restating it.
 export const DESIGN_PRIORITY_RULE =
-  "Decide the design direction in this strict priority order, and only move to the next step when the current one truly yields nothing: (1) if the user asked for a specific look or named design system, use that; (2) otherwise you must first inspect the project the artifact is about - the subject or product whose content or UI it represents, which may differ from your current working directory - and match that project's design system: Tailwind or theme config, shared CSS variables or design tokens, component library, brand assets, or existing styled pages. If the artifact previews, proposes, or mocks a specific app's UI, render it in that app's own design system so it faithfully shows the product, even when you are running in a different repo; (3) only when both steps come up empty, use the Lavish-recommended Tailwind CSS browser runtime v4 + DaisyUI v5, available via CDN, and prefer that CDN snippet over hand-writing styles unless explicitly instructed otherwise by the user.";
+  "Decide the design direction in this strict priority order, and only move to the next step when the current one truly yields nothing: (1) if the user asked for a specific look or named design system, use that; (2) otherwise you must first inspect the project the artifact is about - the subject or product whose content or UI it represents, which may differ from your current working directory - and match that project's design system: Tailwind or theme config, shared CSS variables or design tokens, component library, brand assets, or existing styled pages. If the artifact previews, proposes, or mocks a specific app's UI, render it in that app's own design system so it faithfully shows the product, even when you are running in a different repo; (3) only when both steps come up empty, use the Lavish-recommended Tailwind CSS browser runtime v4 + DaisyUI v5, served locally by Lavish from its `/design/` routes as vendored assets with no network egress, and prefer that local design snippet over hand-writing styles unless explicitly instructed otherwise by the user.";
 
 export const DESIGN_SYSTEM_HINT =
   "Lavish does not auto-inject any design system - artifacts stay portable so they render identically when opened directly without lavish-axi running. Before writing any HTML: " +
   DESIGN_PRIORITY_RULE +
-  " Run `lavish-axi design` for a content-to-playbook router, a copy-pasteable CDN snippet, a Mermaid CDN snippet/init for diagrams, and the DaisyUI component reference. When you deliver the artifact, state which of the three design sources you used and why.";
+  " Run `lavish-axi design` for a content-to-playbook router, a copy-pasteable local design snippet, a Mermaid snippet/init for diagrams, and the DaisyUI component reference. These assets are vendored and served locally from Lavish's `/design/` routes - no CDN, no network egress. When you deliver the artifact, state which of the three design sources you used and why.";
 
 export const DAISYUI_THEMES = [
   "light",
@@ -248,9 +248,9 @@ export function createDesignOutput() {
     },
     design: {
       summary:
-        "Use this Lavish CDN fallback only if (1) the user gave no design direction and (2) you already inspected the project the artifact is about and found no design system or style conventions to match. If you have not checked the subject project yet, check first. Lavish does not auto-inject any design system; artifacts stay portable HTML. " +
+        "Use this Lavish local design fallback only if (1) the user gave no design direction and (2) you already inspected the project the artifact is about and found no design system or style conventions to match. If you have not checked the subject project yet, check first. Lavish does not auto-inject any design system; artifacts stay portable HTML. " +
         DESIGN_PRIORITY_RULE +
-        " Paste the CDN snippet below into your `<head>`.",
+        " Paste the local design snippet below into your `<head>`. These assets are vendored and served locally from Lavish's `/design/` routes with no network egress.",
       cdn_snippet: DESIGN_CDN_SNIPPET,
       cdn_urls: DESIGN_CDN_URLS,
       versions: { tailwind: TAILWIND_BROWSER_VERSION, daisyui: DAISYUI_VERSION },

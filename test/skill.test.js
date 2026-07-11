@@ -4,10 +4,6 @@ import test from "node:test";
 import { createHomeOutput } from "../src/cli.js";
 import { SKILL_DESCRIPTION, createSkillMarkdown } from "../src/skill.js";
 
-function skillCommandText(text) {
-  return text.replaceAll("`lavish-axi", "`npx -y lavish-axi");
-}
-
 test("createSkillMarkdown emits valid frontmatter naming the lavish skill", () => {
   const md = createSkillMarkdown();
   assert.ok(md.startsWith("---\n"), "starts with frontmatter fence");
@@ -41,7 +37,7 @@ test("createSkillMarkdown mirrors the no-args home output", () => {
   const md = createSkillMarkdown();
   const home = createHomeOutput({ bin: "lavish-axi", sessions: [], includeSessions: false });
 
-  assert.ok(md.includes(skillCommandText(home.description)), "includes the product description");
+  assert.ok(md.includes(home.description), "includes the product description");
 
   for (const item of home.visual_guidance) {
     assert.ok(md.includes(item), `includes visual guidance: ${item.slice(0, 32)}...`);
@@ -53,8 +49,7 @@ test("createSkillMarkdown mirrors the no-args home output", () => {
   }
 
   for (const item of home.help) {
-    const skillItem = skillCommandText(item);
-    assert.ok(md.includes(skillItem), `includes help: ${skillItem.slice(0, 32)}...`);
+    assert.ok(md.includes(item), `includes help: ${item.slice(0, 32)}...`);
   }
 });
 
@@ -78,12 +73,13 @@ test("createSkillMarkdown omits setup hooks guidance", () => {
   assert.doesNotMatch(md, /setup hooks/);
 });
 
-test("createSkillMarkdown uses non-interactive npx commands", () => {
+test("createSkillMarkdown invokes the local lavish-axi binary, never npx or the public registry", () => {
   const md = createSkillMarkdown();
 
-  assert.match(md, /`npx -y lavish-axi <html-file>`/);
-  assert.match(md, /If lavish-axi output shows a follow-up command starting with `lavish-axi`/);
-  assert.match(md, /run it as `npx -y lavish-axi/);
-  assert.doesNotMatch(md, /`npx lavish-axi/);
-  assert.doesNotMatch(md, /Run `lavish-axi/);
+  // The user is behind a private registry and cannot reach the public npm registry,
+  // so the generated skill must never tell an agent to fetch/run lavish-axi via npx.
+  assert.ok(!md.includes("npx"), "skill contains no npx invocation guidance");
+  assert.match(md, /`lavish-axi <html-file>`/, "invokes the local lavish-axi binary directly");
+  assert.match(md, /locally built and linked command/, "explains lavish-axi is a local binary");
+  assert.match(md, /node dist\/cli\.mjs/, "offers the direct local invocation form");
 });
