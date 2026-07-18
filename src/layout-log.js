@@ -16,6 +16,21 @@ import { layoutWarningKey } from "./session-store.js";
 // state file on every mutation, and an append-only log grows without bound. Appends use
 // `appendFile` - the temp-file-then-rename trick in `whiteboard-store.js` replaces a whole file
 // and would truncate history here.
+//
+// Delivery is AT LEAST ONCE, and anything reading this file has to be written for that.
+// `appendFile` is not transactional: a write that flushes some bytes and then fails leaves the
+// suppression set correctly unmarked, so the next report retries the same warning. Depending on
+// where the failed write stopped, that retry can produce a duplicate record (a whole line landed
+// before the failure) or follow a truncated JSON fragment (it did not). The deliberate trade is
+// that a finding is never silently dropped: duplicates and a malformed tail are both recoverable
+// by a reader, a missing warning is not. Parse defensively - skip lines that do not parse,
+// expect the last line of a log to be the one at risk, and treat records as a multiset.
+//
+// Serialization is SINGLE PROCESS. The write queue below orders every writer inside one Node
+// process, which is what makes stat/rotate/append atomic there. Two lavish servers pointed at
+// the same state root do not share that queue, so they can still interleave during rotation.
+// Out of scope by design: filesystem locking is a large amount of machinery, and cross-process
+// sharing of one state root is not a configuration the CLI produces.
 
 export const LAYOUT_LOG_FILENAME = "layout-warnings.jsonl";
 
@@ -29,7 +44,8 @@ export const LAYOUT_LOG_MAX_BYTES = 5 * 1024 * 1024;
 // rename it to `.1`, and the second rename would clobber the first caller's archive with a log
 // that had already been rotated out from under it. Same serialize-writes shape as
 // `queueWhiteboardWrite` in `whiteboard-store.js`, keyed by the resource (the log path) rather
-// than the caller, so recorders sharing a state dir share one chain.
+// than the caller, so recorders sharing a state dir share one chain. Module-level, and therefore
+// process-level: see the single-process note in the header for what this does not cover.
 /** @type {Map<string, Promise<unknown>>} */
 const writeTails = new Map();
 
@@ -109,15 +125,14 @@ export async function appendLayoutWarnings(stateRoot, { key, file, warnings, at 
  * Consequences worth knowing:
  *  - The logged `overflowPx`/`viewportWidth` are those of the first sighting in an episode, not
  *    the worst or the last. That is the deliberate trade for not recording every frame of a drag.
- *  - Suppression is in-memory only. A server restart forgets it, so an episode that spans the
- *    restart is logged a second time and recurrence counts read slightly high. Accepted: the
- *    alternative is persisting suppression state, which is a second durable store to keep
- *    consistent with the log it guards.
- *  - A write that fails after partially flushing can duplicate a line on the retry. Duplicates
- *    are recoverable by a reader; a silently dropped finding is not.
+ *  - Suppression is in-memory and per process. A server restart forgets it, so an episode that
+ *    spans the restart is logged a second time; and two servers sharing a state root do not see
+ *    each other's suppression at all, so each logs the episode once. Recurrence counts therefore
+ *    read slightly high rather than low. Accepted: the alternative is persisting suppression
+ *    state, which is a second durable store to keep consistent with the log it guards.
  *
  * @param {string} stateRoot Directory holding `state.json`.
- * @param {{ onError?: ((error: Error) => void) | null }} [options]
+ * @param {{ onError?: ((error: Error) => unknown) | null }} [options]
  */
 export function createLayoutWarningRecorder(stateRoot, { onError = null } = {}) {
   // sessionKey -> signatures known to be on disk and still being reported.
@@ -133,10 +148,13 @@ export function createLayoutWarningRecorder(stateRoot, { onError = null } = {}) 
      * @returns {Promise<number>} How many lines were appended.
      */
     async record({ key, file, warnings }) {
-      const sessionKey = String(key || "");
-      const at = new Date().toISOString();
-      const logFile = layoutLogFile(stateRoot);
+      // Everything, including the coercions, sits inside the try: `String(key)` runs a
+      // caller-supplied `toString` and `layoutLogFile` throws on a non-string root, so leaving
+      // them outside would make "never throws" depend on the caller passing well-typed input.
       try {
+        const sessionKey = String(key || "");
+        const at = new Date().toISOString();
+        const logFile = layoutLogFile(stateRoot);
         // The whole read-modify-write - decide what is new, write it, then mark it written -
         // runs inside the log's write queue, so concurrent reports cannot both classify the same
         // warning as fresh and double-log it.
@@ -165,11 +183,35 @@ export function createLayoutWarningRecorder(stateRoot, { onError = null } = {}) 
       } catch (error) {
         // Deliberately leaves this session's set untouched: it still describes what genuinely
         // reached disk, and re-deriving it from the next report is both correct and automatic.
-        onError?.(/** @type {Error} */ (error));
+        reportQuietly(onError, /** @type {Error} */ (error));
         return 0;
       }
     },
   };
+}
+
+/**
+ * Hand an error to the caller's diagnostic hook without letting the hook become the failure.
+ *
+ * `onError` is arbitrary caller code - in the server it is `serve({ log })`, which an embedder
+ * can supply. A hook that throws would reject `record`, and the handler's outer try would turn a
+ * safely-caught filesystem error into a failed POST: the one path that exists to report trouble
+ * would be the one path that causes it. A hook that hands back a rejected promise would surface
+ * as an unhandled rejection instead, which is the same contract violation by a different route.
+ *
+ * @param {((error: Error) => unknown) | null} onError
+ * @param {Error} error
+ * @returns {void}
+ */
+function reportQuietly(onError, error) {
+  try {
+    const reported = onError?.(error);
+    if (reported && typeof (/** @type {Promise<unknown>} */ (reported).then) === "function") {
+      /** @type {Promise<unknown>} */ (reported).catch(() => {});
+    }
+  } catch {
+    // Diagnostic reporting must never affect the endpoint.
+  }
 }
 
 /**

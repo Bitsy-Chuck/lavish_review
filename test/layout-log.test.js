@@ -295,6 +295,45 @@ test("recorder never throws on a write failure, reports it, and retries next tim
   });
 });
 
+test("a throwing onError hook cannot turn a caught write failure into a failed report", async () => {
+  await withTempDir(async (dir) => {
+    // `onError` is arbitrary caller code - in the server it is `serve({ log })`. If it throws,
+    // an unguarded call would reject `record`, the handler's outer try would forward to Express,
+    // and reporting the failure would itself fail the POST.
+    const blocked = path.join(dir, "blocked");
+    await writeFile(blocked, "not a directory");
+    const recorder = createLayoutWarningRecorder(blocked, {
+      onError: () => {
+        throw new Error("logger exploded");
+      },
+    });
+
+    assert.equal(await recorder.record({ key: KEY, file: FILE, warnings: [warning()] }), 0);
+  });
+});
+
+test("an onError hook that rejects does not escape as an unhandled rejection", async () => {
+  await withTempDir(async (dir) => {
+    const blocked = path.join(dir, "blocked");
+    await writeFile(blocked, "not a directory");
+    const unhandled = [];
+    const trackUnhandled = (reason) => unhandled.push(reason);
+    process.on("unhandledRejection", trackUnhandled);
+    try {
+      const recorder = createLayoutWarningRecorder(blocked, {
+        onError: () => Promise.reject(new Error("async logger exploded")),
+      });
+
+      assert.equal(await recorder.record({ key: KEY, file: FILE, warnings: [warning()] }), 0);
+      // Let the microtask checkpoint pass, which is when an unhandled rejection would be raised.
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", trackUnhandled);
+    }
+  });
+});
+
 test("recorder swallows write failures even without an onError hook", async () => {
   await withTempDir(async (dir) => {
     const blocked = path.join(dir, "blocked");
