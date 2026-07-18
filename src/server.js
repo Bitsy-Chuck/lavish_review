@@ -38,6 +38,7 @@ import {
 } from "./export-bundle.js";
 import { publishToHtmlApp } from "./html-app.js";
 import { injectLavishSdk } from "./html-transform.js";
+import { createLayoutWarningRecorder } from "./layout-log.js";
 import { bindHost, hostForUrl, linkHost } from "./paths.js";
 import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
 
@@ -171,8 +172,13 @@ export async function serve({
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
   let publicPort = port;
 
-  // Whiteboard sidecar files live next to state.json, keyed by session + diagram.
-  const whiteboardStateRoot = path.dirname(stateFile);
+  // Sidecar files (whiteboard scenes, the durable layout-warning log) live next to state.json.
+  // Derived from the passed-in `stateFile` rather than imported from `paths.js` so a test can
+  // point the whole server at a temp dir.
+  const stateRoot = path.dirname(stateFile);
+  const layoutWarningLog = createLayoutWarningRecorder(stateRoot, {
+    onError: (error) => writeLog(`[lavish] layout warning log write failed: ${error?.message || error}`),
+  });
 
   const defaultJsonParser = express.json({ limit: "2mb" });
   const whiteboardJsonParser = express.json({ limit: "20mb" });
@@ -323,6 +329,16 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
+      // Durable history. This is the right insertion point because the handler sees every report,
+      // including ones `takeFeedback` will later clear from the session. `record` swallows its own
+      // errors, so logging can never fail the report; awaiting it keeps the line on disk before
+      // the browser gets its ack.
+      await layoutWarningLog.record({
+        key: req.params.key,
+        file: result.session.file,
+        warnings: result.session.layout_warnings || [],
+        changed: result.changed,
+      });
       if (result.changed && result.hasWarnings) {
         events.emit("feedback", req.params.key);
       }
@@ -673,7 +689,7 @@ export async function serve({
         res.status(404).json({ error: "whiteboard not found" });
         return;
       }
-      const whiteboard = await loadWhiteboard(whiteboardStateRoot, req.params.key, Number(req.params.index));
+      const whiteboard = await loadWhiteboard(stateRoot, req.params.key, Number(req.params.index));
       res.json({ whiteboard });
     } catch (error) {
       next(error);
@@ -717,7 +733,7 @@ export async function serve({
         return;
       }
       const body = req.body || {};
-      await saveWhiteboard(whiteboardStateRoot, req.params.key, Number(req.params.index), {
+      await saveWhiteboard(stateRoot, req.params.key, Number(req.params.index), {
         sourceHash: String(body.source_hash || body.sourceHash || ""),
         scene: body.scene ?? null,
         baseline: body.baseline ?? null,
@@ -744,7 +760,7 @@ export async function serve({
       }
       const body = req.body || {};
       const { scenePath, previewPath } = await writeWhiteboardFeedbackFiles(
-        whiteboardStateRoot,
+        stateRoot,
         req.params.key,
         Number(req.params.index),
         { scene: body.scene ?? null, pngDataUrl: String(body.pngDataUrl || body.png_data_url || "") },

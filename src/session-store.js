@@ -220,7 +220,14 @@ function normalizePrompt(prompt) {
   return normalized;
 }
 
-function layoutWarningKey(warning) {
+/**
+ * Natural grouping key for a finding: the same element failing the same way. Exported because
+ * the durable layout log (`layout-log.js`) dedupes on exactly this identity.
+ *
+ * @param {{ kind: string, selector: string }} warning
+ * @returns {string}
+ */
+export function layoutWarningKey(warning) {
   return `${warning.kind}:${warning.selector}`;
 }
 

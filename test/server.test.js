@@ -1088,6 +1088,75 @@ test("layout warnings wake the same long-poll feedback channel as human prompts"
   }
 });
 
+test("reported layout warnings are appended to a durable log that survives delivery", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const logFile = path.join(dir, "layout-warnings.jsonl");
+    const postWarnings = (layoutWarnings) =>
+      fetch(`${base}/api/${key}/layout-warnings`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ layout_warnings: layoutWarnings }),
+      });
+    const loggedLines = async () =>
+      (await readFile(logFile, "utf8"))
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line));
+
+    const reported = await postWarnings([
+      { selector: "main > .card", kind: "element-horizontal-overflow", overflowPx: 32, viewportWidth: 640 },
+    ]);
+    assert.equal(reported.status, 200);
+
+    const logged = await loggedLines();
+    assert.equal(logged.length, 1);
+    assert.match(logged[0].at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.deepEqual(
+      { ...logged[0], at: "" },
+      {
+        at: "",
+        key,
+        file: await canonicalFile(artifact),
+        selector: "main > .card",
+        kind: "element-horizontal-overflow",
+        overflowPx: 32,
+        viewportWidth: 640,
+        severity: "error",
+        persistent: false,
+      },
+    );
+
+    // A resize storm re-reports the same finding with different measurements - the log stays quiet.
+    await postWarnings([
+      { selector: "main > .card", kind: "element-horizontal-overflow", overflowPx: 48, viewportWidth: 600 },
+    ]);
+    assert.equal((await loggedLines()).length, 1);
+
+    // Delivery clears the warning off the session, but the durable record stays behind.
+    const delivered = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then((res) =>
+      res.json(),
+    );
+    assert.equal(delivered.layout_warnings.length, 1);
+    const state = JSON.parse(await readFile(path.join(dir, "state.json"), "utf8"));
+    assert.deepEqual(state.sessions[key].layout_warnings, []);
+    assert.equal((await loggedLines()).length, 1);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("long-poll sends heartbeat bytes before feedback arrives", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
