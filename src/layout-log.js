@@ -24,6 +24,15 @@ export const LAYOUT_LOG_FILENAME = "layout-warnings.jsonl";
 // archives. Older-than-previous history is dropped rather than kept forever.
 export const LAYOUT_LOG_MAX_BYTES = 5 * 1024 * 1024;
 
+// Serializes every write to a given log file. `stat` -> optional rotate -> append is a
+// read-modify-write on one shared file: two callers that both see an oversized log would each
+// rename it to `.1`, and the second rename would clobber the first caller's archive with a log
+// that had already been rotated out from under it. Same serialize-writes shape as
+// `queueWhiteboardWrite` in `whiteboard-store.js`, keyed by the resource (the log path) rather
+// than the caller, so recorders sharing a state dir share one chain.
+/** @type {Map<string, Promise<unknown>>} */
+const writeTails = new Map();
+
 /**
  * The canonical warning shape produced by `normalizeLayoutWarnings` in `session-store.js`.
  *
@@ -65,24 +74,10 @@ export function layoutLogFile(stateRoot) {
  * @returns {Promise<number>} How many lines were appended.
  */
 export async function appendLayoutWarnings(stateRoot, { key, file, warnings, at = new Date().toISOString() }) {
-  const records = toWarningList(warnings).map((warning) => ({
-    at,
-    key: String(key || ""),
-    file: String(file || ""),
-    selector: String(warning.selector || ""),
-    kind: String(warning.kind || "layout-warning"),
-    overflowPx: finiteNumber(warning.overflowPx),
-    viewportWidth: finiteNumber(warning.viewportWidth),
-    severity: warning.severity === "warning" ? "warning" : "error",
-    persistent: Boolean(warning.persistent),
-  }));
+  const records = buildRecords({ key, file, warnings, at });
   if (records.length === 0) return 0;
   const logFile = layoutLogFile(stateRoot);
-  await mkdir(stateRoot, { recursive: true });
-  await rotateIfOversized(logFile);
-  // One append for the whole batch: a single write keeps a report's lines contiguous.
-  await appendFile(logFile, records.map((record) => `${JSON.stringify(record)}\n`).join(""));
-  return records.length;
+  return queueLogWrite(logFile, () => writeRecords(stateRoot, logFile, records));
 }
 
 /**
@@ -93,7 +88,6 @@ export async function appendLayoutWarnings(stateRoot, { key, file, warnings, at 
  * `overflowPx`/`viewportWidth`. Logging each one would bury the signal in drag noise.
  *
  * Policy, per session:
- *  - A report the store already classified as unchanged is skipped outright.
  *  - A warning is logged the first time its `kind:selector` key appears, then suppressed for as
  *    long as it keeps being reported. The key is forgotten the moment a report omits it, so a
  *    warning that is fixed and later regresses gets logged again - that recurrence is precisely
@@ -101,50 +95,140 @@ export async function appendLayoutWarnings(stateRoot, { key, file, warnings, at 
  *  - A key re-reported as `persistent` (it survived delivery to the agent) is logged again:
  *    "the fix did not take" is a distinct signal from the original sighting.
  *
- * Consequence worth knowing: the logged `overflowPx`/`viewportWidth` are those of the first
- * sighting in an episode, not the worst or the last. That is the deliberate trade for not
- * recording every frame of a window drag.
+ * The suppression set holds only signatures this recorder has *successfully written to disk*,
+ * never merely ones it has seen. That distinction is load-bearing: the store persists a warning
+ * to state.json before this recorder runs, so if the append fails the browser's next report of
+ * the same warning is one the store considers unchanged. Suppressing on sight would drop that
+ * warning from the log permanently - it stays active on the page, so no later report ever
+ * presents it as new. Because the set means "on disk", a failed write simply leaves the
+ * signature absent and the very next report - changed or not - writes it. This is also why the
+ * recorder ignores the store's `changed` flag entirely: an unchanged report whose warnings are
+ * all already on disk is filtered by the set anyway, and one whose warnings are *not* on disk is
+ * exactly the report that must still be logged.
  *
- * The seen-set is per recorder rather than module-global, so each `serve()` owns its own and
- * tests stay isolated from each other.
+ * Consequences worth knowing:
+ *  - The logged `overflowPx`/`viewportWidth` are those of the first sighting in an episode, not
+ *    the worst or the last. That is the deliberate trade for not recording every frame of a drag.
+ *  - Suppression is in-memory only. A server restart forgets it, so an episode that spans the
+ *    restart is logged a second time and recurrence counts read slightly high. Accepted: the
+ *    alternative is persisting suppression state, which is a second durable store to keep
+ *    consistent with the log it guards.
+ *  - A write that fails after partially flushing can duplicate a line on the retry. Duplicates
+ *    are recoverable by a reader; a silently dropped finding is not.
  *
  * @param {string} stateRoot Directory holding `state.json`.
  * @param {{ onError?: ((error: Error) => void) | null }} [options]
  */
 export function createLayoutWarningRecorder(stateRoot, { onError = null } = {}) {
+  // sessionKey -> signatures known to be on disk and still being reported.
   /** @type {Map<string, Set<string>>} */
-  const loggedBySession = new Map();
+  const writtenBySession = new Map();
 
   return {
     /**
      * Record a browser report. Never rejects and never throws: logging must not be able to fail
      * the endpoint that feeds it.
      *
-     * @param {{ key: string, file: string, warnings: LayoutWarning[], changed?: boolean }} report
+     * @param {{ key: string, file: string, warnings: LayoutWarning[] }} report
      * @returns {Promise<number>} How many lines were appended.
      */
-    async record({ key, file, warnings, changed = true }) {
+    async record({ key, file, warnings }) {
       const sessionKey = String(key || "");
+      const at = new Date().toISOString();
+      const logFile = layoutLogFile(stateRoot);
       try {
-        const list = toWarningList(warnings);
-        const active = new Set(list.map(warningSignature));
-        const alreadyLogged = loggedBySession.get(sessionKey) || new Set();
-        // Everything still active is now either freshly logged below or was logged earlier, so
-        // the active set is the next suppression set. Keys absent from this report drop out.
-        loggedBySession.set(sessionKey, active);
-        if (!changed) return 0;
-        const fresh = list.filter((warning) => !alreadyLogged.has(warningSignature(warning)));
-        if (fresh.length === 0) return 0;
-        return await appendLayoutWarnings(stateRoot, { key: sessionKey, file, warnings: fresh });
+        // The whole read-modify-write - decide what is new, write it, then mark it written -
+        // runs inside the log's write queue, so concurrent reports cannot both classify the same
+        // warning as fresh and double-log it.
+        return await queueLogWrite(logFile, async () => {
+          const list = toWarningList(warnings);
+          const active = new Set(list.map(warningSignature));
+          // Retain only already-written signatures that are still being reported; anything the
+          // page stopped reporting is forgotten, so a regression starts a new episode.
+          const written = retainActive(writtenBySession.get(sessionKey), active);
+          const fresh = list.filter((warning) => !written.has(warningSignature(warning)));
+          if (fresh.length === 0) {
+            rememberWritten(writtenBySession, sessionKey, written);
+            return 0;
+          }
+          const appended = await writeRecords(
+            stateRoot,
+            logFile,
+            buildRecords({ key: sessionKey, file, warnings: fresh, at }),
+          );
+          // Only now are these signatures durable. Reached solely on a successful write - a
+          // throw skips it, leaving them absent so the next report retries them.
+          for (const warning of fresh) written.add(warningSignature(warning));
+          rememberWritten(writtenBySession, sessionKey, written);
+          return appended;
+        });
       } catch (error) {
-        // Forget this session's suppression set so the next report retries rather than treating
-        // warnings that never reached disk as already logged.
-        loggedBySession.delete(sessionKey);
+        // Deliberately leaves this session's set untouched: it still describes what genuinely
+        // reached disk, and re-deriving it from the next report is both correct and automatic.
         onError?.(/** @type {Error} */ (error));
         return 0;
       }
     },
   };
+}
+
+/**
+ * Serialize an operation against a log file behind every write already queued for it. Callers
+ * inside the queue must use `writeRecords` directly - re-entering the queue would deadlock.
+ *
+ * @template T
+ * @param {string} logFile
+ * @param {() => Promise<T>} operation
+ * @returns {Promise<T>}
+ */
+function queueLogWrite(logFile, operation) {
+  const queueKey = path.resolve(logFile);
+  const prior = writeTails.get(queueKey) || Promise.resolve();
+  const result = prior.catch(() => {}).then(operation);
+  const tail = result.catch(() => {});
+  writeTails.set(queueKey, tail);
+  tail.finally(() => {
+    if (writeTails.get(queueKey) === tail) writeTails.delete(queueKey);
+  });
+  return result;
+}
+
+/**
+ * The unqueued write core: rotate if the guard is tripped, then append. Only ever called from
+ * inside `queueLogWrite`, which is what makes the stat/rotate/append sequence atomic against
+ * other writers in this process.
+ *
+ * @param {string} stateRoot
+ * @param {string} logFile
+ * @param {LayoutWarningRecord[]} records
+ * @returns {Promise<number>}
+ */
+async function writeRecords(stateRoot, logFile, records) {
+  await mkdir(stateRoot, { recursive: true });
+  await rotateIfOversized(logFile);
+  // One append for the whole batch. Serialization by `queueLogWrite` is what keeps a report's
+  // lines contiguous against other writers in this process; a separate process appending to the
+  // same log can still interleave between them.
+  await appendFile(logFile, records.map((record) => `${JSON.stringify(record)}\n`).join(""));
+  return records.length;
+}
+
+/**
+ * @param {{ key: string, file: string, warnings: LayoutWarning[], at: string }} report
+ * @returns {LayoutWarningRecord[]}
+ */
+function buildRecords({ key, file, warnings, at }) {
+  return toWarningList(warnings).map((warning) => ({
+    at,
+    key: String(key || ""),
+    file: String(file || ""),
+    selector: String(warning.selector || ""),
+    kind: String(warning.kind || "layout-warning"),
+    overflowPx: finiteNumber(warning.overflowPx),
+    viewportWidth: finiteNumber(warning.viewportWidth),
+    severity: warning.severity === "warning" ? "warning" : "error",
+    persistent: Boolean(warning.persistent),
+  }));
 }
 
 /**
@@ -163,6 +247,32 @@ async function rotateIfOversized(logFile) {
     if (error && /** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") return;
     throw error;
   }
+}
+
+/**
+ * Store a session's written set, dropping the entry entirely once it is empty so a long-running
+ * server does not retain a `Set` per session it has ever seen.
+ *
+ * @param {Map<string, Set<string>>} writtenBySession
+ * @param {string} sessionKey
+ * @param {Set<string>} written
+ * @returns {void}
+ */
+function rememberWritten(writtenBySession, sessionKey, written) {
+  if (written.size === 0) writtenBySession.delete(sessionKey);
+  else writtenBySession.set(sessionKey, written);
+}
+
+/**
+ * @param {Set<string> | undefined} written
+ * @param {Set<string>} active
+ * @returns {Set<string>} The written signatures still present in the current report.
+ */
+function retainActive(written, active) {
+  const retained = new Set();
+  if (!written) return retained;
+  for (const signature of written) if (active.has(signature)) retained.add(signature);
+  return retained;
 }
 
 /**

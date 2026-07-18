@@ -138,12 +138,95 @@ test("recorder logs a finding once and suppresses the resize storm that follows"
   });
 });
 
-test("recorder skips reports the store already classified as unchanged", async () => {
+test("a warning whose write failed is still logged by the next report of the same warning", async () => {
+  await withTempDir(async (dir) => {
+    // Reproduces the server interleaving that a retry-with-changed:true test cannot reach.
+    // `SessionStore` persists the warning to state.json *before* the recorder runs, so once an
+    // append fails, every later report of that still-broken element is one the store calls
+    // unchanged. Suppressing on sight would strand the finding permanently.
+    const root = path.join(dir, "root");
+    // A regular file where the state root should be: every write beneath it fails.
+    await writeFile(root, "not a directory");
+    const errors = [];
+    const recorder = createLayoutWarningRecorder(root, { onError: (error) => errors.push(error) });
+
+    // The store has already persisted this warning; the log write throws.
+    assert.equal(await recorder.record({ key: KEY, file: FILE, warnings: [warning()] }), 0);
+    assert.equal(errors.length, 1);
+
+    await rm(root);
+
+    // The browser re-reports the identical warning - `changed: false` territory. The element is
+    // still broken on the page, so nothing later will ever present it as new: log it now or lose it.
+    assert.equal(await recorder.record({ key: KEY, file: FILE, warnings: [warning()] }), 1);
+    // ...and now that it is genuinely on disk, the resize storm is suppressed as usual.
+    const dragged = warning({ overflowPx: 60, viewportWidth: 600 });
+    assert.equal(await recorder.record({ key: KEY, file: FILE, warnings: [dragged] }), 0);
+
+    const lines = await readLines(root);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].overflowPx, 24);
+  });
+});
+
+test("concurrent writes against an oversized log rotate exactly once and lose nothing", async () => {
+  await withTempDir(async (dir) => {
+    const logFile = layoutLogFile(dir);
+    await writeFile(logFile, Buffer.alloc(LAYOUT_LOG_MAX_BYTES, "x"));
+    const selectors = ["#a", "#b", "#c", "#d", "#e"];
+
+    // Guards the serialization contract rather than reproducing a specific interleaving. The
+    // race this protects against - one call stats an oversized log, a second rotates and appends
+    // in the gap, then the first renames that fresh small log over the `.1` archive - needs a
+    // skew between two stat/rename pairs that a black-box test cannot force. Serializing the
+    // whole stat/rotate/append section closes the window by construction; this pins the outcome
+    // so a future change that reopens it has to fail something.
+    await Promise.all(
+      selectors.map((selector) =>
+        appendLayoutWarnings(dir, { key: KEY, file: FILE, warnings: [warning({ selector })] }),
+      ),
+    );
+
+    // The retained generation is still the original archive, not somebody's fresh small log.
+    const rotated = await stat(`${logFile}.1`);
+    assert.equal(rotated.size, LAYOUT_LOG_MAX_BYTES);
+    // One rotation, and every concurrent record landed in the log that survived it.
+    const lines = await readLines(dir);
+    assert.deepEqual(lines.map((line) => line.selector).sort(), [...selectors].sort());
+  });
+});
+
+test("concurrent reports of the same warning log it once, not once per racing report", async () => {
   await withTempDir(async (dir) => {
     const recorder = createLayoutWarningRecorder(dir);
 
-    assert.equal(await recorder.record({ key: KEY, file: FILE, warnings: [warning()], changed: false }), 0);
-    await assert.rejects(() => stat(layoutLogFile(dir)), /ENOENT/);
+    // The suppression set is now updated only after a successful write, so the decide-then-write
+    // section has to be serialized for this to hold: otherwise both calls would read an empty set,
+    // both classify the warning as fresh, and both append it.
+    const counts = await Promise.all([
+      recorder.record({ key: KEY, file: FILE, warnings: [warning()] }),
+      recorder.record({ key: KEY, file: FILE, warnings: [warning()] }),
+    ]);
+
+    assert.deepEqual(counts.sort(), [0, 1]);
+    assert.equal((await readLines(dir)).length, 1);
+  });
+});
+
+test("recorders sharing a state dir serialize against each other", async () => {
+  await withTempDir(async (dir) => {
+    const logFile = layoutLogFile(dir);
+    await writeFile(logFile, Buffer.alloc(LAYOUT_LOG_MAX_BYTES, "x"));
+    const first = createLayoutWarningRecorder(dir);
+    const second = createLayoutWarningRecorder(dir);
+
+    await Promise.all([
+      first.record({ key: KEY, file: FILE, warnings: [warning({ selector: "#first" })] }),
+      second.record({ key: KEY, file: FILE, warnings: [warning({ selector: "#second" })] }),
+    ]);
+
+    assert.equal((await stat(`${logFile}.1`)).size, LAYOUT_LOG_MAX_BYTES);
+    assert.deepEqual((await readLines(dir)).map((line) => line.selector).sort(), ["#first", "#second"]);
   });
 });
 

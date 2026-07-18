@@ -330,14 +330,16 @@ export async function serve({
         return;
       }
       // Durable history. This is the right insertion point because the handler sees every report,
-      // including ones `takeFeedback` will later clear from the session. `record` swallows its own
-      // errors, so logging can never fail the report; awaiting it keeps the line on disk before
-      // the browser gets its ack.
+      // including ones `takeFeedback` will later clear from the session. Deliberately not gated on
+      // `result.changed`: the store persists a warning before this runs, so a report it calls
+      // unchanged is exactly what follows a failed log write, and skipping those would lose the
+      // finding for good. The recorder dedupes on what it has actually written instead. It
+      // swallows its own errors, so logging can never fail the report; awaiting it keeps the line
+      // on disk before the browser gets its ack.
       await layoutWarningLog.record({
         key: req.params.key,
         file: result.session.file,
         warnings: result.session.layout_warnings || [],
-        changed: result.changed,
       });
       if (result.changed && result.hasWarnings) {
         events.emit("feedback", req.params.key);
