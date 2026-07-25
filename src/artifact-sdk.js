@@ -491,7 +491,7 @@ export function createArtifactSdk(
     }
     setFrozen(false);
 
-    return { reset, setFrozen };
+    return { reset, setFrozen, intrinsicWidth: initial.w };
   }
 
   function safeBBox(svg) {
@@ -546,10 +546,6 @@ export function createArtifactSdk(
     const index = mermaidContainerIndex(container);
     if (index < 0) return;
     const rect = svg.getBoundingClientRect();
-    const intrinsicMaxWidth = intrinsicSvgWidth(svg);
-    if (rect.width > 0 && intrinsicMaxWidth > 0) {
-      mermaidMeasurements.set(container, { renderedWidth: rect.width, intrinsicMaxWidth });
-    }
     // Mermaid renders asynchronously; a zero-ish rect means this svg has not
     // been laid out yet. Skip it and retry shortly - layout completion does
     // not necessarily mutate the DOM again, so the observer alone is not a
@@ -557,6 +553,10 @@ export function createArtifactSdk(
     if (rect.height < 40) {
       window.setTimeout(scheduleMermaidEnhance, 150);
       return;
+    }
+    const intrinsicMaxWidth = intrinsicSvgWidth(svg);
+    if (rect.width > 0 && intrinsicMaxWidth > 0) {
+      mermaidMeasurements.set(container, { intrinsicMaxWidth });
     }
     const iframe = document.createElement("iframe");
     iframe.setAttribute("data-lavish-ui", "whiteboard-inline");
@@ -883,7 +883,20 @@ export function createArtifactSdk(
 
     function walk(el) {
       if (!(el instanceof Element) || isLavishUi(el)) return;
-      if (isIntentionalHorizontalScroller(el)) return;
+      if (isIntentionalHorizontalScroller(el)) {
+        // Ordinary descendants of an intentional scroller do not need overflow
+        // auditing. Mermaid shrinkage is different: max-width:100% can erase the
+        // scrollbar by scaling the SVG, so keep only diagram measurement targets.
+        function walkDiagramTargets(node) {
+          if (!(node instanceof Element) || isLavishUi(node)) return;
+          if (mermaidMeasurements.has(node) || (node.tagName?.toLowerCase() === "svg" && isMermaidSvg(node))) {
+            elements.push(node);
+          }
+          for (const child of node.children) walkDiagramTargets(child);
+        }
+        for (const child of el.children) walkDiagramTargets(child);
+        return;
+      }
       // Skip auditing SVG internals, whose scroll-box metrics are meaningless, but keep descending:
       // <foreignObject> re-enters HTML (Mermaid renders flowchart labels there) and that does clip.
       if (!isSvgLayoutDescendant(el)) elements.push(el);
@@ -913,6 +926,8 @@ export function createArtifactSdk(
   }
 
   function intrinsicSvgWidth(svg) {
+    const viewportWidth = mermaidViewports.get(svg)?.intrinsicWidth || 0;
+    if (viewportWidth > 0) return viewportWidth;
     const viewBoxWidth = readViewBox(svg)?.w || 0;
     if (viewBoxWidth > 0) return viewBoxWidth;
     for (const value of [svg.getAttribute?.("width"), svg.style?.maxWidth, getComputedStyle(svg).maxWidth]) {
@@ -941,7 +956,14 @@ export function createArtifactSdk(
     // captured immediately before replacement instead of certifying a 0x0 box.
     const capturedMermaidMeasurement = mermaidMeasurements.get(el);
     if (capturedMermaidMeasurement) {
-      pushScaledDownDiagramFinding(el, capturedMermaidMeasurement, viewportWidth, findings, seen);
+      const iframeWidth = whiteboardEmbeds.get(el)?.iframe?.getBoundingClientRect().width || 0;
+      pushScaledDownDiagramFinding(
+        el,
+        { renderedWidth: iframeWidth, intrinsicMaxWidth: capturedMermaidMeasurement.intrinsicMaxWidth },
+        viewportWidth,
+        findings,
+        seen,
+      );
     }
 
     const rect = el.getBoundingClientRect();

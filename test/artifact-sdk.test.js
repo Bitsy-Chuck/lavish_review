@@ -67,7 +67,7 @@ test("two-pointer tracker ignores a third finger and cleans up cancel or lost ca
 
 test("Mermaid enhancement snapshots geometry before whiteboard hiding and the layout audit reports it", () => {
   const saved = Object.fromEntries(
-    ["window", "document", "parent", "Element", "getComputedStyle"].map((key) => [key, globalThis[key]]),
+    ["window", "document", "parent", "Element", "CSS", "getComputedStyle"].map((key) => [key, globalThis[key]]),
   );
   const rect = (width, height) => ({ left: 0, top: 0, right: width, bottom: height, width, height });
   const styleDefaults = {
@@ -90,6 +90,7 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
   const setGlobal = (key, value) => {
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
   };
+  let iframeWidth = 500;
 
   try {
     setGlobal(
@@ -100,6 +101,7 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
         }
       },
     );
+    setGlobal("CSS", { escape: (value) => String(value) });
     const body = node("body");
     const container = append(body, node("pre", { class: "mermaid" }));
     container.className = "mermaid";
@@ -123,6 +125,36 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
     svg.releasePointerCapture = () => {};
     svg.scrollWidth = svg.clientWidth = 500;
     svg.scrollHeight = svg.clientHeight = 80;
+
+    const scroller = append(body, node("div"));
+    scroller.style = { overflowX: "auto" };
+    scroller.getBoundingClientRect = () => rect(390, 40);
+    scroller.getClientRects = () => [];
+    scroller.scrollWidth = scroller.clientWidth = 390;
+    scroller.scrollHeight = scroller.clientHeight = 40;
+    const shortContainer = append(scroller, node("pre", { class: "mermaid" }));
+    shortContainer.className = "mermaid";
+    shortContainer.style = {};
+    shortContainer.getBoundingClientRect = () => rect(390, 22);
+    shortContainer.getClientRects = () => [];
+    shortContainer.scrollWidth = shortContainer.clientWidth = 390;
+    shortContainer.scrollHeight = shortContainer.clientHeight = 22;
+    const shortSvg = append(
+      shortContainer,
+      node("svg", { id: "mermaid-short", viewBox: "0 0 1223 80", width: "100%" }),
+    );
+    shortSvg.style = {};
+    shortSvg.getBoundingClientRect = () => rect(390, 22);
+    shortSvg.getClientRects = () => [];
+    shortSvg.getBBox = () => ({ x: 0, y: 0, width: 1223, height: 80 });
+    shortSvg.setAttribute = (name, value) => {
+      attrsFor(shortSvg)[name] = String(value);
+    };
+    shortSvg.addEventListener = () => {};
+    shortSvg.setPointerCapture = () => {};
+    shortSvg.releasePointerCapture = () => {};
+    shortSvg.scrollWidth = shortSvg.clientWidth = 390;
+    shortSvg.scrollHeight = shortSvg.clientHeight = 22;
 
     const documentElement = node("html", {}, [body]);
     documentElement.style = {};
@@ -150,8 +182,8 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
       body,
       documentElement,
       querySelectorAll(selector) {
-        if (selector === "svg") return [svg];
-        if (selector === ".mermaid") return [container];
+        if (selector === "svg") return [svg, shortSvg];
+        if (selector === ".mermaid") return [container, shortContainer];
         return [];
       },
       createElement(tag) {
@@ -160,7 +192,7 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
         el.setAttribute = (name, value) => {
           attrsFor(el)[name] = String(value);
         };
-        el.getBoundingClientRect = () => rect(500, 456);
+        el.getBoundingClientRect = () => rect(iframeWidth, 456);
         return el;
       },
       elementFromPoint() {
@@ -176,6 +208,7 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
     createArtifactSdk(() => "", undefined, undefined, hooks);
     hooks.enhanceMermaid();
     assert.equal(container.style.display, "none");
+    assert.equal(shortContainer.style.display, undefined, "a short live diagram is not whiteboard-embedded");
     assert.equal(svg.style.touchAction, "pan-y");
     hooks.setMermaidFrozen(false);
     assert.equal(svg.style.touchAction, "none");
@@ -189,7 +222,11 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
     assert.deepEqual(captures, [1, 2], "a third finger is ignored");
     listeners.get("pointercancel")({ pointerId: 1 });
     listeners.get("lostpointercapture")({ pointerId: 2 });
-    assert.deepEqual(hooks.auditLayout(), [
+    shortSvg.setAttribute("viewBox", "0 0 2446 160"); // pan/zoom must not change the intrinsic audit width
+    const initialFindings = hooks.auditLayout();
+    assert.equal(initialFindings.length, 2, "embedded and live diagrams emit exactly one shrink finding each");
+    assert.deepEqual(
+      initialFindings.find((finding) => finding.selector === "html > body > pre"),
       {
         selector: "html > body > pre",
         kind: "scaled-down-diagram",
@@ -197,7 +234,32 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
         viewportWidth: 500,
         severity: "error",
       },
-    ]);
+    );
+    assert.deepEqual(
+      initialFindings.find((finding) => finding.selector === "svg#mermaid-short"),
+      {
+        selector: "svg#mermaid-short",
+        kind: "scaled-down-diagram",
+        overflowPx: 833,
+        viewportWidth: 500,
+        severity: "error",
+      },
+    );
+
+    iframeWidth = 800;
+    globalThis.window.innerWidth = 800;
+    documentElement.scrollWidth = documentElement.clientWidth = 800;
+    assert.deepEqual(
+      hooks.auditLayout().find((finding) => finding.selector === "html > body > pre"),
+      {
+        selector: "html > body > pre",
+        kind: "scaled-down-diagram",
+        overflowPx: 423,
+        viewportWidth: 800,
+        severity: "warning",
+      },
+      "embedded audits use the iframe's current width after a resize",
+    );
   } finally {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete globalThis[key];

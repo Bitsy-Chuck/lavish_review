@@ -325,6 +325,23 @@ test("diagram playbook selects diagram types and rejects diagram-shaped prose", 
   }
 });
 
+test("Mermaid reaches only the known Node DOM boundary after parsing the block syntax example", async () => {
+  const playbook = createPlaybookOutput(["diagram"]).playbook;
+  const entry = playbook.syntax_examples.find((item) => item.startsWith("block —"));
+  const source = entry.match(/`([\s\S]*?)`/)?.[1].replaceAll("\\n", "\n");
+  assert.ok(source, "block example has an extractable Mermaid source");
+
+  const mermaid = (await import("mermaid")).default;
+  await assert.rejects(mermaid.parse(source), (error) => {
+    const message = String(error);
+    assert.doesNotMatch(message, /Lexical error|Parse error/);
+    assert.match(message, /DOMPurify\.addHook is not a function/);
+    return true;
+  });
+  const formerlyBroken = source.replaceAll('["Input"]', "[Input]").replaceAll('["Transform"]', "[Transform]");
+  await assert.rejects(mermaid.parse(formerlyBroken), /Lexical error/);
+});
+
 test("diagram playbook tells agents to keep Mermaid theming in sync with the page theme", () => {
   const output = createPlaybookOutput(["diagram"]);
 
