@@ -114,7 +114,10 @@ const SSE_HEALTHY_AFTER_MS = 20_000;
 /** @type {EventSource | null} */
 let eventStream = null;
 let eventStreamConnected = false;
-let eventStreamEverOpened = false;
+// Bumped for every connection attempt. Anything that arrives tagged with an older generation -
+// a stream we have already replaced, or a /state response from a server that has since restarted -
+// is stale by construction and must not touch state.
+let eventStreamGeneration = 0;
 let eventStreamAttempt = 0;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let eventStreamReconnectTimer;
@@ -124,11 +127,11 @@ let eventStreamWatchdogTimer;
 let eventStreamHealthyTimer;
 /** @type {Promise<void> | null} */
 let resyncPromise = null;
-// Highest server revision whose state has been applied. Snapshots and live events both carry one,
-// so a slow /state response that was captured before a reply can never overwrite it.
+// Highest server revision whose state has been applied, and the server instance it belongs to.
+// Revisions live in the server's memory and restart at zero, so they only mean anything paired
+// with the boot id that issued them.
 let appliedStateRevision = -1;
-// Which server instance those revisions belong to. Revisions are in-memory and restart at zero.
-let appliedStateEpoch = 0;
+let appliedStateBootId = "";
 let presenceStalled = false;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let presenceStallTimer;
@@ -254,23 +257,35 @@ function setConnectionBanner(visible) {
   connectionBanner.hidden = !visible || ended;
 }
 
-// True when this payload describes state newer than anything applied so far, in which case it
-// also becomes the new watermark. A payload without a revision is always applied, so an older
-// server still works.
-function claimStateRevision(revision, epoch) {
-  const instance = Number(epoch);
-  if (Number.isFinite(instance) && instance !== appliedStateEpoch) {
-    // A restarted server counts from zero, so its revisions are not comparable with the previous
-    // instance's - re-base instead of going deaf until it climbs past the old high-water mark.
-    // Anything still in flight from an older instance is stale and stays ignored.
-    if (instance < appliedStateEpoch) return false;
-    appliedStateEpoch = instance;
+// Applies a whole server state - chat, presence and ended together - if it is newer than what is
+// already on screen. They move as one because applying them separately is what let the initial
+// presence be dropped behind the chat that shared its revision.
+function applyServerState(payload, generation) {
+  if (!payload || typeof payload !== "object") return false;
+  // Never trust a connection we have already given up on. This is what keeps a stale instance from
+  // ending the session, or rolling presence back, after a newer one has been accepted.
+  if (generation !== eventStreamGeneration) return false;
+
+  const bootId = typeof payload.bootId === "string" ? payload.bootId : "";
+  if (bootId && bootId !== appliedStateBootId) {
+    // Boot ids are compared for identity, never for order - a different server is simply a
+    // different server, and its revision counter starts fresh, so the watermark re-bases. Ordering
+    // them would mean a replacement could be judged "older" and ignored forever.
+    appliedStateBootId = bootId;
     appliedStateRevision = -1;
   }
-  const next = Number(revision);
-  if (!Number.isFinite(next)) return true;
-  if (next <= appliedStateRevision) return false;
-  appliedStateRevision = next;
+
+  const revision = Number(payload.revision);
+  if (Number.isFinite(revision)) {
+    if (revision <= appliedStateRevision) return false;
+    appliedStateRevision = revision;
+  }
+
+  // Chat is optional: a degraded push from a server whose store is unreadable still carries
+  // trustworthy in-memory presence, and must leave the conversation alone rather than blank it.
+  if (Array.isArray(payload.chat)) syncChat(payload.chat);
+  setAgentPresence(String(payload.presence || "waiting"));
+  if (payload.ended) markSessionEnded();
   return true;
 }
 
@@ -1547,24 +1562,23 @@ function connectEventStream() {
   if (ended) return;
 
   closeEventStream();
+  eventStreamGeneration += 1;
+  const generation = eventStreamGeneration;
   const stream = new EventSource("/events/" + key);
   eventStream = stream;
 
   stream.addEventListener("open", () => {
-    if (stream !== eventStream) return;
-    const reconnected = eventStreamEverOpened;
+    if (generation !== eventStreamGeneration) return;
     eventStreamConnected = true;
-    eventStreamEverOpened = true;
     clearTimeout(eventStreamHealthyTimer);
     eventStreamHealthyTimer = setTimeout(markEventStreamHealthy, SSE_HEALTHY_AFTER_MS);
     setConnectionBanner(false);
     noteEventStreamActivity();
-    // Nothing replays what was missed while the stream was down, so a reconnected client re-reads
-    // authoritative state instead of assuming the gap was empty.
-    if (reconnected) resyncState().catch(() => {});
+    // No separate resync is needed: the server opens every connection by pushing the whole state,
+    // so reconnecting is itself the recovery.
   });
   stream.addEventListener("error", () => {
-    if (stream !== eventStream) return;
+    if (generation !== eventStreamGeneration) return;
     handleEventStreamFailure();
   });
   stream.addEventListener("heartbeat", () => {
@@ -1579,30 +1593,13 @@ function connectEventStream() {
     });
   });
   stream.addEventListener("chrome-reload", () => reloadAfterServerRestart());
-  stream.addEventListener("agent-reply", (event) => {
+  // The server sends whole states, never chat deltas, so re-applying an overlapping one is a
+  // no-op rather than a duplicated bubble. It arrives unprompted on every connect, which is what
+  // makes reconnecting a complete recovery without a separate fetch.
+  stream.addEventListener("state", (event) => {
+    if (generation !== eventStreamGeneration) return;
     noteEventStreamActivity();
-    const payload = JSON.parse(event.data);
-    if (!claimStateRevision(payload.revision, payload.epoch)) return;
-    addChat("agent", payload.text);
-  });
-  stream.addEventListener("chat-sync", (event) => {
-    noteEventStreamActivity();
-    const payload = JSON.parse(event.data);
-    if (!claimStateRevision(payload.revision, payload.epoch)) return;
-    syncChat(payload.chat || []);
-  });
-  stream.addEventListener("agent-presence", (event) => {
-    noteEventStreamActivity();
-    const payload = JSON.parse(event.data);
-    if (!claimStateRevision(payload.revision, payload.epoch)) return;
-    setAgentPresence(payload.state);
-  });
-  // Ending is terminal and cannot be undone by a newer revision, so it is never skipped - the
-  // revision is only recorded so a later snapshot does not look older than it really is.
-  stream.addEventListener("session-ended", (event) => {
-    const payload = JSON.parse(event?.data || "{}");
-    claimStateRevision(payload.revision, payload.epoch);
-    markSessionEnded();
+    applyServerState(JSON.parse(event?.data || "{}"), generation);
   });
 }
 
@@ -1675,15 +1672,13 @@ async function resyncState() {
 }
 
 async function resyncStateOnce() {
+  // Tagged with the connection it was asked on: if the stream has been replaced by the time this
+  // lands, the answer describes a server we are no longer talking to. `ended` goes through the
+  // same check - a stale terminal response must not be able to close the session.
+  const generation = eventStreamGeneration;
   const response = await fetch("/api/" + key + "/state", { cache: "no-store" });
   if (!response.ok) throw new Error("failed to resync session state");
-  const state = await response.json();
-  // The stream stayed live while this request was in flight. If anything newer already landed,
-  // this snapshot is stale by definition and applying it would erase that reply or presence.
-  if (state.ended) markSessionEnded();
-  if (!claimStateRevision(state.revision, state.epoch)) return;
-  syncChat(Array.isArray(state.chat) ? state.chat : []);
-  setAgentPresence(String(state.presence || "waiting"));
+  applyServerState(await response.json(), generation);
 }
 
 window.addEventListener("online", reconnectEventStreamNow);
