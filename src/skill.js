@@ -71,6 +71,12 @@ ${home.help[home.help.length - 1]}
 
 ${bullets(home.visual_guidance)}
 
+## Responsive layout
+
+Requirements, not suggestions - artifacts get reviewed on a phone as often as on a laptop.
+
+${bullets(home.responsive_layout)}
+
 ## Playbooks
 
 Run \`lavish-axi playbook <id>\` for focused, detailed guidance on any of these.

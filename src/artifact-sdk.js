@@ -1219,9 +1219,81 @@ export function createArtifactSdk(
     true,
   );
 
+  // Text annotation used to hang off `mouseup` alone, which is a mouse-only contract: dragging the
+  // native selection handles on a phone never synthesizes one, so on touch, selecting text produced
+  // NO annotation at all - the feedback the user believed they had attached simply never existed.
+  //
+  // `pointerup` replaces it and covers mouse, pen and touch alike (it also fires before the compat
+  // `mouseup`, so keeping both would just open the card twice). `selectionchange` is the second net
+  // for everything a pointer release does not describe: a handle drag that ends outside the
+  // artifact, double-tap-to-select, Select All from the platform context menu, keyboard selection.
+  // That path is deliberately the conservative one - it waits for the selection to stop moving and
+  // refuses to disturb a card that is already open - so the two never fight over one gesture.
+  const SELECTION_SETTLE_MS = 350;
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let selectionSettleTimer;
+  let selectionPointerDown = false;
+
+  function annotationCardOpen() {
+    return !!(shadow && shadow.querySelector(".lavish-annotation-card"));
+  }
+
+  function clearSelectionSettle() {
+    if (!selectionSettleTimer) return;
+    clearTimeout(selectionSettleTimer);
+    selectionSettleTimer = undefined;
+  }
+
+  function scheduleSelectionSettle() {
+    clearSelectionSettle();
+    if (!annotationMode) return;
+    selectionSettleTimer = setTimeout(settleSelection, SELECTION_SETTLE_MS);
+  }
+
+  function settleSelection() {
+    selectionSettleTimer = undefined;
+    if (!annotationMode || selectionPointerDown || annotationCardOpen()) return;
+    const selection = document.getSelection();
+    if (selectionInsideLavishUi(selection)) return;
+    openTextSelectionCard(selection);
+  }
+
+  // A selectionchange event carries no target, so the annotation card's own textarea has to be
+  // ruled out here. Its nodes live in a shadow tree, where a document-level `closest()` can never
+  // match `[data-lavish-ui]` on the host - the root has to be checked instead of the selector.
+  function selectionInsideLavishUi(selection) {
+    const node = selection && selection.anchorNode;
+    if (!node) return true;
+    const root = typeof node.getRootNode === "function" ? node.getRootNode() : document;
+    if (root !== document) return true;
+    const el = closestElement(node);
+    return !!(el && (isLavishUi(el) || isLavishAction(el) || isInteractiveControl(el)));
+  }
+
+  function openTextSelectionCard(selection) {
+    const c = textSelectionContext(selection);
+    if (!c) return false;
+    ignoreNextClick = true;
+    showAnnotationCard(c.element, { context: c, range: c.range });
+    return true;
+  }
+
   document.addEventListener(
-    "mouseup",
+    "pointerdown",
+    () => {
+      selectionPointerDown = true;
+      clearSelectionSettle();
+      // A gesture that never produced a click (a touch selection, a release over another element)
+      // must not leave this armed to swallow the next real tap.
+      ignoreNextClick = false;
+    },
+    true,
+  );
+
+  document.addEventListener(
+    "pointerup",
     (event) => {
+      selectionPointerDown = false;
       if (
         !annotationMode ||
         isLavishUi(event.target) ||
@@ -1230,14 +1302,28 @@ export function createArtifactSdk(
       )
         return;
 
-      const c = textSelectionContext(document.getSelection());
-      if (!c) return;
-
-      ignoreNextClick = true;
-      showAnnotationCard(c.element, { context: c, range: c.range });
+      // Touch selection handles keep adjusting the range after the finger lifts, so a release with
+      // nothing selected yet is not a decision - hand it to the settle path rather than dropping it.
+      if (!openTextSelectionCard(document.getSelection())) scheduleSelectionSettle();
     },
     true,
   );
+
+  // A gesture the browser takes over (a scroll started on text) ends in `pointercancel`, not
+  // `pointerup`. Without this the down-flag would latch and mute the settle path for good.
+  document.addEventListener(
+    "pointercancel",
+    () => {
+      selectionPointerDown = false;
+      scheduleSelectionSettle();
+    },
+    true,
+  );
+
+  document.addEventListener("selectionchange", () => {
+    if (selectionPointerDown) return;
+    scheduleSelectionSettle();
+  });
 
   document.addEventListener(
     "click",

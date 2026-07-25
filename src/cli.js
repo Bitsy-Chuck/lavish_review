@@ -7,7 +7,13 @@ import { fileURLToPath } from "node:url";
 
 import { AxiError, installSessionStartHooks, RESERVED_COMMANDS, runAxiCli } from "axi-sdk-js";
 
-import { createDesignOutput, DESIGN_PRIORITY_RULE, DESIGN_SYSTEM_HINT } from "./design-reference.js";
+import {
+  ARTIFACT_VIEWPORT_BUDGET,
+  createDesignOutput,
+  DESIGN_PRIORITY_RULE,
+  DESIGN_SYSTEM_HINT,
+  RESPONSIVE_LAYOUT_RULES,
+} from "./design-reference.js";
 import {
   buildSelfContainedHtml,
   exportFileName,
@@ -129,7 +135,11 @@ export function createHomeOutput({ bin, sessions, includeSessions = true }) {
       "Choose typography, spacing, color, and layout deliberately so the artifact has a clear point of view",
       "Prevent horizontal overflow at every nesting level: nested grid/flex children also need minmax(0, 1fr) tracks and min-width: 0, especially when badges, labels, or status text use wide pixel or monospace fonts; wrap, truncate, or contain long unbreakable text deliberately",
       "When the artifact would describe existing or current UI or state, show it instead: capture screenshots of the real pages (run the app read-only if needed) and embed them, rather than explaining the current look in prose; reserve prose for what cannot be shown such as rationale, trade-offs, and open questions",
+      ARTIFACT_VIEWPORT_BUDGET,
     ],
+    // Its own section rather than more visual_guidance bullets: this list is long enough to drown
+    // that one out, and reviewers open artifacts on phones often enough that it needs a heading.
+    responsive_layout: RESPONSIVE_LAYOUT_RULES,
     playbooks: listPlaybooks(),
     help: [
       "Run `lavish-axi <html-file>` to open or resume a Lavish Editor session. If the user explicitly ended the session from the browser, this refuses to reopen it and explains why instead of reopening uninvited - pass `--reopen` only when the user asks for further review or something important needs their visual attention",

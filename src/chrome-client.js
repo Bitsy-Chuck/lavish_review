@@ -53,6 +53,9 @@ const layoutGateCopy = /** @type {HTMLParagraphElement} */ (document.getElementB
 const layoutGateAction = /** @type {HTMLButtonElement} */ (document.getElementById("layoutGateAction"));
 const layoutIssueBanner = /** @type {HTMLDivElement} */ (document.getElementById("layoutIssueBanner"));
 const sendHint = /** @type {HTMLDivElement} */ (document.getElementById("sendHint"));
+const panelHead = /** @type {HTMLDivElement} */ (document.getElementById("panelHead"));
+const sheetToggle = /** @type {HTMLButtonElement} */ (document.getElementById("sheetToggle"));
+const sheetCount = /** @type {HTMLSpanElement} */ (document.getElementById("sheetCount"));
 const connectionBanner = /** @type {HTMLDivElement} */ (document.getElementById("connectionBanner"));
 const submitError = /** @type {HTMLDivElement} */ (document.getElementById("submitError"));
 const submitErrorText = /** @type {HTMLSpanElement} */ (document.getElementById("submitErrorText"));
@@ -139,6 +142,23 @@ let lastSendEndAfter = false;
 /** @type {(() => void) | null} */
 let submitRetryAction = null;
 
+// ---------------------------------------------------------------------------
+// Mobile conversation sheet.
+//
+// Below the chrome's narrow breakpoint the Conversation panel is a bottom sheet instead of a
+// permanently open row: chrome.css sizes it from `data-lavish-sheet` on <body>, this owns the
+// state. It starts collapsed so the artifact gets the screen, and opens itself whenever there is
+// something in it worth reading - the reviewer should never have to discover that the agent replied.
+// Every entry point is a no-op on desktop, where the panel is a plain always-visible column.
+// ---------------------------------------------------------------------------
+const SHEET_BREAKPOINT_QUERY = "(max-width: 860px)";
+const SHEET_STATES = ["collapsed", "half", "expanded"];
+// Below this a header drag is a tap, not a swipe - fingers are never perfectly still.
+const SHEET_SWIPE_THRESHOLD_PX = 24;
+const mobileSheetQuery = typeof window.matchMedia === "function" ? window.matchMedia(SHEET_BREAKPOINT_QUERY) : null;
+let sheetState = "collapsed";
+let sheetDragStartY = null;
+
 function escapeHtml(value) {
   return String(value).replace(
     /[&<>"']/g,
@@ -182,6 +202,7 @@ function render() {
     closeButton.addEventListener("click", (event) => removeQueuedPrompt(Number(closeButton.dataset.index), event));
   }
   updateSendState();
+  updateSheetCount();
   scrollPanelToBottom();
 }
 
@@ -277,6 +298,82 @@ function claimStateRevision(revision, epoch) {
 function hideSendHint() {
   clearTimeout(sendHintTimer);
   sendHint.hidden = true;
+}
+
+function isMobileSheet() {
+  return Boolean(mobileSheetQuery && mobileSheetQuery.matches);
+}
+
+function setSheetState(next) {
+  sheetState = SHEET_STATES.includes(next) ? next : "collapsed";
+  document.body.dataset.lavishSheet = sheetState;
+  const expanded = sheetState !== "collapsed";
+  sheetToggle.setAttribute("aria-expanded", String(expanded));
+  sheetToggle.setAttribute("aria-label", expanded ? "Collapse conversation" : "Expand conversation");
+}
+
+// Auto-OPEN only, never auto-close. A collapse is a decision the reviewer made about their own
+// screen and nothing here may undo it; a message they have not seen yet, on the other hand, must
+// not sit silently behind a 52px handle.
+function openSheetAtLeast(state) {
+  if (!isMobileSheet() || ended) return;
+  if (SHEET_STATES.indexOf(sheetState) >= SHEET_STATES.indexOf(state)) return;
+  setSheetState(state);
+}
+
+function cycleSheetState() {
+  setSheetState(SHEET_STATES[(SHEET_STATES.indexOf(sheetState) + 1) % SHEET_STATES.length]);
+}
+
+function stepSheetState(direction) {
+  const index = SHEET_STATES.indexOf(sheetState) + direction;
+  if (index < 0 || index >= SHEET_STATES.length) return;
+  setSheetState(SHEET_STATES[index]);
+}
+
+// Queued annotations live inside the sheet, so a collapsed sheet has to carry the count or feedback
+// piles up somewhere the reviewer cannot see it.
+function updateSheetCount() {
+  sheetCount.textContent = String(queued.length);
+  sheetCount.hidden = queued.length === 0;
+}
+
+// A drag on the handle steps one state per swipe; anything shorter than the threshold was a tap,
+// which cycles. The toggle button is excluded so its own click handler stays the single driver
+// there - otherwise a tap on it would both step and cycle.
+function handleSheetPointerDown(event) {
+  // Cleared on every press, not only presses on the handle: a drag that ends inside the artifact
+  // iframe never delivers its pointerup to the chrome, and a start point left over from it would
+  // be read as a swipe by whatever release comes next.
+  sheetDragStartY = null;
+  if (!isMobileSheet() || event.button) return;
+  const target = /** @type {Node} */ (event.target);
+  if (!panelHead.contains(target) || sheetToggle.contains(target)) return;
+  sheetDragStartY = Number(event.clientY) || 0;
+}
+
+function handleSheetPointerUp(event) {
+  if (sheetDragStartY === null) return;
+  const travel = sheetDragStartY - (Number(event.clientY) || 0);
+  sheetDragStartY = null;
+  if (!isMobileSheet()) return;
+  if (Math.abs(travel) < SHEET_SWIPE_THRESHOLD_PX) cycleSheetState();
+  else stepSheetState(travel > 0 ? 1 : -1);
+}
+
+// `position: fixed` is anchored to the LAYOUT viewport, which iOS does not shrink when the soft
+// keyboard opens - so the sheet, and with it the composer the user is typing into, ends up beneath
+// the keyboard. visualViewport is the only surface that reports the keyboard at all. Reading it
+// only while the composer has focus keeps a pinch-zoom (which also shrinks the visual viewport)
+// from shoving the sheet around.
+function syncKeyboardInset() {
+  const viewport = window.visualViewport;
+  if (!viewport || typeof document.body.style?.setProperty !== "function") return;
+  const inset =
+    document.activeElement === chatInput
+      ? Math.max(0, Math.round(window.innerHeight - viewport.height - viewport.offsetTop))
+      : 0;
+  document.body.style.setProperty("--sheet-keyboard-inset", `${inset}px`);
 }
 
 function setMenuOpen(button, menu, open) {
@@ -446,6 +543,8 @@ function enqueuePrompt(prompt) {
 
   persistQueuedPrompts();
   render();
+  // The reviewer just queued feedback from the artifact; Send to Agent lives in the sheet.
+  openSheetAtLeast("half");
 }
 
 function stripInternalPromptFields(prompt) {
@@ -1476,6 +1575,18 @@ chatInput.addEventListener("keydown", (event) => {
   }
 });
 chatInput.addEventListener("input", hideSendHint);
+chatInput.addEventListener("focus", () => {
+  openSheetAtLeast("half");
+  syncKeyboardInset();
+});
+chatInput.addEventListener("blur", syncKeyboardInset);
+sheetToggle.onclick = cycleSheetState;
+// Capture phase, on the document rather than the handle, so the start point is reset by every
+// press before the handle gets a chance to record a new one.
+document.addEventListener("pointerdown", handleSheetPointerDown, true);
+document.addEventListener("pointerup", handleSheetPointerUp);
+window.visualViewport?.addEventListener("resize", syncKeyboardInset);
+window.visualViewport?.addEventListener("scroll", syncKeyboardInset);
 copyPathButton.onclick = copyFilePath;
 reloadArtifactButton.onclick = reloadArtifact;
 copySnapshotButton.onclick = copyDomSnapshot;
@@ -1509,6 +1620,9 @@ document.addEventListener("keydown", (event) => {
       closeWhiteboard();
     } else if (!shareDialog.hidden) {
       closeShareDialog();
+    } else if (moreMenu.hidden && isMobileSheet() && sheetState !== "collapsed") {
+      // Innermost thing first: an open menu still outranks the sheet it is sitting over.
+      setSheetState("collapsed");
     } else {
       closeMenus();
     }
@@ -1584,6 +1698,9 @@ function connectEventStream() {
     const payload = JSON.parse(event.data);
     if (!claimStateRevision(payload.revision, payload.epoch)) return;
     addChat("agent", payload.text);
+    // Agent feedback is the one thing a collapsed sheet must not swallow. Raised only for a reply
+    // that actually landed, so a stale event the revision gate dropped cannot open the sheet.
+    openSheetAtLeast("half");
   });
   stream.addEventListener("chat-sync", (event) => {
     noteEventStreamActivity();
@@ -1693,6 +1810,9 @@ document.addEventListener("visibilitychange", () => {
 
 connectEventStream();
 
+// Collapsed is the load-time default on narrow screens: the artifact is what the reviewer opened
+// Lavish to look at, and the sheet opens itself the moment it has something to say.
+setSheetState("collapsed");
 render();
 initialChat.forEach((item) => addChat(item.role, item.text));
 setAgentPresence("waiting");

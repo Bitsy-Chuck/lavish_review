@@ -96,7 +96,19 @@
   --shadow-tooltip: 0 16px 44px rgba(0, 0, 0, 0.35);
   --shadow-floating: 0 20px 70px rgba(0, 0, 0, 0.35);
   --bar-h: 56px;
-  --panel-w: 360px;
+  /* Every pixel here comes off the artifact, so the panel only claims its full 360px once the
+     window is wide enough to spare it. This softens - it cannot remove - the step at the 860px
+     breakpoint, where a stacked panel becomes a side-by-side one: below it the artifact gets the
+     whole width, above it the panel takes a column, so widening the window past 860px always costs
+     the artifact something. Making the panel fluid shrinks that step from 360px to 288px and then
+     grows it back smoothly, instead of charging full price the pixel after the breakpoint. */
+  --panel-w: clamp(288px, 30vw, 360px);
+  /* Mobile conversation sheet. `peek` is the collapsed handle - the only part of the sheet that
+     costs the artifact any height - and the two open sizes overlay the artifact instead of
+     resizing it. dvh (not vh) so the sheet tracks the URL bar and the soft keyboard. */
+  --sheet-peek-h: 52px;
+  --sheet-half-h: min(50dvh, 420px);
+  --sheet-full-h: calc(100dvh - var(--bar-h) - var(--space-8));
   --ease: cubic-bezier(0.2, 0.6, 0.2, 1);
   --dur-fast: 120ms;
   --dur: 180ms;
@@ -431,7 +443,9 @@ body.lavish {
 }
 .share-card {
   width: min(520px, 100%);
-  max-height: min(760px, calc(100vh - 32px));
+  /* svh here, not dvh: a dialog that fits the SMALL viewport fits in every URL-bar state, so it
+     never gets clipped and never resizes under the reader mid-read. */
+  max-height: min(760px, calc(100svh - 32px));
   overflow: auto;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-xl);
@@ -604,8 +618,11 @@ body.lavish {
   color: var(--fg);
   border-color: var(--border-strong);
 }
+/* dvh, not vh: on a phone `100vh` is the LARGE viewport, so with the URL bar showing the layout is
+   taller than the screen and the composer sits below the fold - and it jumps the moment the bar
+   auto-hides. dvh tracks the viewport the browser is actually giving us. */
 .layout {
-  height: calc(100vh - var(--bar-h));
+  height: calc(100dvh - var(--bar-h));
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) var(--panel-w);
@@ -626,13 +643,28 @@ body.lavish {
   min-width: 0;
   min-height: 0;
 }
+/* On desktop this is just the panel heading; the grip, the queued-count pill and the toggle are
+   the mobile bottom sheet's handle and stay hidden until the narrow breakpoint. */
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  flex: 0 0 auto;
+  position: relative;
+}
 .panel h2 {
   font-size: 15px;
   line-height: 1.3;
   margin: 16px 16px 8px;
   font-weight: var(--w-semi);
   letter-spacing: 0;
-  flex: 0 0 auto;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.sheet-grip,
+.sheet-count,
+.sheet-toggle {
+  display: none;
 }
 .panel-scroll {
   flex: 1 1 auto;
@@ -1010,19 +1042,119 @@ iframe {
 body.layout-gate-active iframe#artifact {
   opacity: 0;
 }
+/* Narrow screens: the Conversation panel becomes a bottom sheet.
+ *
+ * It used to be a permanently open row of `min(42vh, 360px)`, which on a 390x844 phone left the
+ * artifact ~433px - roughly half the screen, every artifact read through a letterbox. As a sheet it
+ * starts COLLAPSED, so the artifact gets `100dvh - 56px bar - 52px peek` (736px on that phone), and
+ * the open states overlay the artifact rather than resizing it. chrome-client.js drives the state
+ * through `data-lavish-sheet` on <body> and auto-opens it when the agent says something.
+ */
 @media (max-width: 860px) {
   body {
     overflow: auto;
   }
   .layout {
-    height: calc(100vh - var(--bar-h));
+    height: calc(100dvh - var(--bar-h));
     grid-template-columns: 1fr;
-    grid-template-rows: minmax(0, 1fr) min(42vh, 360px);
+    /* Row 2 is an empty spacer under the fixed sheet: it reserves exactly the collapsed peek, so
+       the artifact is never covered by the handle and never reflows when the sheet opens. */
+    grid-template-rows: minmax(0, 1fr) var(--sheet-peek-h);
   }
   .panel {
+    position: fixed;
+    left: 0;
+    right: 0;
+    /* Raised by chrome-client.js when the soft keyboard opens: `position: fixed` is anchored to the
+       layout viewport, which iOS does not shrink for the keyboard, so the composer would otherwise
+       sit underneath it - the exact control the user came here to type into. */
+    bottom: var(--sheet-keyboard-inset, 0px);
     width: 100%;
+    height: var(--sheet-peek-h);
+    max-height: calc(100dvh - var(--bar-h));
+    z-index: 40;
     border-left: 0;
     border-top: var(--hairline-subtle);
+    border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+    box-shadow: var(--shadow-floating);
+    transition:
+      height var(--dur) var(--ease),
+      bottom var(--dur-fast) var(--ease);
+  }
+  body[data-lavish-sheet="half"] .panel {
+    height: var(--sheet-half-h);
+  }
+  body[data-lavish-sheet="expanded"] .panel {
+    height: var(--sheet-full-h);
+  }
+  /* Collapsed shows the handle and nothing else - `display: none` rather than clipping so the
+     composer and its buttons cannot be tabbed into while they are off screen. */
+  body[data-lavish-sheet="collapsed"] .panel-scroll,
+  body[data-lavish-sheet="collapsed"] .composer {
+    display: none;
+  }
+  .panel-head {
+    min-height: var(--sheet-peek-h);
+    padding: var(--space-5) var(--space-6) var(--space-4) var(--space-8);
+    cursor: pointer;
+    user-select: none;
+    /* The header owns vertical drags so a swipe changes the sheet state instead of scrolling. */
+    touch-action: none;
+  }
+  .panel h2 {
+    margin: 0;
+  }
+  .sheet-grip {
+    display: block;
+    position: absolute;
+    top: var(--space-3);
+    left: 50%;
+    transform: translateX(-50%);
+    width: 36px;
+    height: 4px;
+    border-radius: var(--radius-pill);
+    background: var(--border-strong);
+  }
+  /* Queued annotations live inside the sheet, so a collapsed sheet has to say how many are waiting
+     or feedback silently piles up out of sight. */
+  .sheet-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 6px;
+    border-radius: var(--radius-pill);
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-size: 11px;
+    font-weight: var(--w-bold);
+    line-height: 1;
+  }
+  .sheet-count[hidden] {
+    display: none;
+  }
+  .sheet-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 44px;
+    height: 44px;
+    margin: -10px -6px -10px 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--fg-faint);
+    cursor: pointer;
+  }
+  .sheet-chevron {
+    display: flex;
+    transition: transform var(--dur) var(--ease);
+  }
+  body[data-lavish-sheet="expanded"] .sheet-chevron {
+    transform: rotate(180deg);
   }
   .chat {
     padding-bottom: 10px;
@@ -1036,6 +1168,47 @@ body.layout-gate-active iframe#artifact {
   }
   .share-copy-row {
     flex-direction: column;
+  }
+}
+
+/* Touch input, not screen width: a 44px target is about fingers, and a touch laptop needs it at
+   any window size. Only hit areas grow here - nothing moves on a mouse-driven desktop. */
+@media (pointer: coarse) {
+  .button,
+  .share-cancel,
+  .share-copy-btn,
+  .composer-error-retry {
+    min-height: 44px;
+  }
+  .menu-item,
+  .menu-file {
+    min-height: 44px;
+  }
+  .more-button {
+    width: 44px;
+    height: 44px;
+  }
+  .annotate-switch {
+    min-height: 44px;
+    padding-inline: var(--space-2);
+  }
+  /* Small round icon buttons keep their drawn size - a 44px disc in the corner of a dialog reads as
+     a mistake - and grow an invisible hit area underneath instead. */
+  .pill-close,
+  .share-close,
+  .whiteboard-close {
+    position: relative;
+  }
+  .pill-close::after,
+  .share-close::after,
+  .whiteboard-close::after {
+    content: "";
+    position: absolute;
+    inset: -13px;
+  }
+  .share-close::after,
+  .whiteboard-close::after {
+    inset: -7px;
   }
 }
 

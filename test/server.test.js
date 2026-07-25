@@ -414,7 +414,12 @@ test("chrome declares the Lavish design-system tokens", async () => {
   assert.match(css, /--ease:cubic-bezier\(.2,.6,.2,1\)/);
   assert.match(css, /--dur-slow:320ms/);
   assert.match(css, /--bar-h:56px/);
-  assert.match(css, /--panel-w:360px/);
+  // Fluid, not fixed: every pixel of panel comes off the artifact, so it only claims its full 360px
+  // once the window is wide enough to spare it. This shrinks - it cannot remove - the step at the
+  // 860px breakpoint where widening the window costs the artifact a whole column.
+  assert.match(css, /--panel-w:clamp\(288px,30vw,360px\)/);
+  assert.match(css, /--sheet-peek-h:52px/);
+  assert.match(css, /--sheet-half-h:min\(50dvh,420px\)/);
 });
 
 test("artifact SDK uses design-token aliases for annotation highlight and shadow UI", () => {
@@ -437,12 +442,89 @@ test("chrome uses the annotation outline as the keyboard focus outline", async (
   assert.match(css, /--annotate-offset:2px/);
 });
 
+// The panel used to be a permanently open `min(42vh, 360px)` row, which on a 390x844 phone left the
+// artifact ~433px - every artifact read through a letterbox. As a collapsible sheet the artifact
+// keeps everything above a 52px handle and the open states overlay it instead of resizing it.
 test("chrome keeps the editor usable on narrow screens", async () => {
   const css = await chromeCssSource();
 
   assert.match(css, /@media \(max-width:860px\)/);
   assert.match(css, /grid-template-columns:1fr/);
-  assert.match(css, /grid-template-rows:minmax\(0,1fr\) min\(42vh,360px\)/);
+  assert.match(css, /grid-template-rows:minmax\(0,1fr\) var\(--sheet-peek-h\)/);
+  assert.doesNotMatch(css, /grid-template-rows:minmax\(0,1fr\) min\(42vh,360px\)/);
+  assert.match(css, /\.panel\{position:fixed/);
+  assert.match(css, /body\[data-lavish-sheet="half"\] \.panel\{height:var\(--sheet-half-h\);\}/);
+  assert.match(css, /body\[data-lavish-sheet="expanded"\] \.panel\{height:var\(--sheet-full-h\);\}/);
+  assert.match(
+    css,
+    /body\[data-lavish-sheet="collapsed"\] \.panel-scroll,\s*body\[data-lavish-sheet="collapsed"\] \.composer\{display:none;\}/,
+  );
+});
+
+// `100vh` on a phone is the LARGE viewport, so with the URL bar showing the layout is taller than
+// the screen and the composer sits below the fold - then it jumps when the bar auto-hides.
+test("chrome sizes itself with dynamic viewport units, not 100vh", async () => {
+  const css = await chromeCssSource();
+
+  assert.match(css, /\.layout\{height:calc\(100dvh - var\(--bar-h\)\)/);
+  assert.match(css, /max-height:calc\(100dvh - var\(--bar-h\)\)/);
+  // A dialog is sized off the SMALL viewport so it fits in every URL-bar state.
+  assert.match(css, /max-height:min\(760px,calc\(100svh - 32px\)\)/);
+  assert.doesNotMatch(css, /:calc\(100vh/);
+  assert.doesNotMatch(css, /:min\([^)]*100vh/);
+});
+
+// `position: fixed` is anchored to the layout viewport, which iOS does not shrink for the soft
+// keyboard - so without this the sheet, and the composer inside it, ends up under the keyboard.
+test("the mobile sheet lifts clear of the soft keyboard", async () => {
+  const css = await chromeCssSource();
+  const js = await chromeClientSource();
+
+  assert.match(css, /bottom:var\(--sheet-keyboard-inset,0px\)/);
+  assert.match(js, /window\.visualViewport/);
+  assert.match(js, /--sheet-keyboard-inset/);
+});
+
+test("chrome renders the conversation sheet handle", async () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+
+  assert.match(html, /<div class="panel-head" id="panelHead">/);
+  assert.match(html, /<span class="sheet-grip" aria-hidden="true"><\/span>/);
+  assert.match(html, /<span class="sheet-count" id="sheetCount" hidden><\/span>/);
+  assert.match(html, /id="sheetToggle" type="button" aria-controls="panel" aria-expanded="false"/);
+  assert.match(html, /aria-label="Expand conversation"/);
+  // The heading is still a real heading - the button carries the semantics, not a clickable <h2>.
+  assert.match(html, /<h2>Conversation<\/h2>/);
+});
+
+// On a phone, dragging the native selection handles never synthesizes a `mouseup`, so selecting
+// text produced NO annotation at all - the feedback the user believed they had attached never
+// existed, which reads from the outside exactly like "Send to Agent doesn't work".
+test("artifact SDK builds text annotations from touch selections, not only mouse ones", () => {
+  const js = createSdkJs("abc");
+
+  assert.match(js, /addEventListener\(\s*"pointerup"/);
+  assert.match(js, /addEventListener\("selectionchange"/);
+  // A gesture the browser takes over ends in pointercancel; without it the down-flag would latch.
+  assert.match(js, /addEventListener\(\s*"pointercancel"/);
+  // Keeping mouseup as well would open the card twice - pointerup fires before the compat event.
+  assert.doesNotMatch(js, /addEventListener\(\s*"mouseup"/);
+  // The selectionchange path must not reopen over a card the user is already typing into, and its
+  // shadow-DOM textarea can never be matched by a document-level closest().
+  assert.match(js, /annotationCardOpen\(\)/);
+  assert.match(js, /getRootNode/);
+});
+
+// A 44px target is about fingers, not screen width, so this keys off pointer type - and only hit
+// areas grow, so nothing moves on a mouse-driven desktop.
+test("chrome meets 44px touch targets on coarse pointers", async () => {
+  const css = await chromeCssSource();
+
+  assert.match(css, /@media \(pointer:coarse\)/);
+  assert.match(css, /\.more-button\{width:44px;height:44px;\}/);
+  assert.match(css, /min-height:44px/);
+  // Small round icon buttons keep their drawn size and grow an invisible hit area instead.
+  assert.match(css, /\.pill-close::after[^}]*inset:-13px/);
 });
 
 test("chrome top bar follows the design mock wordmark and overflow menu treatment", async () => {
