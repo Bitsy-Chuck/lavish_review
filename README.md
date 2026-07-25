@@ -133,8 +133,19 @@ pnpm link
 
 - **File-path identity** - Sessions are keyed by the canonical HTML file path, so agents do not need opaque IDs.
 - **Portable artifacts** - The artifact runs in an iframe while Lavish injects a small SDK for annotations, snapshots, feedback controls, and render-time layout checks.
-  Lavish does not inject any design system, so the saved HTML file renders identically whether you open it through `lavish-axi` or directly in a browser.
+  Lavish does not inject any design system - no colors, spacing, typography, or components - so the saved HTML file still looks the way you wrote it whether you open it through `lavish-axi` or directly in a browser.
   Run `lavish-axi design` for the single source of agent-facing design guidance and optional CDN or Mermaid snippets.
+- **Artifact base layer** - Every artifact Lavish serves, exports, or publishes gets two things it needs in order to lay out correctly, and nothing else: a `<meta name="viewport" content="width=device-width, initial-scale=1">` when the artifact does not declare its own (without it a phone lays the artifact out at its ~980px desktop fallback and scales the result down), plus a containment-only CSS layer.
+  That layer sets box-sizing, `min-width: 0` on grid and flex children, `overflow-wrap` on text, containment for `pre` and `code`, and bounded media. It never sets color, spacing, typography, or component appearance.
+  It lives in `@layer lavish-safety`, declared ahead of any artifact stylesheet, so any unlayered rule in the artifact overrides it regardless of specificity.
+  Media inside a horizontal scroll container (`.overflow-x-auto`, `.overflow-x-scroll`, `[data-lavish-scroll-x]`, or an inline `overflow-x`) is exempt from the width cap, so a wide Mermaid diagram using `useMaxWidth: false` keeps its intrinsic width and actually scrolls.
+  Opt out per artifact with `<html data-lavish-layout-safety="off">`; run `lavish-axi design` to see the exact CSS.
+- **Phone and tablet layout** - At 860px wide and below, the Conversation panel becomes a bottom sheet with collapsed, half, and expanded states, and it starts collapsed - so the artifact gets the full width and all the height above a 52px handle instead of sharing the screen with a permanently open panel.
+  Tap the handle to cycle states, swipe it up or down to step one state, or press Escape to collapse it.
+  It opens itself to half when the agent replies, when you queue an annotation, and when you focus the composer; it never closes itself.
+  The chrome sizes itself in dynamic viewport units so it does not jump when the mobile URL bar appears or hides, and the sheet lifts clear of the soft keyboard.
+  Above 860px the panel is a side column that narrows to 288px on smaller windows and widens back to 360px on larger ones.
+  Interactive controls meet a 44x44px touch target on coarse pointers.
 - **Open-time layout gate** - The browser chrome masks each artifact until the real in-iframe layout audit reports no error-severity findings.
   Warning-only artifacts reveal normally; error findings notify the agent through the same `layout_warnings` poll path and keep the curtain up until a clean reload.
   The user can click **Show anyway**, and a bounded safety timeout reveals with a persistent layout-issues banner so review is never blocked indefinitely.

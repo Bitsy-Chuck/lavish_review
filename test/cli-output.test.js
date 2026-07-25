@@ -72,7 +72,8 @@ test("home output teaches agents when and how to use Lavish Editor", () => {
   assert.equal("use_cases" in output, false);
   assert.equal("example_use_cases" in output, false);
   assert.equal("artifact_guidance" in output, false);
-  assert.ok(output.visual_guidance.length <= 5);
+  // Terse by design; the long-form responsive rules live in their own section, not as more bullets.
+  assert.ok(output.visual_guidance.length <= 6);
   assert.ok(output.visual_guidance.some((item) => item.includes("visual hierarchy")));
   assert.ok(
     output.visual_guidance.some((item) => /screenshot/i.test(item) && /embed/i.test(item) && /prose/i.test(item)),
@@ -83,6 +84,18 @@ test("home output teaches agents when and how to use Lavish Editor", () => {
   assert.ok(output.visual_guidance.some((item) => /nested grid\/flex/i.test(item)));
   assert.ok(output.visual_guidance.some((item) => /pixel or monospace fonts/i.test(item)));
   assert.ok(!output.visual_guidance.some((item) => item.includes("test narrow viewports")));
+  // The artifact does not get the browser window, and nothing in the guidance used to say so. State
+  // the arithmetic where an agent that reads exactly one layout line will hit it.
+  assert.ok(output.visual_guidance.some((item) => /NOT rendering into the full browser window/.test(item)));
+  assert.ok(output.visual_guidance.some((item) => /window width - 360px/.test(item)));
+  assert.ok(output.visual_guidance.some((item) => /100dvh - 108px/.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /mobile-first/i.test(item) && /360px/.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /grid-cols-1 md:grid-cols-3/.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /overflow-x-auto/.test(item) && /table/i.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /clamp\(\)/.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /useMaxWidth: false/.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /44x44/.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /width=device-width/.test(item)));
   assert.ok(output.playbooks.some((item) => item.id === "diagram"));
   assert.equal(
     output.playbooks.find((item) => item.id === "input")?.use_when,
@@ -190,8 +203,14 @@ test("design output prints copy-pasteable local /design URLs so agents can opt i
   assert.match(output.design.layout_safety_snippet, /min-width: 0/);
   assert.match(output.design.layout_safety_snippet, /overflow-wrap: anywhere/);
   assert.match(output.design.layout_safety_snippet, /max-width: 100%/);
-  assert.match(output.design.layout_safety_note, /Optional copy-paste CSS/);
-  assert.match(output.design.layout_safety_note, /never auto-injects/);
+  // This CSS is no longer optional boilerplate an agent has to remember to paste - that was the
+  // root cause of recurring overflow. The note must say so and must document the opt-out.
+  assert.match(output.design.layout_safety_note, /AUTO-INJECTS/);
+  assert.match(output.design.layout_safety_note, /data-lavish-layout-safety="off"/);
+  assert.match(output.design.layout_safety_note, /@layer lavish-safety/);
+  assert.doesNotMatch(output.design.layout_safety_note, /never auto-injects/);
+  assert.match(output.responsive_layout.artifact_viewport, /NOT rendering into the full browser window/);
+  assert.ok(output.responsive_layout.rules.length >= 5);
   assert.equal(output.design.cdn_urls.daisyui, "/design/daisyui.css");
   assert.equal(output.design.cdn_urls.daisyuiThemes, "/design/daisyui-themes.css");
   assert.equal(output.design.cdn_urls.tailwind, "/design/tailwindcss-browser.js");
