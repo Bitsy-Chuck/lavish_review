@@ -2,6 +2,8 @@ import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { injectArtifactBaseLayer } from "./html-transform.js";
+
 // Builds a portable copy of a Lavish artifact by inlining only its LOCAL assets - files on disk
 // the artifact references by relative path, fetchable file:// URL, or a trusted root-absolute
 // resolver - as inline <style>/<script> blocks and data URIs. Remote references (http(s) CDN/font URLs,
@@ -160,6 +162,10 @@ export async function buildSelfContainedHtml(html, options = {}) {
     canInjectImportMap: !hasExistingImportMap(html),
   };
   let out = await transform(html, ctx);
+  // Exports and shares carry the same viewport meta and containment layer the served artifact gets,
+  // so a copy handed to someone else - or opened on a phone - lays out exactly like the copy that
+  // was reviewed. The annotation SDK is still deliberately absent; this is layout, not tooling.
+  out = injectArtifactBaseLayer(out);
   out = injectDesignImportMap(out, ctx);
   return { html: out, warnings: ctx.warnings };
 }

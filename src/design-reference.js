@@ -175,7 +175,26 @@ export const MERMAID_CDN_SNIPPET = `<script type="module">
   darkQuery.addEventListener("change", queueRender);
 </script>`;
 
-export const LAYOUT_SAFETY_CSS_SNIPPET = `<style>
+export const LAYOUT_SAFETY_LAYER_NAME = "lavish-safety";
+export const LAYOUT_SAFETY_OPT_OUT_ATTRIBUTE = "data-lavish-layout-safety";
+
+// The containment base layer Lavish injects into every artifact it serves, exports, or publishes
+// (src/html-transform.js). Layout safety used to be optional boilerplate an agent had to remember
+// to paste, which is why overflow kept coming back; this makes it structural instead.
+//
+// Two properties make auto-injection safe:
+//
+//  1. Everything lives inside `@layer lavish-safety`, declared before any artifact stylesheet. An
+//     unlayered author rule always outranks a layered one regardless of specificity, so an artifact
+//     (or Tailwind, whose own utilities land in later layers) overrides any of this for free. The
+//     `:where()` wrappers keep specificity at zero on top of that.
+//  2. The scope is strictly containment - box model, wrapping, overflow, and intrinsic media bounds.
+//     It never sets color, spacing, typography, or component appearance. A base layer that restyles
+//     an existing artifact is a bug, not a feature.
+//
+// Opt out per artifact with `<html data-lavish-layout-safety="off">`.
+export const LAYOUT_SAFETY_CSS_SNIPPET = `<style ${LAYOUT_SAFETY_OPT_OUT_ATTRIBUTE}="on">
+@layer ${LAYOUT_SAFETY_LAYER_NAME} {
   *, *::before, *::after { box-sizing: border-box; }
   :where(.grid, .flex, .layout-grid, .layout-flex) > *,
   :where([style*="display: grid"], [style*="display:grid"], [style*="display: flex"], [style*="display:flex"]) > * {
@@ -184,11 +203,45 @@ export const LAYOUT_SAFETY_CSS_SNIPPET = `<style>
   :where(p, h1, h2, h3, h4, h5, h6, li, dd, blockquote, figcaption, td, th, .badge, .label) {
     overflow-wrap: anywhere;
   }
-  :where(img, svg, video, canvas, iframe) {
-    max-width: 100%;
-    height: auto;
+  /* Long unbreakable code lines are the overflow source the hand-pasted snippet always missed.
+     Contain them in the block instead of rewrapping them - reflowed code reads worse than a
+     scrollbar, and \`overflow-wrap\` is inert under the \`white-space: pre\` a <pre> defaults to. */
+  :where(pre) { max-width: 100%; overflow-x: auto; }
+  :where(code, kbd, samp) { overflow-wrap: anywhere; }
+  /* \`iframe\` is bounded but deliberately excluded from \`height: auto\`: unlike raster media and
+     viewBox'd SVG it has no intrinsic aspect ratio, so \`auto\` collapses it to the 150px default
+     and would beat a \`height\` attribute (a presentational hint the cascade ranks below this). */
+  :where(img, svg, video, canvas, iframe):where(:not([data-lavish-ui])) { max-width: 100%; }
+  :where(img, svg, video, canvas):where(:not([data-lavish-ui])) { height: auto; }
+  /* Escape hatch for wide diagrams. A diagram deliberately placed in a horizontal scroll container
+     (Mermaid \`useMaxWidth: false\` + \`overflow-x: auto\`) must keep its intrinsic width: capping it
+     at 100% silently shrinks it to fit and the scrollbar never appears, so the wide-diagram path
+     is defeated by the very rule meant to protect narrow ones. */
+  :where(.overflow-x-auto, .overflow-x-scroll, [data-lavish-scroll-x],
+    [style*="overflow-x:auto"], [style*="overflow-x: auto"],
+    [style*="overflow-x:scroll"], [style*="overflow-x: scroll"]) :where(img, svg, video, canvas) {
+    max-width: none;
   }
+}
 </style>`;
+
+// The fact agents were never told: the artifact does not get the browser window. It goes in the
+// terse always-read visual_guidance list rather than the responsive section below, because an agent
+// that reads only one line about layout has to read this one.
+export const ARTIFACT_VIEWPORT_BUDGET =
+  "You are NOT rendering into the full browser window - the artifact lives in an iframe beside Lavish's own chrome, so size for less than you can see. On desktop the artifact gets roughly `window width - 360px` (the Conversation panel; it narrows to 288px on windows under ~1200px wide) and `window height - 56px` (the top bar). At 860px wide and below the panel becomes a bottom sheet that starts collapsed, so the artifact gets the FULL width and `100dvh - 108px` of height (56px top bar + 52px collapsed sheet handle); when the reviewer opens the sheet it overlays the bottom `min(50dvh, 420px)` (half) or nearly the whole viewport (expanded) instead of resizing the artifact. Budget for a 360px-wide viewport at the low end.";
+
+// Single source for what an artifact must do to survive the width and height it is actually given.
+// It flows into the no-args home output, the generated skill, and `lavish-axi design`.
+export const RESPONSIVE_LAYOUT_RULES = [
+  "Design mobile-first and verify at 360px wide before adding any wider layout: write the single-column, full-bleed layout first, then add `sm:`/`md:`/`lg:` (or `min-width` media queries) to opt into multi-column. 360x640 is the minimum size an artifact must be readable and operable at, with no horizontal page scroll.",
+  "Collapse every multi-column grid to one column on narrow screens - `grid-cols-1 md:grid-cols-3`, not a bare `grid-cols-3` - and give nested grid/flex tracks `minmax(0, 1fr)` and `min-width: 0` so a long token inside a cell cannot force the whole page wider.",
+  "Tables need an explicit narrow-screen strategy, not just a wrapper: put the table in `overflow-x-auto` so it scrolls inside its own box, or restructure it into stacked label/value cards under `md:`. Never let a table set the page width.",
+  "Use fluid type and spacing (`clamp()`, or the responsive text/spacing scale) so headings shrink with the viewport instead of overflowing it, and keep body copy at 16px or larger on mobile so phones do not zoom the form controls.",
+  "Contain diagrams and SVG deliberately. Mermaid diagrams fit by default; when a diagram is genuinely too wide to read shrunk, initialize it with `useMaxWidth: false` AND wrap it in a horizontal scroll container (`overflow-x-auto`, `overflow-x-scroll`, or `data-lavish-scroll-x`), which is the one place Lavish's injected containment layer lets media exceed 100% width so the scrollbar actually appears.",
+  "Every interactive control needs a touch target of at least 44x44 CSS pixels on a phone - buttons, links in button rows, close controls, tabs, and anything with `data-lavish-action`. Small icon-only controls should grow their hit area (padding, or an inset `::after` overlay) rather than shrink to the icon.",
+  'Write `<meta name="viewport" content="width=device-width, initial-scale=1">` into the artifact head yourself. Lavish injects one when it is missing so a phone never lays the artifact out at the ~980px desktop fallback, but the saved file should stand on its own when opened straight from disk.',
+];
 
 // Single source for how agents choose an artifact's design direction. It flows into the
 // no-args home output, top-level --help, the generated skill (all via DESIGN_SYSTEM_HINT),
@@ -198,7 +251,7 @@ export const DESIGN_PRIORITY_RULE =
   "Decide the design direction in this strict priority order, and only move to the next step when the current one truly yields nothing: (1) if the user asked for a specific look or named design system, use that; (2) otherwise you must first inspect the project the artifact is about - the subject or product whose content or UI it represents, which may differ from your current working directory - and match that project's design system: Tailwind or theme config, shared CSS variables or design tokens, component library, brand assets, or existing styled pages. If the artifact previews, proposes, or mocks a specific app's UI, render it in that app's own design system so it faithfully shows the product, even when you are running in a different repo; (3) only when both steps come up empty, use the Lavish-recommended Tailwind CSS browser runtime v4 + DaisyUI v5, served locally by Lavish from its `/design/` routes as vendored assets with no network egress, and prefer that local design snippet over hand-writing styles unless explicitly instructed otherwise by the user.";
 
 export const DESIGN_SYSTEM_HINT =
-  "Lavish does not auto-inject any design system - artifacts stay portable so they render identically when opened directly without lavish-axi running. Before writing any HTML: " +
+  "Lavish does not auto-inject any design system - no colors, spacing, typography, or components - so artifacts stay portable and render the way you wrote them when opened directly without lavish-axi running. (It does inject a viewport meta tag and a containment-only CSS base layer that any rule of yours overrides; run `lavish-axi design` for exactly what is in it and how to opt out.) Before writing any HTML: " +
   DESIGN_PRIORITY_RULE +
   " Run `lavish-axi design` for a content-to-playbook router, a copy-pasteable local design snippet, a Mermaid snippet/init for diagrams, and the DaisyUI component reference. These assets are vendored and served locally from Lavish's `/design/` routes - no CDN, no network egress. When you deliver the artifact, state which of the three design sources you used and why.";
 
@@ -246,6 +299,12 @@ export function createDesignOutput() {
       instruction: PLAYBOOK_ROUTER_INSTRUCTION,
       playbooks: listPlaybooks(),
     },
+    responsive_layout: {
+      instruction:
+        "Requirements, not suggestions - an artifact that ignores them is unreadable on the phone the reviewer is holding.",
+      artifact_viewport: ARTIFACT_VIEWPORT_BUDGET,
+      rules: RESPONSIVE_LAYOUT_RULES,
+    },
     design: {
       summary:
         "Use this Lavish local design fallback only if (1) the user gave no design direction and (2) you already inspected the project the artifact is about and found no design system or style conventions to match. If you have not checked the subject project yet, check first. Lavish does not auto-inject any design system; artifacts stay portable HTML. " +
@@ -259,7 +318,7 @@ export function createDesignOutput() {
         "Use this command for common syntax. Read the latest DaisyUI docs for full details when using advanced or unfamiliar components.",
       layout_safety_snippet: LAYOUT_SAFETY_CSS_SNIPPET,
       layout_safety_note:
-        "Optional copy-paste CSS for artifacts with dense nested grid/flex layouts, badges, wide monospace or pixel fonts, or local media. Paste it into the artifact yourself when useful. Lavish never auto-injects it, so direct-open portability stays intact.",
+        'Lavish AUTO-INJECTS this containment CSS into every artifact it serves, exports, or publishes, so you do not need to paste it - it is shown here only so you know exactly what is in the cascade. It is containment-only (box-sizing, min-width on grid/flex children, overflow-wrap, pre/code containment, bounded media) and never sets color, spacing, typography, or component appearance. It lives in `@layer lavish-safety`, declared before any artifact stylesheet, so ANY unlayered rule of yours overrides it. Two things it does not do: it will not save a layout that has no min-width: 0 on its own nested grid/flex tracks, and it deliberately exempts media inside a horizontal scroll container (`.overflow-x-auto`, `.overflow-x-scroll`, `[data-lavish-scroll-x]`, or an inline `overflow-x`) so a wide Mermaid diagram using `useMaxWidth: false` keeps its intrinsic width and actually scrolls. Opt out of the whole layer with `<html data-lavish-layout-safety="off">`. Paste the snippet yourself only when an artifact must behave identically when double-clicked straight from disk with no Lavish involved.',
       other_design_systems:
         "If the user asks for a different design system (Bootstrap, custom CSS, plain HTML, etc.), use that instead - Lavish does not require DaisyUI.",
     },

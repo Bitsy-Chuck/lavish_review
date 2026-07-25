@@ -13,6 +13,7 @@ async function createChromeHarness({
   fetchImpl = async () => ({ ok: true }),
   sessionData = defaultSessionData,
   artifactSrc = "",
+  narrowScreen = false,
 } = {}) {
   const source = await readFile(sourceUrl, "utf8");
   const storage = new Map();
@@ -105,6 +106,16 @@ async function createChromeHarness({
       },
       addEventListener(type, handler) {
         listeners.set(type, handler);
+      },
+      // The sheet handle asks whether a pointer landed on the toggle button, so the stub needs a
+      // real containment answer rather than the default "no children" one.
+      contains(other) {
+        return other === this;
+      },
+      dispatch(type, event = {}) {
+        const handler = listeners.get(type);
+        assert.ok(handler, `element #${id} has a ${type} listener`);
+        return handler(event);
       },
       querySelectorAll() {
         return [];
@@ -230,6 +241,11 @@ async function createChromeHarness({
         if (!windowListeners.has(type)) windowListeners.set(type, []);
         windowListeners.get(type).push(handler);
       },
+      // The mobile conversation sheet only exists below the chrome's narrow breakpoint; every entry
+      // point checks this before it does anything.
+      matchMedia(media) {
+        return { media, matches: narrowScreen, addEventListener() {}, removeEventListener() {} };
+      },
     },
   };
 
@@ -275,6 +291,16 @@ async function createChromeHarness({
       const handlers = windowListeners.get("message") || [];
       assert.ok(handlers.length > 0, "chrome-client registered a message handler");
       for (const handler of handlers) handler({ source: whiteboard.source, data });
+    },
+    dispatchDocumentPointerDown(eventProps) {
+      const handlers = documentListeners.get("pointerdown") || [];
+      assert.ok(handlers.length > 0, "chrome-client registered a document pointerdown handler");
+      for (const { handler } of handlers) handler({ button: 0, clientY: 0, ...eventProps });
+    },
+    dispatchDocumentPointerUp(eventProps) {
+      const handlers = documentListeners.get("pointerup") || [];
+      assert.ok(handlers.length > 0, "chrome-client registered a document pointerup handler");
+      for (const { handler } of handlers) handler({ button: 0, clientY: 0, ...eventProps });
     },
     dispatchDocumentKeydown(eventProps) {
       const handlers = documentListeners.get("keydown") || [];
@@ -1572,4 +1598,149 @@ test("chrome client clears the composer only after the submit succeeds", async (
 
   assert.equal(chrome.element("chatInput").value, "");
   assert.equal(chrome.element("chatLog").lastAppendedChild.classList.contains("pending"), false);
+});
+
+// ---------------------------------------------------------------------------
+// Mobile conversation sheet. The panel used to be permanently open below the narrow breakpoint,
+// which on a 390x844 phone left the artifact ~433px - roughly half the screen. As a sheet it starts
+// collapsed and opens itself only when there is something in it worth reading.
+// ---------------------------------------------------------------------------
+
+test("the conversation sheet starts collapsed on a narrow screen", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "collapsed");
+  assert.equal(chrome.element("sheetToggle")["aria-expanded"], "false");
+  assert.equal(chrome.element("sheetToggle")["aria-label"], "Expand conversation");
+});
+
+test("an agent reply opens the collapsed sheet", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+
+  chrome.eventSource().listeners.get("agent-reply")({ data: JSON.stringify({ text: "Look at card two" }) });
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "half");
+  assert.equal(chrome.element("sheetToggle")["aria-expanded"], "true");
+  assert.equal(chrome.element("sheetToggle")["aria-label"], "Collapse conversation");
+});
+
+test("queuing an annotation opens the sheet and shows how many are waiting", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Tighten this", selector: "#a", tag: "p", text: "A" },
+  });
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "half");
+  assert.equal(chrome.element("sheetCount").textContent, "1");
+  assert.equal(chrome.element("sheetCount").hidden, false);
+});
+
+// Auto-OPEN only. A collapse is a decision the reviewer made about their own screen; an agent reply
+// may raise the sheet from collapsed, but it must never lower one the reviewer opened further.
+test("an agent reply never lowers a sheet the reviewer opened wider", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+  const toggle = chrome.element("sheetToggle");
+
+  toggle.onclick();
+  toggle.onclick();
+  assert.equal(chrome.element("body").dataset.lavishSheet, "expanded");
+
+  chrome.eventSource().listeners.get("agent-reply")({ data: JSON.stringify({ text: "Done" }) });
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "expanded");
+});
+
+test("the sheet toggle cycles collapsed -> half -> expanded -> collapsed", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+  const body = chrome.element("body");
+  const toggle = chrome.element("sheetToggle");
+
+  for (const expected of ["half", "expanded", "collapsed", "half"]) {
+    toggle.onclick();
+    assert.equal(body.dataset.lavishSheet, expected);
+  }
+});
+
+test("a swipe on the sheet handle steps one state, a tap cycles", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+  const body = chrome.element("body");
+  const head = chrome.element("panelHead");
+  const swipe = (from, to) => {
+    chrome.dispatchDocumentPointerDown({ clientY: from, target: head });
+    chrome.dispatchDocumentPointerUp({ clientY: to });
+  };
+
+  swipe(600, 500); // up
+  assert.equal(body.dataset.lavishSheet, "half");
+  swipe(500, 400); // up again
+  assert.equal(body.dataset.lavishSheet, "expanded");
+  swipe(400, 500); // down
+  assert.equal(body.dataset.lavishSheet, "half");
+
+  // Under the threshold a drag is just a finger that did not hold still - treat it as a tap.
+  swipe(500, 496);
+  assert.equal(body.dataset.lavishSheet, "expanded");
+});
+
+// The toggle button runs its own click handler, so the handle must not also step on its pointer -
+// otherwise one tap would move the sheet twice.
+test("a tap on the toggle button does not also trigger the handle swipe path", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+  const head = chrome.element("panelHead");
+  const toggle = chrome.element("sheetToggle");
+
+  chrome.dispatchDocumentPointerDown({ clientY: 600, target: toggle });
+  chrome.dispatchDocumentPointerUp({ clientY: 600 });
+  assert.equal(chrome.element("body").dataset.lavishSheet, "collapsed");
+
+  toggle.onclick();
+  assert.equal(chrome.element("body").dataset.lavishSheet, "half");
+
+  // A press that landed outside the handle entirely must not arm the swipe either.
+  chrome.dispatchDocumentPointerDown({ clientY: 600, target: head.parentElement || chrome.element("artifact") });
+  chrome.dispatchDocumentPointerUp({ clientY: 400 });
+  assert.equal(chrome.element("body").dataset.lavishSheet, "half");
+});
+
+test("focusing the composer opens the sheet", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+
+  chrome.element("chatInput").dispatch("focus");
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "half");
+});
+
+// On desktop the panel is a plain always-visible column, so none of the sheet machinery may fire.
+test("the sheet stays inert on a wide screen", async () => {
+  const chrome = await createChromeHarness();
+
+  chrome.eventSource().listeners.get("agent-reply")({ data: JSON.stringify({ text: "Look at card two" }) });
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Tighten this", selector: "#a", tag: "p", text: "A" },
+  });
+  chrome.element("chatInput").dispatch("focus");
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "collapsed");
+});
+
+test("Escape collapses an open sheet, but an open menu outranks it", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+  const body = chrome.element("body");
+  // Stub elements default to visible, and Escape checks the overlays before anything else.
+  chrome.element("whiteboardOverlay").hidden = true;
+  chrome.element("shareDialog").hidden = true;
+
+  chrome.element("sheetToggle").onclick();
+  assert.equal(body.dataset.lavishSheet, "half");
+
+  chrome.element("moreMenu").hidden = false;
+  chrome.dispatchDocumentKeydown({ key: "Escape" });
+  assert.equal(body.dataset.lavishSheet, "half");
+  assert.equal(chrome.element("moreMenu").hidden, true);
+
+  chrome.dispatchDocumentKeydown({ key: "Escape" });
+  assert.equal(body.dataset.lavishSheet, "collapsed");
 });
