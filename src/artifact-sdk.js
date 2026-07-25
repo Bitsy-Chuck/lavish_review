@@ -565,7 +565,7 @@ export function createArtifactSdk(
     iframe.setAttribute("sandbox", "allow-scripts allow-popups");
     iframe.src = whiteboardFrameSrc({ index, diagramId: svg.id || "" });
     iframe.style.cssText =
-      `display:block;width:100%;height:${whiteboardEmbedHeightPx(rect)}px;border:1px solid rgba(128,128,128,.35);` +
+      `display:block;box-sizing:border-box;width:100%;height:${whiteboardEmbedHeightPx(rect)}px;border:1px solid rgba(128,128,128,.35);` +
       "border-radius:12px;background:transparent";
     // The design snippet re-renders Mermaid inside the container on theme
     // changes, so the frame lives as a sibling: re-renders stay harmless
@@ -939,8 +939,9 @@ export function createArtifactSdk(
   function pushScaledDownDiagramFinding(el, measurement, viewportWidth, findings, seen) {
     const scaledDown = classifyScaledDownSvg(measurement);
     if (!scaledDown) return;
+    const identity = el.tagName?.toLowerCase() === "svg" ? el.closest(".mermaid, [data-lavish-mermaid]") || el : el;
     pushLayoutFinding(findings, seen, {
-      selector: selector(el),
+      selector: selector(identity),
       kind: "scaled-down-diagram",
       overflowPx: scaledDown.shrinkPx,
       viewportWidth,

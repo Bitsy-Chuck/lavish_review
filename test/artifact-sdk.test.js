@@ -91,6 +91,7 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
   };
   let iframeWidth = 500;
+  let shortDiagramHeight = 22;
 
   try {
     setGlobal(
@@ -135,8 +136,10 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
     const shortContainer = append(scroller, node("pre", { class: "mermaid" }));
     shortContainer.className = "mermaid";
     shortContainer.style = {};
-    shortContainer.getBoundingClientRect = () => rect(390, 22);
+    shortContainer.getBoundingClientRect = () =>
+      rect(390, shortContainer.style.display === "none" ? 0 : shortDiagramHeight);
     shortContainer.getClientRects = () => [];
+    shortContainer.insertAdjacentElement = (_position, child) => append(scroller, child);
     shortContainer.scrollWidth = shortContainer.clientWidth = 390;
     shortContainer.scrollHeight = shortContainer.clientHeight = 22;
     const shortSvg = append(
@@ -144,7 +147,8 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
       node("svg", { id: "mermaid-short", viewBox: "0 0 1223 80", width: "100%" }),
     );
     shortSvg.style = {};
-    shortSvg.getBoundingClientRect = () => rect(390, 22);
+    shortSvg.getBoundingClientRect = () =>
+      shortContainer.style.display === "none" ? rect(0, 0) : rect(390, shortDiagramHeight);
     shortSvg.getClientRects = () => [];
     shortSvg.getBBox = () => ({ x: 0, y: 0, width: 1223, height: 80 });
     shortSvg.setAttribute = (name, value) => {
@@ -208,6 +212,8 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
     createArtifactSdk(() => "", undefined, undefined, hooks);
     hooks.enhanceMermaid();
     assert.equal(container.style.display, "none");
+    const embeddedIframe = body.children.find((child) => child.tagName === "IFRAME");
+    assert.match(embeddedIframe.style.cssText, /box-sizing:border-box/);
     assert.equal(shortContainer.style.display, undefined, "a short live diagram is not whiteboard-embedded");
     assert.equal(svg.style.touchAction, "pan-y");
     hooks.setMermaidFrozen(false);
@@ -235,15 +241,30 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
         severity: "error",
       },
     );
-    assert.deepEqual(
-      initialFindings.find((finding) => finding.selector === "svg#mermaid-short"),
-      {
-        selector: "svg#mermaid-short",
-        kind: "scaled-down-diagram",
-        overflowPx: 833,
-        viewportWidth: 500,
-        severity: "error",
-      },
+    const liveFinding = initialFindings.find((finding) => finding.selector === "html > body > div > pre");
+    assert.deepEqual(liveFinding, {
+      selector: "html > body > div > pre",
+      kind: "scaled-down-diagram",
+      overflowPx: 833,
+      viewportWidth: 500,
+      severity: "error",
+    });
+    shortSvg.id = "mermaid-regenerated-at-a-different-time";
+    assert.equal(
+      hooks.auditLayout().find((finding) => finding.kind === "scaled-down-diagram" && finding.selector.includes("div"))
+        .selector,
+      liveFinding.selector,
+      "a Mermaid re-render that changes the generated SVG id keeps the same warning identity",
+    );
+
+    shortDiagramHeight = 80;
+    hooks.enhanceMermaid();
+    assert.equal(shortContainer.style.display, "none");
+    assert.equal(
+      hooks.auditLayout().find((finding) => finding.kind === "scaled-down-diagram" && finding.selector.includes("div"))
+        .selector,
+      liveFinding.selector,
+      "live and whiteboard-embedded paths use the same Mermaid container identity",
     );
 
     iframeWidth = 800;
