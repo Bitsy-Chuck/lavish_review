@@ -13,6 +13,57 @@ function feedbackResult(result) {
   );
 }
 
+test("concurrent prompt and layout-warning writes do not lose prompts", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const firstStore = new SessionStore(stateFile);
+    const secondStore = new SessionStore(path.join(dir, ".", "state.json"));
+    const session = await firstStore.upsertSession(artifact, "http://localhost:4387/session/test");
+    const writes = [];
+    for (let index = 0; index < 50; index += 1) {
+      writes.push(
+        firstStore.queuePrompts(session.key, {
+          prompts: [
+            {
+              uid: String(index),
+              prompt: `Prompt ${index}`,
+              selector: "h1",
+              tag: "h1",
+              text: "Hello",
+            },
+          ],
+        }),
+        secondStore.recordLayoutWarnings(session.key, {
+          layout_warnings: [
+            {
+              selector: `h1:nth-child(${index + 1})`,
+              kind: "overlapping-text",
+              overflowPx: index,
+              viewportWidth: 720,
+              severity: "error",
+            },
+          ],
+        }),
+      );
+    }
+
+    await Promise.all(writes);
+
+    const updated = await firstStore.findByKey(session.key);
+    assert.equal(updated.prompts.length, 50);
+    assert.deepEqual(
+      updated.prompts.map((prompt) => prompt.uid).sort((a, b) => Number(a) - Number(b)),
+      Array.from({ length: 50 }, (_, index) => String(index)),
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("queued prompts are returned with DOM snapshot context and then cleared", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
   try {
