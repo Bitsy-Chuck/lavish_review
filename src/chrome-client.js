@@ -53,6 +53,10 @@ const layoutGateCopy = /** @type {HTMLParagraphElement} */ (document.getElementB
 const layoutGateAction = /** @type {HTMLButtonElement} */ (document.getElementById("layoutGateAction"));
 const layoutIssueBanner = /** @type {HTMLDivElement} */ (document.getElementById("layoutIssueBanner"));
 const sendHint = /** @type {HTMLDivElement} */ (document.getElementById("sendHint"));
+const connectionBanner = /** @type {HTMLDivElement} */ (document.getElementById("connectionBanner"));
+const submitError = /** @type {HTMLDivElement} */ (document.getElementById("submitError"));
+const submitErrorText = /** @type {HTMLSpanElement} */ (document.getElementById("submitErrorText"));
+const submitRetryButton = /** @type {HTMLButtonElement} */ (document.getElementById("submitRetry"));
 const whiteboardOverlay = /** @type {HTMLDivElement} */ (document.getElementById("whiteboardOverlay"));
 const whiteboardFrame = /** @type {HTMLIFrameElement} */ (document.getElementById("whiteboardFrame"));
 const whiteboardCloseButton = /** @type {HTMLButtonElement} */ (document.getElementById("whiteboardClose"));
@@ -86,6 +90,42 @@ let lastScroll = { x: 0, y: 0 };
 let copyHintTimer;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendHintTimer;
+
+const DEFAULT_SEND_HINT_TEXT = "Write a message or annotate an element first.";
+// The artifact answers snapshot requests over postMessage. If its own JS threw before the SDK
+// registered that listener the answer never arrives, so every request is bounded and falls back to
+// sending without a snapshot instead of leaving the click with no effect at all.
+const SNAPSHOT_TIMEOUT_MS = 2_500;
+// How long an unchanged "working" presence is trusted before the composer unlocks itself. The
+// server latches presence at "working" as soon as an agent takes delivery and stops polling, and
+// that latch outlives a page reload, so the escape hatch has to live here.
+const PRESENCE_STALL_MS = 45_000;
+const SSE_RECONNECT_BASE_MS = 1_000;
+const SSE_RECONNECT_MAX_MS = 15_000;
+// The server heartbeats every 15s. Missing three in a row means the stream is dead even when
+// EventSource never fired an error, which is exactly how a half-open proxied connection behaves.
+const SSE_HEARTBEAT_TIMEOUT_MS = 50_000;
+
+/** @type {EventSource | null} */
+let eventStream = null;
+let eventStreamConnected = false;
+let eventStreamEverOpened = false;
+let eventStreamAttempt = 0;
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let eventStreamReconnectTimer;
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let eventStreamWatchdogTimer;
+/** @type {Promise<void> | null} */
+let resyncPromise = null;
+let presenceStalled = false;
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let presenceStallTimer;
+let pendingComposerPrompt = null;
+let pendingComposerText = "";
+let pendingUserBubble = null;
+let lastSendEndAfter = false;
+/** @type {(() => void) | null} */
+let submitRetryAction = null;
 
 function escapeHtml(value) {
   return String(value).replace(
@@ -123,24 +163,7 @@ function persistQueuedPrompts() {
 }
 
 function render() {
-  annotationPills.innerHTML = queued
-    .map(
-      (prompt, index) =>
-        '<div class="pill-wrap"><div class="pill"><span class="pill-preview">' +
-        escapeHtml(prompt.prompt) +
-        '</span><button class="pill-close" type="button" aria-label="Remove queued prompt" data-index="' +
-        index +
-        '"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><div class="pill-tooltip">' +
-        (prompt.selector
-          ? '<div class="tooltip-label">Target</div><div class="pill-tooltip-target">' +
-            escapeHtml(prompt.selector) +
-            "</div>"
-          : "") +
-        '<div class="tooltip-label">Prompt</div><div class="pill-tooltip-prompt">' +
-        escapeHtml(prompt.prompt) +
-        "</div></div></div>",
-    )
-    .join("");
+  annotationPills.innerHTML = queued.map(renderQueuedPill).join("");
 
   for (const button of annotationPills.querySelectorAll(".pill-close")) {
     const closeButton = /** @type {HTMLButtonElement} */ (button);
@@ -150,18 +173,69 @@ function render() {
   scrollPanelToBottom();
 }
 
+// Keeps the pill index aligned with `queued` even for entries that render as nothing.
+function renderQueuedPill(prompt, index) {
+  // The freeform message behind an in-flight send still sits in the composer until the POST
+  // succeeds, so rendering it as a pill too would show the same text three times over.
+  if (prompt === pendingComposerPrompt) return "";
+  return (
+    '<div class="pill-wrap"><div class="pill"><span class="pill-preview">' +
+    escapeHtml(prompt.prompt) +
+    '</span><button class="pill-close" type="button" aria-label="Remove queued prompt" data-index="' +
+    index +
+    '"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><div class="pill-tooltip">' +
+    (prompt.selector
+      ? '<div class="tooltip-label">Target</div><div class="pill-tooltip-target">' +
+        escapeHtml(prompt.selector) +
+        "</div>"
+      : "") +
+    '<div class="tooltip-label">Prompt</div><div class="pill-tooltip-prompt">' +
+    escapeHtml(prompt.prompt) +
+    "</div></div></div>"
+  );
+}
+
 function updateSendState() {
-  sendButton.disabled = ended || agentPresence === "working";
+  // `presenceStalled` is the escape hatch: server presence can stay latched at "working" forever
+  // once an agent takes delivery and never polls again, and that must not mute the composer.
+  sendButton.disabled = ended || (agentPresence === "working" && !presenceStalled);
   sendAndEndButton.disabled = sendButton.disabled;
 }
 
-function showSendHint() {
+function setSendHint(text) {
+  sendHint.textContent = text;
   sendHint.hidden = false;
   clearTimeout(sendHintTimer);
   sendHintTimer = setTimeout(() => {
     sendHint.hidden = true;
   }, 2600);
+}
+
+function showSendHint() {
+  setSendHint(DEFAULT_SEND_HINT_TEXT);
   chatInput.focus();
+}
+
+// Transient notice in the composer for a degraded-but-completed action, as opposed to the
+// failure box, which sticks around and offers a retry.
+function showComposerNotice(message) {
+  setSendHint(message);
+}
+
+function showSubmitError(message, retry) {
+  submitErrorText.textContent = message;
+  submitRetryButton.hidden = !retry;
+  submitRetryAction = retry || null;
+  submitError.hidden = false;
+}
+
+function hideSubmitError() {
+  submitError.hidden = true;
+  submitRetryAction = null;
+}
+
+function setConnectionBanner(visible) {
+  connectionBanner.hidden = !visible || ended;
 }
 
 function hideSendHint() {
@@ -222,6 +296,12 @@ function syncChat(chat) {
 
   let lastChatBubble = null;
   for (const item of chat) lastChatBubble = addChat(item.role, item.text, false) || lastChatBubble;
+  // The optimistic bubble for an in-flight send is not in the server's chat yet. Re-append it so a
+  // sync landing mid-submit does not make the user's own message vanish before it is even sent.
+  if (pendingUserBubble) {
+    chatLog.appendChild(pendingUserBubble);
+    lastChatBubble = pendingUserBubble;
+  }
   if (workingBubble) {
     chatLog.appendChild(workingBubble);
     scrollElementIntoView(workingBubble);
@@ -231,7 +311,17 @@ function syncChat(chat) {
 }
 
 function setAgentPresence(state) {
-  agentPresence = state === "listening" || state === "working" ? state : "waiting";
+  const next = state === "listening" || state === "working" ? state : "waiting";
+  const changed = next !== agentPresence;
+  agentPresence = next;
+
+  if (agentPresence !== "working") {
+    clearPresenceStall();
+  } else if (changed) {
+    // A fresh transition into "working" is real news from the server, so trust it again.
+    armPresenceStall();
+  }
+
   updateSendState();
   if (presenceBanner) presenceBanner.hidden = ended || agentPresence !== "waiting";
 
@@ -246,8 +336,40 @@ function setAgentPresence(state) {
     workingBubble.className = "bubble agent agent-working";
     workingBubble.innerHTML = '<span class="spinner"></span><span>Working...</span>';
     chatLog.appendChild(workingBubble);
+    if (presenceStalled) markWorkingBubbleStalled();
   }
   scrollElementIntoView(workingBubble);
+}
+
+function armPresenceStall() {
+  clearTimeout(presenceStallTimer);
+  presenceStalled = false;
+  presenceStallTimer = setTimeout(handlePresenceStall, PRESENCE_STALL_MS);
+}
+
+function clearPresenceStall() {
+  clearTimeout(presenceStallTimer);
+  presenceStallTimer = undefined;
+  presenceStalled = false;
+}
+
+function handlePresenceStall() {
+  presenceStallTimer = undefined;
+  if (ended || agentPresence !== "working") return;
+  presenceStalled = true;
+  markWorkingBubbleStalled();
+  updateSendState();
+  // Ask the server before settling on the pessimistic story - the stall may just be a stream that
+  // dropped the presence event that would have cleared it.
+  resyncState().catch(() => {});
+}
+
+// A stalled agent must never keep showing the same spinner as a working one.
+function markWorkingBubbleStalled() {
+  if (!workingBubble) return;
+  workingBubble.classList.add("agent-stalled");
+  workingBubble.innerHTML =
+    '<span class="spinner"></span><span>No word from your agent for a while. It may have stopped listening - you can send again, and it will be delivered the next time the agent checks in.</span>';
 }
 
 function scrollPanelToBottom() {
@@ -300,20 +422,52 @@ function postToFrame(message) {
 }
 
 function requestSnapshot(action) {
-  snapshotRequests.push(action);
+  const request = { action, settled: false, timer: undefined };
+  request.timer = setTimeout(() => handleSnapshotTimeout(request), SNAPSHOT_TIMEOUT_MS);
+  snapshotRequests.push(request);
   postToFrame({ type: "lavish:requestSnapshot" });
 }
 
-function sendQueued(endAfter) {
-  if (ended || agentPresence === "working") return;
-  closeMenus();
+function takeSnapshotRequest() {
+  const request = snapshotRequests.shift();
+  if (!request) return null;
+  request.settled = true;
+  clearTimeout(request.timer);
+  return request;
+}
 
-  const text = chatInput.value.trim();
+function handleSnapshotTimeout(request) {
+  if (request.settled) return;
+  request.settled = true;
+  const index = snapshotRequests.indexOf(request);
+  if (index !== -1) snapshotRequests.splice(index, 1);
+
+  if (request.action === "copy") {
+    showComposerNotice("The artifact did not answer with a DOM snapshot. Reload the artifact and try again.");
+    return;
+  }
+  // Degraded send: the agent gets the feedback without a DOM snapshot, which beats a Send button
+  // that silently does nothing because the artifact's own JS threw before the SDK loaded.
+  pendingSnapshot = "";
+  showComposerNotice("The artifact did not respond, so this was sent without a page snapshot.");
+  submitQueued().catch(() => {});
+}
+
+function sendQueued(endAfter) {
+  if (ended || (agentPresence === "working" && !presenceStalled)) return;
+  closeMenus();
+  hideSubmitError();
+
+  // While a composer send is already in flight its text stays in the box, so re-reading it here
+  // would queue the same message twice.
+  const text = pendingComposerPrompt ? "" : chatInput.value.trim();
   if (text) {
-    queued.push({ uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" });
+    pendingComposerText = text;
+    pendingComposerPrompt = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" };
+    queued.push(pendingComposerPrompt);
     persistQueuedPrompts();
-    addChat("user", text);
-    chatInput.value = "";
+    pendingUserBubble = addChat("user", text) || null;
+    if (pendingUserBubble) pendingUserBubble.classList.add("pending");
     render();
   }
   if (!queued.length) {
@@ -322,8 +476,45 @@ function sendQueued(endAfter) {
   }
   hideSendHint();
 
+  lastSendEndAfter = Boolean(endAfter);
   if (endAfter) endAfterSubmit = true;
   requestSnapshot("submit");
+}
+
+// The composer only loses the user's text once the server has it.
+function commitPendingComposer() {
+  if (!pendingComposerPrompt) return;
+  if (chatInput.value.trim() === pendingComposerText) chatInput.value = "";
+  if (pendingUserBubble) pendingUserBubble.classList.remove("pending");
+  pendingComposerPrompt = null;
+  pendingComposerText = "";
+  pendingUserBubble = null;
+}
+
+// ...and gets it back, along with its bubble, if the send failed.
+function rollbackPendingComposer() {
+  if (pendingComposerPrompt) {
+    const index = queued.indexOf(pendingComposerPrompt);
+    if (index !== -1) queued.splice(index, 1);
+    persistQueuedPrompts();
+  }
+  if (pendingUserBubble) pendingUserBubble.remove();
+  if (pendingComposerText && !chatInput.value.trim()) chatInput.value = pendingComposerText;
+  pendingComposerPrompt = null;
+  pendingComposerText = "";
+  pendingUserBubble = null;
+  render();
+}
+
+function handleSubmitFailure() {
+  rollbackPendingComposer();
+  showSubmitError("Could not reach Lavish, so nothing was sent.", () => sendQueued(lastSendEndAfter));
+}
+
+function handleEndSessionFailure() {
+  showSubmitError("Could not reach Lavish to end this session.", () => {
+    endSession().catch(handleEndSessionFailure);
+  });
 }
 
 async function submitQueued() {
@@ -344,12 +535,13 @@ async function submitQueued() {
     submitQueuedAgain = false;
     if (!succeeded) {
       endAfterSubmit = false;
+      handleSubmitFailure();
     } else if (!ended && shouldSubmitAgain) {
       if (queued.length) {
-        submitQueued();
+        submitQueued().catch(() => {});
       } else if (endAfterSubmit) {
         endAfterSubmit = false;
-        endSession();
+        endSession().catch(handleEndSessionFailure);
       }
     }
   }
@@ -371,6 +563,8 @@ async function submitQueuedOnce() {
     if (index !== -1) queued.splice(index, 1);
   }
   persistQueuedPrompts();
+  commitPendingComposer();
+  hideSubmitError();
   render();
   if (shouldEndSession) {
     endAfterSubmit = false;
@@ -506,6 +700,10 @@ async function endSession() {
 function markSessionEnded() {
   if (ended) return;
   ended = true;
+  clearPresenceStall();
+  hideSubmitError();
+  stopEventStream();
+  setConnectionBanner(false);
   closeMenus();
   closeWhiteboard();
   annotationSwitch.disabled = true;
@@ -1189,12 +1387,15 @@ window.addEventListener("message", (event) => {
     enqueuePrompt(msg.prompt);
   }
   if (msg.type === "lavish:snapshot") {
-    const snapshotAction = snapshotRequests.shift() || "submit";
+    const request = takeSnapshotRequest();
+    // A snapshot that arrives after its request already timed out has no pending request left, and
+    // acting on it would submit the queue a second time.
+    const snapshotAction = request ? request.action : "";
     if (snapshotAction === "copy") {
       copyText(msg.snapshot || "");
-    } else {
+    } else if (snapshotAction === "submit") {
       pendingSnapshot = msg.snapshot || "";
-      submitQueued();
+      submitQueued().catch(() => {});
     }
   }
   if (msg.type === "lavish:scroll") {
@@ -1205,7 +1406,7 @@ window.addEventListener("message", (event) => {
     submitLayoutWarnings(msg.layout_warnings).catch(() => {});
   }
   if (msg.type === "lavish:sendQueuedPrompts") sendQueued();
-  if (msg.type === "lavish:endSession") endSession();
+  if (msg.type === "lavish:endSession") endSession().catch(handleEndSessionFailure);
   if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();
 });
 
@@ -1245,7 +1446,12 @@ copyShareUrlButton.onclick = () => copyToButton(shareUrlInput.value, copyShareUr
 copyUpdateKeyButton.onclick = () => copyToButton(shareUpdateKeyInput.value, copyUpdateKeyButton, "Copy key");
 endButton.onclick = () => {
   closeMenus();
-  endSession();
+  endSession().catch(handleEndSessionFailure);
+};
+submitRetryButton.onclick = () => {
+  const retry = submitRetryAction;
+  hideSubmitError();
+  if (retry) retry();
 };
 document.addEventListener("mousedown", (event) => {
   const target = /** @type {Node} */ (event.target);
@@ -1286,16 +1492,132 @@ frame.addEventListener("load", () => {
 
 initializeLayoutGate();
 
-const events = new EventSource("/events/" + key);
-events.addEventListener("reload", () => {
-  resetFrame().then((reloaded) => {
-    if (reloaded) refreshWhiteboardSource();
+// The browser's own EventSource retry cannot be relied on here. Through `tailscale serve` a dead
+// backend answers 502, and the WHATWG processing model fails a stream on any non-200 permanently -
+// no reconnect, ever. The only recovery path Lavish had (the chrome-reload event) rode that same
+// dead stream, so an outage left the page silently deaf until someone reloaded it by hand.
+function connectEventStream() {
+  clearTimeout(eventStreamReconnectTimer);
+  eventStreamReconnectTimer = undefined;
+  if (ended) return;
+
+  closeEventStream();
+  const stream = new EventSource("/events/" + key);
+  eventStream = stream;
+
+  stream.addEventListener("open", () => {
+    if (stream !== eventStream) return;
+    const reconnected = eventStreamEverOpened;
+    eventStreamConnected = true;
+    eventStreamEverOpened = true;
+    eventStreamAttempt = 0;
+    setConnectionBanner(false);
+    noteEventStreamActivity();
+    // Nothing replays what was missed while the stream was down, so a reconnected client re-reads
+    // authoritative state instead of assuming the gap was empty.
+    if (reconnected) resyncState().catch(() => {});
   });
+  stream.addEventListener("error", () => {
+    if (stream !== eventStream) return;
+    handleEventStreamFailure();
+  });
+  stream.addEventListener("heartbeat", () => noteEventStreamActivity());
+  stream.addEventListener("reload", () => {
+    noteEventStreamActivity();
+    resetFrame().then((reloaded) => {
+      if (reloaded) refreshWhiteboardSource();
+    });
+  });
+  stream.addEventListener("chrome-reload", () => reloadAfterServerRestart());
+  stream.addEventListener("agent-reply", (event) => {
+    noteEventStreamActivity();
+    addChat("agent", JSON.parse(event.data).text);
+  });
+  stream.addEventListener("chat-sync", (event) => {
+    noteEventStreamActivity();
+    syncChat(JSON.parse(event.data).chat || []);
+  });
+  stream.addEventListener("agent-presence", (event) => {
+    noteEventStreamActivity();
+    setAgentPresence(JSON.parse(event.data).state);
+  });
+  stream.addEventListener("session-ended", () => markSessionEnded());
+}
+
+function closeEventStream() {
+  if (!eventStream) return;
+  eventStream.close?.();
+  eventStream = null;
+}
+
+function stopEventStream() {
+  clearTimeout(eventStreamReconnectTimer);
+  eventStreamReconnectTimer = undefined;
+  clearTimeout(eventStreamWatchdogTimer);
+  eventStreamWatchdogTimer = undefined;
+  eventStreamConnected = false;
+  closeEventStream();
+}
+
+function handleEventStreamFailure() {
+  clearTimeout(eventStreamWatchdogTimer);
+  eventStreamWatchdogTimer = undefined;
+  eventStreamConnected = false;
+  closeEventStream();
+  if (ended) return;
+  setConnectionBanner(true);
+  scheduleEventStreamReconnect();
+}
+
+function scheduleEventStreamReconnect() {
+  clearTimeout(eventStreamReconnectTimer);
+  const capped = Math.min(SSE_RECONNECT_MAX_MS, SSE_RECONNECT_BASE_MS * 2 ** eventStreamAttempt);
+  eventStreamAttempt += 1;
+  // Jitter across the capped window so every tab that lost the same server does not come back in
+  // lockstep the moment it returns.
+  const delay = Math.round(capped * (0.5 + Math.random() * 0.5));
+  eventStreamReconnectTimer = setTimeout(connectEventStream, delay);
+}
+
+// A connection that goes half-open - a proxy dropping the path, a laptop suspending - keeps
+// delivering nothing without ever firing `error`. Server heartbeats turn that silence into a
+// detectable failure.
+function noteEventStreamActivity() {
+  clearTimeout(eventStreamWatchdogTimer);
+  eventStreamWatchdogTimer = setTimeout(handleEventStreamFailure, SSE_HEARTBEAT_TIMEOUT_MS);
+}
+
+function reconnectEventStreamNow() {
+  if (ended || eventStreamConnected) return;
+  eventStreamAttempt = 0;
+  connectEventStream();
+}
+
+async function resyncState() {
+  if (resyncPromise) return resyncPromise;
+  resyncPromise = resyncStateOnce();
+  try {
+    return await resyncPromise;
+  } finally {
+    resyncPromise = null;
+  }
+}
+
+async function resyncStateOnce() {
+  const response = await fetch("/api/" + key + "/state", { cache: "no-store" });
+  if (!response.ok) throw new Error("failed to resync session state");
+  const state = await response.json();
+  syncChat(Array.isArray(state.chat) ? state.chat : []);
+  setAgentPresence(String(state.presence || "waiting"));
+  if (state.ended) markSessionEnded();
+}
+
+window.addEventListener("online", reconnectEventStreamNow);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "hidden") reconnectEventStreamNow();
 });
-events.addEventListener("chrome-reload", () => reloadAfterServerRestart());
-events.addEventListener("agent-reply", (event) => addChat("agent", JSON.parse(event.data).text));
-events.addEventListener("chat-sync", (event) => syncChat(JSON.parse(event.data).chat || []));
-events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse(event.data).state));
+
+connectEventStream();
 
 render();
 initialChat.forEach((item) => addChat(item.role, item.text));

@@ -97,6 +97,18 @@ function allowSandboxedArtifactOrigin(res) {
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
 const WHITEBOARD_CHANNEL_TOKEN_TTL_MS = 5 * 60_000;
 
+// Browser event-stream resilience knobs.
+//
+// `retry:` is the reconnect hint the EventSource spec lets the server set. It only governs the
+// browser's own automatic reconnect; chrome-client.js additionally drives an explicit reconnect
+// loop because a non-200 response (an HTTP 502 from `tailscale serve` in front of a dead backend,
+// for example) makes the spec's processing model fail the stream permanently with no retry at all.
+const SSE_RETRY_HINT_MS = 2_000;
+// The heartbeat is a real named event rather than an SSE comment so the client can watchdog it.
+// A connection that goes half-open through a proxy or a sleeping laptop simply stops delivering
+// bytes without ever firing an `error`, which is the other way this stream went permanently deaf.
+const SSE_HEARTBEAT_MS = 15_000;
+
 // The whiteboard frame bundle (Excalidraw + Mermaid converter + React) is
 // produced by `scripts/build.js` into dist/whiteboard. Packaged runs find it
 // next to the served bundle; source runs (node bin/lavish-axi.js) fall back to
@@ -307,10 +319,38 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
-      if (shouldEndSession) clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+      // Feedback that lands while nothing is polling has not been delivered to anyone, so the
+      // session is not "working" on it - it is waiting for an agent to show up. Without this the
+      // presence latch survives forever once an agent takes delivery and never polls again.
+      if (shouldEndSession || !activePolls.has(req.params.key)) {
+        clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+      }
       events.emit(shouldEndSession ? "ended" : "feedback", req.params.key);
       res.json({ status: "queued", pending_prompts: session.pending_prompts });
       if (shouldEndSession) await shutdownIfNoLiveSessions();
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Authoritative state for a browser that just reconnected. The event stream carries no history,
+  // so a client that missed events while offline re-reads chat, presence and session status here
+  // rather than assuming nothing happened while it was gone.
+  app.get("/api/:key/state", async (req, res, next) => {
+    try {
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      res.json({
+        key: session.key,
+        status: session.status || "open",
+        ended: session.status === "ended",
+        presence: computePresence(req.params.key, activePolls, deliveredFeedback),
+        chat: session.chat || [],
+        pending_prompts: session.pending_prompts || 0,
+      });
     } catch (error) {
       next(error);
     }
@@ -513,37 +553,50 @@ export async function serve({
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         connection: "keep-alive",
+        // Ask reverse proxies not to buffer the stream; a buffered SSE body looks identical to a
+        // hung agent from the browser.
+        "x-accel-buffering": "no",
       });
       sseClients.add(res);
       refreshIdleTimer();
+      // `id:` is a per-connection sequence, used for ordering and for spotting gaps in a capture.
+      // Lavish keeps no event log, so Last-Event-ID replay is deliberately NOT supported: the
+      // client treats GET /api/:key/state as authoritative after every reconnect instead.
+      let eventId = 0;
+      const write = (event, data) => {
+        if (res.writableEnded) return;
+        eventId += 1;
+        res.write(`id: ${eventId}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      };
+      res.write(`retry: ${SSE_RETRY_HINT_MS}\n\n`);
       const session = await store.findByKey(req.params.key);
       const sendReload = (key) => {
-        if (key === req.params.key) {
-          res.write("event: reload\ndata: {}\n\n");
-        }
+        if (key === req.params.key) write("reload", {});
       };
       const sendAgentReply = (key, text) => {
-        if (key === req.params.key) {
-          res.write(`event: agent-reply\ndata: ${JSON.stringify({ text })}\n\n`);
-        }
+        if (key === req.params.key) write("agent-reply", { text });
       };
       const sendPresence = (key, state) => {
-        if (key === req.params.key) {
-          res.write(`event: agent-presence\ndata: ${JSON.stringify({ state })}\n\n`);
-        }
+        if (key === req.params.key) write("agent-presence", { state });
       };
-      res.write(`event: chat-sync\ndata: ${JSON.stringify({ chat: session?.chat || [] })}\n\n`);
-      res.write(
-        `event: agent-presence\ndata: ${JSON.stringify({ state: computePresence(req.params.key, activePolls, deliveredFeedback) })}\n\n`,
-      );
+      const sendEnded = (key) => {
+        if (key === req.params.key) write("session-ended", {});
+      };
+      write("chat-sync", { chat: session?.chat || [] });
+      write("agent-presence", { state: computePresence(req.params.key, activePolls, deliveredFeedback) });
+      const heartbeat = setInterval(() => write("heartbeat", {}), SSE_HEARTBEAT_MS);
+      heartbeat.unref?.();
       events.on("reload", sendReload);
       events.on("agent-reply", sendAgentReply);
       events.on("agent-presence", sendPresence);
+      events.on("ended", sendEnded);
       req.on("close", () => {
+        clearInterval(heartbeat);
         sseClients.delete(res);
         events.off("reload", sendReload);
         events.off("agent-reply", sendAgentReply);
         events.off("agent-presence", sendPresence);
+        events.off("ended", sendEnded);
         refreshIdleTimer();
       });
     } catch (error) {
@@ -1228,7 +1281,7 @@ ${faviconTag}
 </head>
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe><div class="layout-issue-banner" id="layoutIssueBanner" hidden>This surface may have layout issues. Your agent has been notified.</div></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe><div class="layout-issue-banner" id="layoutIssueBanner" hidden>This surface may have layout issues. Your agent has been notified.</div></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="connection-banner" id="connectionBanner" role="status" hidden>Reconnecting to Lavish...</div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="composer-error" id="submitError" role="alert" hidden><span class="composer-error-text" id="submitErrorText"></span><button class="composer-error-retry" id="submitRetry" type="button">Retry</button></div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label>Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label>Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note">Keep the update key private. ht-ml.app returns it once and it is the only way to update or delete this page later.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p></div></div>

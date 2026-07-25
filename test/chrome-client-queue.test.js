@@ -51,6 +51,18 @@ async function createChromeHarness({
     }
   }
 
+  // Jittered delays have no fixed ms to match on, so let callers select by range.
+  function runTimersWhere(predicate) {
+    let ran = 0;
+    for (const timer of [...timers.values()]) {
+      if (!predicate({ id: timer.id, ms: timer.ms })) continue;
+      timers.delete(timer.id);
+      timer.fn();
+      ran += 1;
+    }
+    return ran;
+  }
+
   function element(id) {
     if (elements.has(id)) return elements.get(id);
     const listeners = new Map();
@@ -172,11 +184,16 @@ async function createChromeHarness({
       constructor(url) {
         this.url = url;
         this.listeners = new Map();
+        this.closed = false;
         eventSources.push(this);
       }
 
       addEventListener(type, handler) {
         this.listeners.set(type, handler);
+      }
+
+      close() {
+        this.closed = true;
       }
     },
     document: {
@@ -238,6 +255,12 @@ async function createChromeHarness({
       assert.equal(eventSources.length, 1);
       return eventSources[0];
     },
+    eventSources() {
+      return eventSources;
+    },
+    latestEventSource() {
+      return eventSources[eventSources.length - 1];
+    },
     sendFrameMessage(data) {
       const handlers = windowListeners.get("message") || [];
       assert.ok(handlers.length > 0, "chrome-client registered a message handler");
@@ -278,6 +301,7 @@ async function createChromeHarness({
       return reloadCount;
     },
     runTimers,
+    runTimersWhere,
     srcLoads,
   };
 }
@@ -1315,4 +1339,237 @@ test("whiteboard close stays responsive while overlay initialization is pending"
 
   releaseOverlaySources?.();
   await flushPromises();
+});
+
+test("chrome client reconnects the event stream after an error and resyncs authoritative state", async () => {
+  const requests = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      requests.push(url);
+      return {
+        ok: true,
+        json: async () => ({
+          status: "open",
+          ended: false,
+          presence: "listening",
+          chat: [{ role: "agent", text: "Reply you missed while offline" }],
+        }),
+      };
+    },
+  });
+
+  const first = chrome.latestEventSource();
+  first.listeners.get("open")();
+  assert.equal(chrome.element("connectionBanner").hidden, true);
+
+  first.listeners.get("error")();
+
+  // The dead stream is explicitly closed - the spec will not retry a stream that failed on a
+  // non-200 response, so leaving it open would leave the page deaf forever.
+  assert.equal(first.closed, true);
+  assert.equal(chrome.element("connectionBanner").hidden, false);
+  assert.equal(chrome.eventSources().length, 1);
+
+  // Backoff, not a hot loop: the first retry lands inside the jittered 1s window.
+  const ran = chrome.runTimersWhere((timer) => timer.ms >= 500 && timer.ms <= 1000);
+  assert.equal(ran, 1);
+  assert.equal(chrome.eventSources().length, 2);
+
+  const second = chrome.latestEventSource();
+  second.listeners.get("open")();
+  await flushPromises();
+
+  assert.equal(chrome.element("connectionBanner").hidden, true);
+  assert.ok(requests.includes("/api/abc/state"));
+  assert.match(chrome.element("chatLog").lastAppendedChild.innerHTML, /Reply you missed while offline/);
+  assert.equal(chrome.element("send").disabled, false);
+});
+
+test("chrome client treats a silent event stream as dead even without an error", async () => {
+  const chrome = await createChromeHarness();
+
+  const first = chrome.latestEventSource();
+  first.listeners.get("open")();
+  assert.equal(chrome.element("connectionBanner").hidden, true);
+
+  // No heartbeat for three intervals: a half-open connection never fires `error`.
+  chrome.runTimers(50_000);
+
+  assert.equal(first.closed, true);
+  assert.equal(chrome.element("connectionBanner").hidden, false);
+  chrome.runTimersWhere((timer) => timer.ms >= 500 && timer.ms <= 1000);
+  assert.equal(chrome.eventSources().length, 2);
+});
+
+test("chrome client stops reconnecting once the session has ended", async () => {
+  const chrome = await createChromeHarness();
+
+  const stream = chrome.latestEventSource();
+  stream.listeners.get("open")();
+  stream.listeners.get("session-ended")();
+
+  assert.equal(chrome.element("endedOverlay").hidden, false);
+  assert.equal(stream.closed, true);
+
+  stream.listeners.get("error")();
+  chrome.runTimersWhere((timer) => timer.ms >= 500 && timer.ms <= 15_000);
+
+  assert.equal(chrome.eventSources().length, 1);
+  assert.equal(chrome.element("connectionBanner").hidden, true);
+});
+
+test("chrome client unlocks the composer when a working presence goes stale", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ presence: "working", ended: false, chat: [] }) }),
+  });
+
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "working" }) });
+  assert.equal(chrome.element("send").disabled, true);
+  assert.equal(chrome.element("sendAndEnd").disabled, true);
+  assert.match(chrome.element("chatLog").lastAppendedChild.innerHTML, /Working\.\.\./);
+
+  chrome.runTimers(45_000);
+  await flushPromises();
+
+  assert.equal(chrome.element("send").disabled, false);
+  assert.equal(chrome.element("sendAndEnd").disabled, false);
+  const bubble = chrome.element("chatLog").lastAppendedChild;
+  assert.ok(bubble.classList.contains("agent-stalled"));
+  assert.match(bubble.innerHTML, /No word from your agent for a while/);
+});
+
+test("chrome client re-locks the composer when the agent starts working again", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ presence: "working", ended: false, chat: [] }) }),
+  });
+  const presence = chrome.eventSource().listeners.get("agent-presence");
+
+  presence({ data: JSON.stringify({ state: "working" }) });
+  chrome.runTimers(45_000);
+  await flushPromises();
+  assert.equal(chrome.element("send").disabled, false);
+
+  presence({ data: JSON.stringify({ state: "listening" }) });
+  assert.equal(chrome.element("send").disabled, false);
+
+  presence({ data: JSON.stringify({ state: "working" }) });
+  assert.equal(chrome.element("send").disabled, true);
+});
+
+test("chrome client sends without a snapshot when the artifact never answers", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: JSON.parse(init.body) });
+      return { ok: true };
+    },
+  });
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Fix the header", selector: "h1", tag: "annotation", text: "Header" },
+  });
+  chrome.element("send").onclick();
+  assert.equal(posts.length, 0);
+
+  chrome.runTimers(2500);
+  await flushPromises();
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, "/api/abc/prompts");
+  assert.equal(posts[0].body.domSnapshot, "");
+  assert.match(chrome.element("sendHint").textContent, /without a page snapshot/);
+  assert.equal(chrome.queued().length, 0);
+
+  // A snapshot that finally arrives after the timeout must not submit the queue a second time.
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "late" });
+  await flushPromises();
+  assert.equal(posts.length, 1);
+});
+
+test("chrome client keeps the typed message and offers a retry when the submit fails", async () => {
+  const posts = [];
+  let ok = false;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: init?.body ? JSON.parse(init.body) : null });
+      return { ok };
+    },
+  });
+
+  chrome.element("chatInput").value = "Please tighten the spacing";
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(posts.length, 1);
+  // The composer never loses text the server did not accept.
+  assert.equal(chrome.element("chatInput").value, "Please tighten the spacing");
+  assert.equal(chrome.element("submitError").hidden, false);
+  assert.equal(chrome.element("submitRetry").hidden, false);
+  assert.equal(chrome.queued().length, 0);
+
+  ok = true;
+  chrome.element("submitRetry").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(posts.length, 2);
+  assert.deepEqual(posts[1].body.prompts, [
+    { uid: "", prompt: "Please tighten the spacing", selector: "", tag: "message", text: "Freeform message" },
+  ]);
+  assert.equal(chrome.element("chatInput").value, "");
+  assert.equal(chrome.element("submitError").hidden, true);
+  assert.equal(chrome.queued().length, 0);
+});
+
+test("chrome client keeps annotation pills queued when their submit fails", async () => {
+  const chrome = await createChromeHarness({ fetchImpl: async () => ({ ok: false }) });
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Fix the header", selector: "h1", tag: "annotation", text: "Header" },
+  });
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  await flushPromises();
+
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["Fix the header"],
+  );
+  assert.equal(chrome.element("submitError").hidden, false);
+});
+
+test("chrome client clears the composer only after the submit succeeds", async () => {
+  let releasePost = () => {};
+  const held = new Promise((resolve) => {
+    releasePost = () => resolve();
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => {
+      await held;
+      return { ok: true };
+    },
+  });
+
+  chrome.element("chatInput").value = "Please tighten the spacing";
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+
+  assert.equal(chrome.element("chatInput").value, "Please tighten the spacing");
+  // The in-flight message shows as a dimmed bubble, not as a duplicate pill.
+  assert.ok(chrome.element("chatLog").lastAppendedChild.classList.contains("pending"));
+  assert.equal(chrome.element("annotationPills").innerHTML, "");
+
+  releasePost();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.element("chatInput").value, "");
+  assert.equal(chrome.element("chatLog").lastAppendedChild.classList.contains("pending"), false);
 });
