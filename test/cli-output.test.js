@@ -289,10 +289,20 @@ test("diagram playbook selects diagram types and rejects diagram-shaped prose", 
   assert.match(guidance, /catchup\.html is the cautionary case/);
   assert.match(guidance, /accTitle and accDescr/);
   assert.match(guidance, /useMaxWidth:false/);
+  assert.match(guidance, /max-width:none/);
   assert.match(guidance, /look: handDrawn/);
   assert.match(guidance, /layout/);
   assert.match(guidance, /%%\{init\}%% directive/);
+  assert.match(guidance, /registers dagre and cose-bilkent, not ELK/);
+  assert.doesNotMatch(guidance, /"layout":"elk"/);
   assert.match(guidance, /EDITABLE Excalidraw shapes/);
+  assert.match(guidance, /11\.13\.0\+ degrades conversion/);
+  assert.match(guidance, /input\["Input"\]/);
+  assert.match(guidance, /radar-beta\\n {2}accTitle:/);
+  assert.match(guidance, /treemap-beta\\n {2}accTitle:/);
+  assert.match(guidance, /architecture-beta\\n {2}accTitle:/);
+  assert.match(guidance, /C4Context\\n {2}accDescr:/);
+  assert.match(guidance, /kanban parses but drops them/);
   for (const type of [
     "sequence",
     "state",

@@ -6,12 +6,15 @@ import {
   classifyHorizontalOverflow,
   classifyScaledDownSvg,
   classifyVerticalOverflow,
+  createArtifactSdk,
+  createTwoPointerTracker,
   deriveLavishQueueKey,
   fragmentsSignificantlyOverlap,
   isModeToggleHotkeyEvent,
   isNativeInteractiveControl,
   isSvgLayoutDescendant,
   resolveVisibleSpillCandidates,
+  scaledDownDiagramSeverity,
 } from "../src/artifact-sdk.js";
 
 test("calculatePinchGesture reports two-finger pan centers and zoom factor", () => {
@@ -38,6 +41,169 @@ test("classifyScaledDownSvg flags a diagram rendered below 75% of its intrinsic 
 test("classifyScaledDownSvg ignores a normally-sized diagram", () => {
   assert.equal(classifyScaledDownSvg({ renderedWidth: 780, intrinsicMaxWidth: 900 }), null);
   assert.equal(classifyScaledDownSvg({ renderedWidth: 900, intrinsicMaxWidth: 900 }), null);
+});
+
+test("scaled-down diagrams block below 60% and warn below 75%", () => {
+  assert.equal(scaledDownDiagramSeverity(0.4), "error");
+  assert.equal(scaledDownDiagramSeverity(0.59), "error");
+  assert.equal(scaledDownDiagramSeverity(0.6), "warning");
+  assert.equal(scaledDownDiagramSeverity(0.74), "warning");
+});
+
+test("two-pointer tracker ignores a third finger and cleans up cancel or lost capture", () => {
+  const pointers = createTwoPointerTracker();
+  assert.equal(pointers.add(1, { x: 0, y: 0 }), true);
+  assert.equal(pointers.add(2, { x: 10, y: 0 }), true);
+  assert.equal(pointers.add(3, { x: 20, y: 0 }), false);
+  assert.deepEqual(pointers.pair(), { a: { x: 0, y: 0 }, b: { x: 10, y: 0 } });
+
+  assert.equal(pointers.delete(1), true); // pointercancel
+  assert.equal(pointers.pair(), null);
+  assert.equal(pointers.add(3, { x: 20, y: 0 }), true);
+  assert.deepEqual(pointers.pair(), { a: { x: 10, y: 0 }, b: { x: 20, y: 0 } });
+  assert.equal(pointers.delete(2), true); // lostpointercapture
+  assert.equal(pointers.size, 1);
+});
+
+test("Mermaid enhancement snapshots geometry before whiteboard hiding and the layout audit reports it", () => {
+  const saved = Object.fromEntries(
+    ["window", "document", "parent", "Element", "getComputedStyle"].map((key) => [key, globalThis[key]]),
+  );
+  const rect = (width, height) => ({ left: 0, top: 0, right: width, bottom: height, width, height });
+  const styleDefaults = {
+    display: "block",
+    visibility: "visible",
+    opacity: "1",
+    overflowX: "visible",
+    overflowY: "visible",
+    position: "static",
+    maxWidth: "100%",
+    borderLeftWidth: "0px",
+    borderRightWidth: "0px",
+    borderTopWidth: "0px",
+    borderBottomWidth: "0px",
+    paddingLeft: "0px",
+    paddingRight: "0px",
+    paddingTop: "0px",
+    paddingBottom: "0px",
+  };
+  const setGlobal = (key, value) => {
+    Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+  };
+
+  try {
+    setGlobal(
+      "Element",
+      class {
+        static [Symbol.hasInstance](value) {
+          return value?.nodeType === 1;
+        }
+      },
+    );
+    const body = node("body");
+    const container = append(body, node("pre", { class: "mermaid" }));
+    container.className = "mermaid";
+    container.style = {};
+    container.getBoundingClientRect = () => rect(500, container.style.display === "none" ? 0 : 80);
+    container.getClientRects = () => [];
+    container.insertAdjacentElement = (_position, child) => append(body, child);
+    const svg = append(container, node("svg", { id: "mermaid-wide", viewBox: "0 0 1223 80", width: "100%" }));
+    svg.style = {};
+    svg.getBoundingClientRect = () => (container.style.display === "none" ? rect(0, 0) : rect(500, 80));
+    svg.getClientRects = () => [];
+    svg.getBBox = () => ({ x: 0, y: 0, width: 1223, height: 80 });
+    svg.setAttribute = (name, value) => {
+      attrsFor(svg)[name] = String(value);
+      if (name === "id") svg.id = String(value);
+    };
+    const listeners = new Map();
+    const captures = [];
+    svg.addEventListener = (type, listener) => listeners.set(type, listener);
+    svg.setPointerCapture = (id) => captures.push(id);
+    svg.releasePointerCapture = () => {};
+    svg.scrollWidth = svg.clientWidth = 500;
+    svg.scrollHeight = svg.clientHeight = 80;
+
+    const documentElement = node("html", {}, [body]);
+    documentElement.style = {};
+    documentElement.scrollWidth = 500;
+    documentElement.clientWidth = 500;
+    documentElement.appendChild = (child) => append(documentElement, child);
+    for (const el of [body, container, documentElement]) {
+      el.getBoundingClientRect ||= () => rect(500, 100);
+      el.getClientRects ||= () => [];
+      el.scrollWidth ||= 500;
+      el.clientWidth ||= 500;
+      el.scrollHeight ||= 100;
+      el.clientHeight ||= 100;
+    }
+
+    setGlobal("window", {
+      innerWidth: 500,
+      innerHeight: 800,
+      addEventListener() {},
+      setTimeout() {},
+      requestAnimationFrame() {},
+    });
+    setGlobal("parent", { postMessage() {} });
+    setGlobal("document", {
+      body,
+      documentElement,
+      querySelectorAll(selector) {
+        if (selector === "svg") return [svg];
+        if (selector === ".mermaid") return [container];
+        return [];
+      },
+      createElement(tag) {
+        const el = node(tag);
+        el.style = {};
+        el.setAttribute = (name, value) => {
+          attrsFor(el)[name] = String(value);
+        };
+        el.getBoundingClientRect = () => rect(500, 456);
+        return el;
+      },
+      elementFromPoint() {
+        return null;
+      },
+    });
+    setGlobal("getComputedStyle", (el) => ({
+      ...styleDefaults,
+      .../** @type {any} */ (el.style || {}),
+    }));
+
+    const hooks = {};
+    createArtifactSdk(() => "", undefined, undefined, hooks);
+    hooks.enhanceMermaid();
+    assert.equal(container.style.display, "none");
+    assert.equal(svg.style.touchAction, "pan-y");
+    hooks.setMermaidFrozen(false);
+    assert.equal(svg.style.touchAction, "none");
+    hooks.setMermaidFrozen(true);
+    assert.equal(svg.style.touchAction, "pan-y");
+    listeners.get("pointerdown")({ button: 0, pointerId: 1, clientX: 10, clientY: 10 });
+    assert.deepEqual(captures, [], "a frozen one-finger annotation pointer is not captured or click-retargeted");
+    listeners.get("pointerdown")({ button: 0, pointerId: 2, clientX: 20, clientY: 10 });
+    assert.deepEqual(captures, [1, 2], "capture starts only once a two-finger diagram gesture exists");
+    listeners.get("pointerdown")({ button: 0, pointerId: 3, clientX: 30, clientY: 10 });
+    assert.deepEqual(captures, [1, 2], "a third finger is ignored");
+    listeners.get("pointercancel")({ pointerId: 1 });
+    listeners.get("lostpointercapture")({ pointerId: 2 });
+    assert.deepEqual(hooks.auditLayout(), [
+      {
+        selector: "html > body > pre",
+        kind: "scaled-down-diagram",
+        overflowPx: 723,
+        viewportWidth: 500,
+        severity: "error",
+      },
+    ]);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete globalThis[key];
+      else setGlobal(key, value);
+    }
+  }
 });
 
 function node(tag, attrs = {}, children = []) {
@@ -78,6 +244,17 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
+function attrsFor(el) {
+  // The small fake DOM intentionally keeps attributes behind getAttribute.
+  // Install a mutable overlay only for integration-test nodes that need writes.
+  if (!el.__testAttrs) {
+    el.__testAttrs = {};
+    const original = el.getAttribute.bind(el);
+    el.getAttribute = (name) => (Object.hasOwn(el.__testAttrs, name) ? el.__testAttrs[name] : original(name));
+  }
+  return el.__testAttrs;
+}
+
 function append(parent, child) {
   child.parentElement = parent;
   parent.children.push(child);
@@ -89,6 +266,14 @@ function matchesSelectorList(el, selectorList) {
 }
 
 function matchesSelector(el, selector) {
+  if (selector === ".mermaid")
+    return String(el.className || "")
+      .split(/\s+/)
+      .includes("mermaid");
+  if (selector === ".mermaid, [data-lavish-mermaid]") {
+    return matchesSelector(el, ".mermaid") || el.getAttribute("data-lavish-mermaid") !== null;
+  }
+  if (selector === "[data-lavish-ui]") return el.getAttribute("data-lavish-ui") !== null;
   if (selector === "form" || selector === "fieldset") return el.tagName.toLowerCase() === selector;
   if (selector === "[data-lavish-question]") return el.getAttribute("data-lavish-question") !== null;
   if (selector === "[contenteditable]:not([contenteditable='false'])") {
