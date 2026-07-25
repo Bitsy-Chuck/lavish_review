@@ -1342,7 +1342,8 @@ export function createArtifactSdk(
     const msg = event.data || {};
     if (msg.type === "lavish:setAnnotationMode") setAnnotationMode(msg.enabled);
     if (msg.type === "lavish:requestSnapshot") {
-      parent.postMessage({ type: "lavish:snapshot", snapshot: snapshot() }, "*");
+      // Echo the request id so the chrome can tell a late answer from the one it is waiting on.
+      parent.postMessage({ type: "lavish:snapshot", requestId: msg.requestId, snapshot: snapshot() }, "*");
     }
     if (msg.type === "lavish:restoreScroll") {
       window.scrollTo(Number(msg.x) || 0, Number(msg.y) || 0);

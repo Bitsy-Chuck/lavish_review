@@ -78,6 +78,37 @@ async function startPresenceStream(base, key) {
   };
 }
 
+// Raw view of the event stream, for the framing fields that startPresenceStream parses past.
+async function startRawEventStream(base, key) {
+  const controller = new AbortController();
+  const res = await fetch(`${base}/events/${key}`, { signal: controller.signal });
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  return {
+    async waitFor(pattern) {
+      const deadline = Date.now() + 1000;
+      while (true) {
+        if (pattern.test(buffer)) return buffer;
+        const remaining = Math.max(1, deadline - Date.now());
+        const { value, done } = await Promise.race([
+          reader.read(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`timed out waiting for ${pattern} in:\n${buffer}`)), remaining),
+          ),
+        ]);
+        if (done) throw new Error(`event stream closed before ${pattern}, saw:\n${buffer}`);
+        buffer += decoder.decode(value, { stream: true });
+      }
+    },
+    async close() {
+      controller.abort();
+      await reader.cancel().catch(() => {});
+    },
+  };
+}
+
 test("server delegates artifact SDK generation to a dedicated source module", async () => {
   const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
 
@@ -543,9 +574,19 @@ test("copy DOM snapshot requests a fresh snapshot and copies it to the clipboard
 
   assert.match(js, /const snapshotRequests = \[\]/);
   assert.match(js, /requestSnapshot\("copy"\)/);
-  assert.match(js, /const snapshotAction = snapshotRequests\.shift\(\) \|\| "submit"/);
+  assert.match(js, /const snapshotAction = request \? request\.action : ""/);
   assert.match(js, /if \(snapshotAction === "copy"\)/);
   assert.match(js, /copyText\(msg\.snapshot \|\| ""\)/);
+});
+
+test("the snapshot handshake is bounded so a silent artifact cannot swallow a send", async () => {
+  const js = await chromeClientSource();
+
+  assert.match(js, /const SNAPSHOT_TIMEOUT_MS = 2_500/);
+  assert.match(js, /setTimeout\(\(\) => handleSnapshotTimeout\(request\), SNAPSHOT_TIMEOUT_MS\)/);
+  assert.match(js, /function handleSnapshotTimeout\(request\)/);
+  // A degraded send beats no send at all when the artifact's own JS threw before the SDK loaded.
+  assert.match(js, /pendingSnapshot = "";\n {2}showComposerNotice/);
 });
 
 test("clipboard copy falls back when navigator clipboard rejects", async () => {
@@ -632,9 +673,22 @@ test("chrome disables sending only while working or ended", async () => {
 
   assert.match(js, /let agentPresence = "waiting"/);
   assert.match(js, /function updateSendState\(\)/);
-  assert.match(js, /sendButton\.disabled = ended \|\| agentPresence === "working"/);
-  assert.match(js, /sendAndEndButton\.disabled = sendButton\.disabled/);
+  assert.match(js, /sendButton\.disabled = ended \|\| \(agentPresence === "working" && !presenceStalled\)/);
+  assert.match(js, /sendAndEndButton\.disabled = ended \|\| agentPresence === "working"/);
   assert.doesNotMatch(js, /hasContent/);
+});
+
+test("a working presence that never resolves unlocks the composer instead of latching it", async () => {
+  const js = await chromeClientSource();
+
+  assert.match(js, /const PRESENCE_STALL_MS = 45_000/);
+  assert.match(js, /presenceStallTimer = setTimeout\(handlePresenceStall, PRESENCE_STALL_MS\)/);
+  assert.match(js, /function handlePresenceStall\(\)/);
+  assert.match(js, /presenceStalled = true/);
+  // The spinner has to stop claiming work is happening.
+  assert.match(js, /function markWorkingBubbleStalled\(\)/);
+  assert.match(js, /No word from your agent for a while/);
+  assert.match(js, /resyncState\(\)\.catch/);
 });
 
 test("sending with an empty composer nudges instead of blocking", async () => {
@@ -657,7 +711,7 @@ test("composer offers two always-visible top-level send actions", async () => {
   assert.match(html, /class="button button-danger" id="sendAndEnd"[^<]*>.*Send &amp; End</);
   assert.match(
     html,
-    /<div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.<\/div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">.*<button class="button" id="send">Send to Agent<\/button><\/div>/,
+    /<div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.<\/div><div class="composer-error" id="submitError" role="alert" hidden>.*<\/div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">.*<button class="button" id="send">Send to Agent<\/button><\/div>/,
   );
   assert.doesNotMatch(html, /id="sendCaret"/);
   assert.doesNotMatch(html, /id="sendMenu"/);
@@ -2621,6 +2675,358 @@ test("SSE agent-presence stays working when resuming an open session", async () 
     await server.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("the event stream sends reconnect hints and event ids", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const stream = await startRawEventStream(base, key);
+    try {
+      const seen = await stream.waitFor(/^id: 2\nevent: agent-presence\n/m);
+      assert.match(seen, /^retry: 2000\n\n/);
+      assert.match(seen, /^id: 1\nevent: chat-sync\n/m);
+      // Ids are a per-connection sequence for ordering only; there is no replay log behind them.
+      assert.match(seen, /^id: 2\nevent: agent-presence\n/m);
+    } finally {
+      await stream.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the event stream tells the browser when the session ends", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  const other = path.join(dir, "other.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  await writeFile(other, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    // A second live session keeps the server up once the first one ends.
+    await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: other }),
+    });
+    const stream = await startRawEventStream(base, key);
+    try {
+      await stream.waitFor(/event: agent-presence\n/);
+      await fetch(`${base}/api/end`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file: artifact }),
+      });
+      await stream.waitFor(/event: session-ended\n/);
+    } finally {
+      await stream.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET /api/:key/state answers with authoritative chat, presence and status", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  const other = path.join(dir, "other.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  await writeFile(other, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    // A second live session keeps the server up after this one ends.
+    await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: other }),
+    });
+
+    assert.equal((await fetch(`${base}/api/missing-key/state`)).status, 404);
+
+    const waiting = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.equal(waiting.presence, "waiting");
+    assert.equal(waiting.ended, false);
+    assert.deepEqual(waiting.chat, []);
+
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompts: [{ prompt: "tighten the spacing", tag: "message" }] }),
+    });
+    await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
+    await fetch(`${base}/api/${key}/agent-reply`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "on it" }),
+    });
+
+    const working = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.equal(working.presence, "working");
+    assert.deepEqual(
+      working.chat.map((item) => [item.role, item.text]),
+      [
+        ["user", "tighten the spacing"],
+        ["agent", "on it"],
+      ],
+    );
+
+    await fetch(`${base}/api/${key}/end`, { method: "POST" });
+    const ended = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.equal(ended.ended, true);
+    assert.equal(ended.status, "ended");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SSE agent-presence leaves working once feedback is queued with nothing polling", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const presence = await startPresenceStream(base, key);
+    try {
+      assert.equal(await presence.next(), "waiting");
+
+      // The agent takes delivery and then never polls again - the latch that used to strand the
+      // page on "Working..." forever.
+      await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
+      });
+      await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
+      assert.equal(await presence.next(), "working");
+
+      // Feedback that lands with nothing polling has been delivered to nobody.
+      await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompts: [{ prompt: "still there?", tag: "message" }] }),
+      });
+      assert.equal(await presence.next(), "waiting");
+    } finally {
+      await presence.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("chrome surfaces a reconnecting indicator and a failed-send retry", async () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  const css = await chromeCssSource();
+  const js = await chromeClientSource();
+
+  assert.match(
+    html,
+    /<div class="connection-banner" id="connectionBanner" role="status" hidden>Reconnecting to Lavish/,
+  );
+  assert.match(html, /id="submitError" role="alert" hidden/);
+  assert.match(html, /id="submitRetry" type="button">Retry<\/button>/);
+  // The codebase has no global [hidden] rule, so display-setting blocks need explicit ones.
+  assert.match(css, /\.connection-banner\[hidden\]\{display:none;?\}/);
+  assert.match(css, /\.composer-error\[hidden\]\{display:none;?\}/);
+  assert.match(css, /\.bubble\.agent-working\.agent-stalled \.spinner\{display:none;?\}/);
+  assert.match(js, /function setConnectionBanner\(visible\)/);
+  assert.match(js, /function showSubmitError\(message, retry\)/);
+});
+
+test("chrome reconnects the event stream itself with capped jittered backoff", async () => {
+  const js = await chromeClientSource();
+
+  assert.match(js, /const SSE_RECONNECT_BASE_MS = 1_000/);
+  assert.match(js, /const SSE_RECONNECT_MAX_MS = 15_000/);
+  assert.match(js, /function connectEventStream\(\)/);
+  assert.match(js, /stream\.addEventListener\("error", \(\) => \{/);
+  assert.match(js, /Math\.min\(SSE_RECONNECT_MAX_MS, SSE_RECONNECT_BASE_MS \* 2 \*\* eventStreamAttempt\)/);
+  assert.match(js, /Math\.round\(capped \* \(0\.5 \+ Math\.random\(\) \* 0\.5\)\)/);
+  assert.match(js, /eventStream\.close\?\.\(\)/);
+  // Heartbeat watchdog: a half-open stream never fires `error`.
+  assert.match(js, /const SSE_HEARTBEAT_TIMEOUT_MS = 50_000/);
+  assert.match(js, /function noteEventStreamActivity\(\)/);
+  // Reopening resyncs rather than assuming the gap was empty.
+  assert.match(js, /if \(reconnected\) resyncState\(\)\.catch/);
+  assert.match(js, /fetch\("\/api\/" \+ key \+ "\/state"/);
+});
+
+test("state snapshots and stream events share one monotonic revision", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+
+    const before = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.equal(typeof before.revision, "number");
+
+    const stream = await startRawEventStream(base, key);
+    try {
+      await stream.waitFor(/event: agent-presence\n/);
+      await fetch(`${base}/api/${key}/agent-reply`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "on it" }),
+      });
+      const seen = await stream.waitFor(/event: agent-reply\n/);
+      const replyRevision = JSON.parse(/^event: agent-reply\ndata: (.+)$/m.exec(seen)[1]).revision;
+      assert.ok(replyRevision > before.revision, `${replyRevision} should exceed ${before.revision}`);
+
+      // A snapshot taken after the reply reports at least that revision, so a client can order
+      // the two against each other rather than guessing which is fresher.
+      const after = await (await fetch(`${base}/api/${key}/state`)).json();
+      assert.ok(after.revision >= replyRevision, `${after.revision} should be at least ${replyRevision}`);
+      assert.deepEqual(
+        after.chat.map((item) => item.text),
+        ["on it"],
+      );
+    } finally {
+      await stream.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("queued feedback moves the revision even though it only wakes pollers", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const before = await (await fetch(`${base}/api/${key}/state`)).json();
+
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompts: [{ prompt: "tighten the spacing", tag: "message" }] }),
+    });
+
+    // The user message is new chat. If the revision stood still, a resync would deliver it under
+    // an already-applied revision and the client would drop it.
+    const after = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.ok(after.revision > before.revision, `${after.revision} should exceed ${before.revision}`);
+    assert.deepEqual(
+      after.chat.map((item) => item.text),
+      ["tighten the spacing"],
+    );
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("every state payload carries the server instance epoch", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+
+    // Revisions restart at zero when the server does, so they only mean anything paired with the
+    // instance that issued them.
+    const state = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.equal(typeof state.epoch, "number");
+    assert.ok(state.epoch > 0);
+
+    const stream = await startRawEventStream(base, key);
+    try {
+      const seen = await stream.waitFor(/event: agent-presence\n/);
+      const presence = JSON.parse(/^event: agent-presence\ndata: (.+)$/m.exec(seen)[1]);
+      assert.equal(presence.epoch, state.epoch);
+      assert.equal(typeof presence.revision, "number");
+    } finally {
+      await stream.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the event stream subscribes before reading its snapshot, so nothing falls in the gap", async () => {
+  const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
+  const route = source.slice(source.indexOf('app.get("/events/:key"'));
+  const body = route.slice(0, route.indexOf("\n  });"));
+
+  const subscribeAt = body.indexOf('events.on("agent-reply", sendAgentReply)');
+  const snapshotAt = body.indexOf("await readSessionSnapshot(");
+  assert.ok(subscribeAt !== -1 && snapshotAt !== -1);
+  assert.ok(subscribeAt < snapshotAt, "listeners must be registered before the snapshot read awaits");
+  // Events that land during the read are buffered rather than raced ahead of the snapshot.
+  assert.match(body, /let snapshotSent = false/);
+  assert.match(body, /buffered\.push\(\[event, data\]\)/);
+  // The disconnect cleanup is registered with the subscriptions, not after the await.
+  assert.ok(body.indexOf('req.on("close"') < snapshotAt, "close cleanup must not sit behind the await");
+});
+
+test("a snapshot read retries until its revision is stable", async () => {
+  const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
+
+  assert.match(source, /const readSessionSnapshot = async \(key\) => \{/);
+  assert.match(source, /const revision = revisionOf\(key\);\n\s+const session = await store\.findByKey\(key\);/);
+  assert.match(
+    source,
+    /if \(revisionOf\(key\) === revision \|\| attempt >= 4\) return \{ session, presence, revision \}/,
+  );
 });
 
 test("hasLiveReloadRootOptIn detects the data attribute and meta opt-in", () => {
