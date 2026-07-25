@@ -10,8 +10,11 @@ import chokidar from "chokidar";
 import express from "express";
 
 import {
+  calculatePinchGesture,
   classifyHorizontalOverflow,
+  classifyScaledDownSvg,
   classifyVerticalOverflow,
+  createTwoPointerTracker,
   createArtifactSdk,
   deriveLavishQueueKey,
   fragmentsSignificantlyOverlap,
@@ -20,6 +23,7 @@ import {
   isSvgLayoutDescendant,
   MODE_TOGGLE_HOTKEY_KEY,
   resolveVisibleSpillCandidates,
+  scaledDownDiagramSeverity,
 } from "./artifact-sdk.js";
 import * as mermaidNode from "./mermaid-node.js";
 import { extractMermaidSources, mermaidSourceHash } from "./mermaid-source.js";
@@ -1290,7 +1294,11 @@ const MODE_TOGGLE_HOTKEY_KEY=${JSON.stringify(MODE_TOGGLE_HOTKEY_KEY)};
 const isModeToggleHotkeyEvent=${isModeToggleHotkeyEvent.toString()};
 const fragmentsSignificantlyOverlap=${fragmentsSignificantlyOverlap.toString()};
 const resolveVisibleSpillCandidates=${resolveVisibleSpillCandidates.toString()};
+const calculatePinchGesture=${calculatePinchGesture.toString()};
+const createTwoPointerTracker=${createTwoPointerTracker.toString()};
 const classifyHorizontalOverflow=${classifyHorizontalOverflow.toString()};
+const classifyScaledDownSvg=${classifyScaledDownSvg.toString()};
+const scaledDownDiagramSeverity=${scaledDownDiagramSeverity.toString()};
 const classifyVerticalOverflow=${classifyVerticalOverflow.toString()};
 const isSvgLayoutDescendant=${isSvgLayoutDescendant.toString()};
 ${mermaidHelperDecls}

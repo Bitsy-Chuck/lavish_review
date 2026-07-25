@@ -172,6 +172,67 @@ export function classifyHorizontalOverflow({ scrollWidth, clientWidth, overflowX
   return { overflowPx, kind: clipsText ? "clipped-text" : "element-scroll-overflow" };
 }
 
+export function classifyScaledDownSvg({ renderedWidth, intrinsicMaxWidth, minReadableScale = 0.75 }) {
+  if (!(renderedWidth > 0) || !(intrinsicMaxWidth > 0) || renderedWidth >= intrinsicMaxWidth) return null;
+  const scale = renderedWidth / intrinsicMaxWidth;
+  if (scale >= minReadableScale) return null;
+  return { scale, shrinkPx: intrinsicMaxWidth - renderedWidth };
+}
+
+export function scaledDownDiagramSeverity(scale, errorScale = 0.6) {
+  return scale < errorScale ? "error" : "warning";
+}
+
+export function createTwoPointerTracker() {
+  const pointers = new Map();
+  return {
+    add(id, point) {
+      if (!pointers.has(id) && pointers.size >= 2) return false;
+      pointers.set(id, point);
+      return true;
+    },
+    update(id, point) {
+      if (!pointers.has(id)) return false;
+      pointers.set(id, point);
+      return true;
+    },
+    delete(id) {
+      return pointers.delete(id);
+    },
+    has(id) {
+      return pointers.has(id);
+    },
+    get size() {
+      return pointers.size;
+    },
+    pair() {
+      if (pointers.size !== 2) return null;
+      const [a, b] = pointers.values();
+      return { a, b };
+    },
+    ids() {
+      return [...pointers.keys()];
+    },
+  };
+}
+
+export function calculatePinchGesture({ previous, current }) {
+  const previousDistance = Math.hypot(previous.b.x - previous.a.x, previous.b.y - previous.a.y);
+  const currentDistance = Math.hypot(current.b.x - current.a.x, current.b.y - current.a.y);
+  if (!(previousDistance > 0) || !(currentDistance > 0)) return null;
+  return {
+    factor: previousDistance / currentDistance,
+    previousCenter: {
+      x: (previous.a.x + previous.b.x) / 2,
+      y: (previous.a.y + previous.b.y) / 2,
+    },
+    currentCenter: {
+      x: (current.a.x + current.b.x) / 2,
+      y: (current.a.y + current.b.y) / 2,
+    },
+  };
+}
+
 // Fixed-size badges/buttons/pills usually leave overflow at its default "visible" rather than
 // "hidden" - the text doesn't get clipped, it spills out of the box and overlaps neighboring
 // content, which is just as broken. Only "auto"/"scroll" are treated as intentional (the user
@@ -216,6 +277,7 @@ export function createArtifactSdk(
   deriveQueueKey,
   isNativeInteractive = isNativeInteractiveControl,
   mermaid = mermaidHelpers,
+  testHooks = null,
 ) {
   const { isMermaidSvg, mermaidNodeFrom, mermaidNodeElement } = mermaid;
   let annotationMode = true;
@@ -306,10 +368,10 @@ export function createArtifactSdk(
     return [...svgs];
   }
 
-  // A minimal, dependency-free viewBox-based pan/zoom. Kept small on purpose:
-  // "nodes only" annotation plus freeze-on-annotate means we do not need
-  // momentum, gestures, or a full pan/zoom library here. svg-pan-zoom is a
-  // documented drop-in upgrade if richer interaction is wanted later.
+  // A minimal, dependency-free viewBox-based pan/zoom. Wheel zoom and one-pointer
+  // pan are explore-mode affordances; two-pointer pinch remains available while
+  // annotating because it is the only way a touch user can inspect a diagram that
+  // responsive Mermaid rendering has shrunk.
   function createViewport(svg) {
     const bbox = svg.getBBox ? safeBBox(svg) : null;
     const initial = readViewBox(svg) || (bbox ? { x: bbox.x, y: bbox.y, w: bbox.width, h: bbox.height } : null);
@@ -319,6 +381,9 @@ export function createArtifactSdk(
     const view = { ...initial };
     let frozen = false;
     let panning = null;
+    const pointers = createTwoPointerTracker();
+    const capturedPointers = new Set();
+    let previousPinch = null;
 
     function apply() {
       svg.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
@@ -349,23 +414,63 @@ export function createArtifactSdk(
       zoomAt(event.clientX, event.clientY, event.deltaY > 0 ? 1.15 : 1 / 1.15);
     }
     function onPointerDown(event) {
-      if (frozen || event.button !== 0) return;
-      panning = { x: event.clientX, y: event.clientY, vx: view.x, vy: view.y };
+      if (event.button !== 0) return;
+      if (!pointers.add(event.pointerId, { x: event.clientX, y: event.clientY })) return;
+      if (pointers.size === 2) {
+        previousPinch = pointers.pair();
+        panning = null;
+        for (const id of pointers.ids()) {
+          svg.setPointerCapture?.(id);
+          capturedPointers.add(id);
+        }
+        return;
+      }
+      if (frozen) return;
       svg.setPointerCapture?.(event.pointerId);
+      capturedPointers.add(event.pointerId);
+      panning = { id: event.pointerId, x: event.clientX, y: event.clientY, vx: view.x, vy: view.y };
       svg.style.cursor = "grabbing";
     }
     function onPointerMove(event) {
-      if (!panning) return;
+      if (!pointers.update(event.pointerId, { x: event.clientX, y: event.clientY })) return;
+      if (pointers.size >= 2) {
+        const currentPinch = pointers.pair();
+        const gesture = previousPinch && calculatePinchGesture({ previous: previousPinch, current: currentPinch });
+        if (gesture) {
+          event.preventDefault();
+          // Move the view with the fingers before scaling around their new
+          // midpoint. This makes a two-finger drag a touch pan even while
+          // annotation mode freezes one-finger diagram navigation.
+          const rect = svg.getBoundingClientRect();
+          if (rect.width && rect.height) {
+            view.x -= ((gesture.currentCenter.x - gesture.previousCenter.x) / rect.width) * view.w;
+            view.y -= ((gesture.currentCenter.y - gesture.previousCenter.y) / rect.height) * view.h;
+          }
+          zoomAt(gesture.currentCenter.x, gesture.currentCenter.y, gesture.factor);
+        }
+        previousPinch = currentPinch;
+        return;
+      }
+      if (!panning || panning.id !== event.pointerId) return;
       const rect = svg.getBoundingClientRect();
       if (!rect.width || !rect.height) return;
       view.x = panning.vx - ((event.clientX - panning.x) / rect.width) * view.w;
       view.y = panning.vy - ((event.clientY - panning.y) / rect.height) * view.h;
       apply();
     }
-    function onPointerUp(event) {
-      panning = null;
-      svg.releasePointerCapture?.(event.pointerId);
+    function endPointer(event, releaseCapture) {
+      pointers.delete(event.pointerId);
+      if (panning?.id === event.pointerId) panning = null;
+      if (pointers.size < 2) previousPinch = null;
+      if (releaseCapture && capturedPointers.has(event.pointerId)) svg.releasePointerCapture?.(event.pointerId);
+      capturedPointers.delete(event.pointerId);
       svg.style.cursor = frozen ? "" : "grab";
+    }
+    function onPointerUp(event) {
+      endPointer(event, true);
+    }
+    function onLostPointerCapture(event) {
+      endPointer(event, false);
     }
 
     svg.addEventListener("wheel", onWheel, { passive: false });
@@ -373,16 +478,20 @@ export function createArtifactSdk(
     svg.addEventListener("pointermove", onPointerMove);
     svg.addEventListener("pointerup", onPointerUp);
     svg.addEventListener("pointercancel", onPointerUp);
+    svg.addEventListener("lostpointercapture", onLostPointerCapture);
 
     function setFrozen(next) {
       frozen = !!next;
       panning = null;
       svg.style.cursor = frozen ? "" : "grab";
-      svg.style.touchAction = frozen ? "" : "none";
+      // Annotation mode keeps native one-finger vertical page scrolling. Omitting
+      // `pinch-zoom` from pan-y still reserves two-finger scaling for the diagram.
+      // Explore mode owns all touch movement so one finger can pan the viewBox.
+      svg.style.touchAction = frozen ? "pan-y" : "none";
     }
     setFrozen(false);
 
-    return { reset, setFrozen };
+    return { reset, setFrozen, intrinsicWidth: initial.w };
   }
 
   function safeBBox(svg) {
@@ -413,6 +522,7 @@ export function createArtifactSdk(
   // from the artifact file. This SDK owns their lifecycle during fullscreen
   // transitions.
   const whiteboardEmbeds = new Map(); // container -> { iframe, index }
+  const mermaidMeasurements = new WeakMap(); // hidden container -> geometry captured before replacement
 
   function mermaidContainerIndex(container) {
     return [...document.querySelectorAll(".mermaid")].indexOf(container);
@@ -443,6 +553,10 @@ export function createArtifactSdk(
     if (rect.height < 40) {
       window.setTimeout(scheduleMermaidEnhance, 150);
       return;
+    }
+    const intrinsicMaxWidth = intrinsicSvgWidth(svg);
+    if (rect.width > 0 && intrinsicMaxWidth > 0) {
+      mermaidMeasurements.set(container, { intrinsicMaxWidth });
     }
     const iframe = document.createElement("iframe");
     iframe.setAttribute("data-lavish-ui", "whiteboard-inline");
@@ -769,7 +883,20 @@ export function createArtifactSdk(
 
     function walk(el) {
       if (!(el instanceof Element) || isLavishUi(el)) return;
-      if (isIntentionalHorizontalScroller(el)) return;
+      if (isIntentionalHorizontalScroller(el)) {
+        // Ordinary descendants of an intentional scroller do not need overflow
+        // auditing. Mermaid shrinkage is different: max-width:100% can erase the
+        // scrollbar by scaling the SVG, so keep only diagram measurement targets.
+        function walkDiagramTargets(node) {
+          if (!(node instanceof Element) || isLavishUi(node)) return;
+          if (mermaidMeasurements.has(node) || (node.tagName?.toLowerCase() === "svg" && isMermaidSvg(node))) {
+            elements.push(node);
+          }
+          for (const child of node.children) walkDiagramTargets(child);
+        }
+        for (const child of el.children) walkDiagramTargets(child);
+        return;
+      }
       // Skip auditing SVG internals, whose scroll-box metrics are meaningless, but keep descending:
       // <foreignObject> re-enters HTML (Mermaid renders flowchart labels there) and that does clip.
       if (!isSvgLayoutDescendant(el)) elements.push(el);
@@ -798,8 +925,46 @@ export function createArtifactSdk(
     return style.textOverflow === "ellipsis" || Number.parseInt(style.webkitLineClamp || "0", 10) > 0;
   }
 
+  function intrinsicSvgWidth(svg) {
+    const viewportWidth = mermaidViewports.get(svg)?.intrinsicWidth || 0;
+    if (viewportWidth > 0) return viewportWidth;
+    const viewBoxWidth = readViewBox(svg)?.w || 0;
+    if (viewBoxWidth > 0) return viewBoxWidth;
+    for (const value of [svg.getAttribute?.("width"), svg.style?.maxWidth, getComputedStyle(svg).maxWidth]) {
+      if (/^\s*\d+(?:\.\d+)?px\s*$/i.test(String(value || ""))) return toPixelNumber(value);
+    }
+    return 0;
+  }
+
+  function pushScaledDownDiagramFinding(el, measurement, viewportWidth, findings, seen) {
+    const scaledDown = classifyScaledDownSvg(measurement);
+    if (!scaledDown) return;
+    pushLayoutFinding(findings, seen, {
+      selector: selector(el),
+      kind: "scaled-down-diagram",
+      overflowPx: scaledDown.shrinkPx,
+      viewportWidth,
+      severity: scaledDownDiagramSeverity(scaledDown.scale),
+    });
+  }
+
   function auditElementOverflow(el, viewportWidth, findings, seen, spillCandidates) {
-    if (el === document.body || el === document.documentElement || hasIntentionalHorizontalScrollerAncestor(el)) return;
+    if (el === document.body || el === document.documentElement) return;
+
+    // Recommended `.mermaid` diagrams are replaced by a whiteboard iframe before
+    // the audit runs. Their live SVG is display:none, so audit the geometry
+    // captured immediately before replacement instead of certifying a 0x0 box.
+    const capturedMermaidMeasurement = mermaidMeasurements.get(el);
+    if (capturedMermaidMeasurement) {
+      const iframeWidth = whiteboardEmbeds.get(el)?.iframe?.getBoundingClientRect().width || 0;
+      pushScaledDownDiagramFinding(
+        el,
+        { renderedWidth: iframeWidth, intrinsicMaxWidth: capturedMermaidMeasurement.intrinsicMaxWidth },
+        viewportWidth,
+        findings,
+        seen,
+      );
+    }
 
     const rect = el.getBoundingClientRect();
     if (!isVisibleForLayoutAudit(el, rect)) return;
@@ -807,6 +972,21 @@ export function createArtifactSdk(
     const style = getComputedStyle(el);
     const hasText = hasReadableText(el);
     const isTruncated = isIntentionalTextTruncation(style);
+
+    if (el.tagName?.toLowerCase() === "svg" && isMermaidSvg(el)) {
+      pushScaledDownDiagramFinding(
+        el,
+        { renderedWidth: rect.width, intrinsicMaxWidth: intrinsicSvgWidth(el) },
+        viewportWidth,
+        findings,
+        seen,
+      );
+    }
+
+    // Intentional scrollers suppress ordinary overflow findings, but must not
+    // suppress diagram shrinkage: max-width:100% can remove the scrollbar by
+    // scaling the SVG down inside the very wrapper meant to preserve its size.
+    if (hasIntentionalHorizontalScrollerAncestor(el)) return;
 
     const horizontal = classifyHorizontalOverflow({
       scrollWidth: el.scrollWidth,
@@ -1137,6 +1317,16 @@ export function createArtifactSdk(
       }
     });
     setTimeout(() => textarea.focus(), 0);
+  }
+
+  // Unit tests use this narrow seam to drive the same enhancement and audit
+  // closures in sequence. Production omits the argument, so no debug surface is
+  // attached to the artifact window.
+  if (testHooks) {
+    testHooks.enhanceMermaid = enhanceMermaid;
+    testHooks.auditLayout = auditLayout;
+    testHooks.setMermaidFrozen = setMermaidFrozen;
+    return;
   }
 
   /** @type {Window & { lavish?: unknown }} */ (window).lavish = {
