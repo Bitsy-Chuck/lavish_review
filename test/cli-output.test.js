@@ -177,7 +177,7 @@ test("design output prints copy-pasteable local /design URLs so agents can opt i
   assert.equal(output.playbook_router.playbooks.length, 7);
   assert.equal(
     output.playbook_router.playbooks.find((playbook) => playbook.id === "diagram")?.use_when,
-    "Map relationships, flows, state, and architecture",
+    "Map relationships, messages, state, data models, timelines, hierarchy, or architecture",
   );
   assert.ok(output.design.summary.includes(DESIGN_PRIORITY_RULE), "design summary embeds the single-sourced rule");
   assert.match(output.design.summary, /does not auto-inject/);
@@ -196,7 +196,7 @@ test("design output prints copy-pasteable local /design URLs so agents can opt i
   assert.equal(output.design.cdn_urls.daisyuiThemes, "/design/daisyui-themes.css");
   assert.equal(output.design.cdn_urls.tailwind, "/design/tailwindcss-browser.js");
   assert.match(output.design.other_design_systems, /different design system|other design system/i);
-  assert.match(output.diagram_tooling.use_when, /flows \/ architecture \/ state \/ sequence diagrams/);
+  assert.match(output.diagram_tooling.use_when, /maps content shapes to specific diagram types/);
   assert.match(output.diagram_tooling.use_when, /hand-built div\/flexbox boxes/);
   assert.match(output.diagram_tooling.mermaid_cdn_snippet, /\/design\/mermaid\.esm\.min\.mjs/);
   assert.match(output.diagram_tooling.mermaid_cdn_snippet, /mermaid\.initialize/);
@@ -275,6 +275,44 @@ test("diagram playbook names the hand-built flow anti-pattern", () => {
   assert.ok(output.playbook.pitfalls.some((item) => /hand-build boxes-and-arrows/i.test(item)));
   assert.ok(output.playbook.pitfalls.some((item) => /div\/flexbox/i.test(item)));
   assert.ok(output.playbook.pitfalls.some((item) => /does not auto-route edges/i.test(item)));
+});
+
+test("diagram playbook selects diagram types and rejects diagram-shaped prose", () => {
+  const playbook = createPlaybookOutput(["diagram"]).playbook;
+  const guidance = Object.values(playbook).flat().join("\n");
+
+  assert.match(guidance, /branching or converging paths -> flowchart/);
+  assert.match(guidance, /messages between actors over time -> sequenceDiagram/);
+  assert.match(guidance, /N options by M criteria -> a TABLE, never a diagram/);
+  assert.match(guidance, /hard ceiling of 20/);
+  assert.match(guidance, /NEVER put <br\/> in labels/);
+  assert.match(guidance, /catchup\.html is the cautionary case/);
+  assert.match(guidance, /accTitle and accDescr/);
+  assert.match(guidance, /useMaxWidth:false/);
+  assert.match(guidance, /look: handDrawn/);
+  assert.match(guidance, /layout/);
+  assert.match(guidance, /%%\{init\}%% directive/);
+  assert.match(guidance, /EDITABLE Excalidraw shapes/);
+  for (const type of [
+    "sequence",
+    "state",
+    "ER",
+    "class",
+    "timeline",
+    "gantt",
+    "quadrant",
+    "mindmap",
+    "journey",
+    "sankey",
+    "kanban",
+    "radar",
+    "treemap",
+    "block",
+    "architecture",
+    "C4",
+  ]) {
+    assert.match(guidance, new RegExp(`${type} —`));
+  }
 });
 
 test("diagram playbook tells agents to keep Mermaid theming in sync with the page theme", () => {

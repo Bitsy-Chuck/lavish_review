@@ -10,7 +10,9 @@ import chokidar from "chokidar";
 import express from "express";
 
 import {
+  calculatePinchGesture,
   classifyHorizontalOverflow,
+  classifyScaledDownSvg,
   classifyVerticalOverflow,
   createArtifactSdk,
   deriveLavishQueueKey,
@@ -1272,7 +1274,9 @@ const MODE_TOGGLE_HOTKEY_KEY=${JSON.stringify(MODE_TOGGLE_HOTKEY_KEY)};
 const isModeToggleHotkeyEvent=${isModeToggleHotkeyEvent.toString()};
 const fragmentsSignificantlyOverlap=${fragmentsSignificantlyOverlap.toString()};
 const resolveVisibleSpillCandidates=${resolveVisibleSpillCandidates.toString()};
+const calculatePinchGesture=${calculatePinchGesture.toString()};
 const classifyHorizontalOverflow=${classifyHorizontalOverflow.toString()};
+const classifyScaledDownSvg=${classifyScaledDownSvg.toString()};
 const classifyVerticalOverflow=${classifyVerticalOverflow.toString()};
 const isSvgLayoutDescendant=${isSvgLayoutDescendant.toString()};
 ${mermaidHelperDecls}

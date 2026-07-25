@@ -265,7 +265,7 @@ export function createDesignOutput() {
     },
     diagram_tooling: {
       use_when:
-        "Use this for flows / architecture / state / sequence diagrams after opening the diagram playbook; Mermaid handles layout and edge routing better than hand-built div/flexbox boxes.",
+        "Open the diagram playbook before choosing a visual form: it maps content shapes to specific diagram types and names cases that should be a table, list, chart, or SVG. Use this Mermaid tooling only after the rubric selects Mermaid; it handles placement and edge routing better than hand-built div/flexbox boxes.",
       mermaid_cdn_snippet: MERMAID_CDN_SNIPPET,
       cdn_urls: { mermaid: MERMAID_CDN_URL },
       versions: { mermaid: MERMAID_VERSION },

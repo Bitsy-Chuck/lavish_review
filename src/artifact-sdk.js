@@ -172,6 +172,30 @@ export function classifyHorizontalOverflow({ scrollWidth, clientWidth, overflowX
   return { overflowPx, kind: clipsText ? "clipped-text" : "element-scroll-overflow" };
 }
 
+export function classifyScaledDownSvg({ renderedWidth, intrinsicMaxWidth, minReadableScale = 0.75 }) {
+  if (!(renderedWidth > 0) || !(intrinsicMaxWidth > 0) || renderedWidth >= intrinsicMaxWidth) return null;
+  const scale = renderedWidth / intrinsicMaxWidth;
+  if (scale >= minReadableScale) return null;
+  return { scale, shrinkPx: intrinsicMaxWidth - renderedWidth };
+}
+
+export function calculatePinchGesture({ previous, current }) {
+  const previousDistance = Math.hypot(previous.b.x - previous.a.x, previous.b.y - previous.a.y);
+  const currentDistance = Math.hypot(current.b.x - current.a.x, current.b.y - current.a.y);
+  if (!(previousDistance > 0) || !(currentDistance > 0)) return null;
+  return {
+    factor: previousDistance / currentDistance,
+    previousCenter: {
+      x: (previous.a.x + previous.b.x) / 2,
+      y: (previous.a.y + previous.b.y) / 2,
+    },
+    currentCenter: {
+      x: (current.a.x + current.b.x) / 2,
+      y: (current.a.y + current.b.y) / 2,
+    },
+  };
+}
+
 // Fixed-size badges/buttons/pills usually leave overflow at its default "visible" rather than
 // "hidden" - the text doesn't get clipped, it spills out of the box and overlaps neighboring
 // content, which is just as broken. Only "auto"/"scroll" are treated as intentional (the user
@@ -306,10 +330,10 @@ export function createArtifactSdk(
     return [...svgs];
   }
 
-  // A minimal, dependency-free viewBox-based pan/zoom. Kept small on purpose:
-  // "nodes only" annotation plus freeze-on-annotate means we do not need
-  // momentum, gestures, or a full pan/zoom library here. svg-pan-zoom is a
-  // documented drop-in upgrade if richer interaction is wanted later.
+  // A minimal, dependency-free viewBox-based pan/zoom. Wheel zoom and one-pointer
+  // pan are explore-mode affordances; two-pointer pinch remains available while
+  // annotating because it is the only way a touch user can inspect a diagram that
+  // responsive Mermaid rendering has shrunk.
   function createViewport(svg) {
     const bbox = svg.getBBox ? safeBBox(svg) : null;
     const initial = readViewBox(svg) || (bbox ? { x: bbox.x, y: bbox.y, w: bbox.width, h: bbox.height } : null);
@@ -319,6 +343,8 @@ export function createArtifactSdk(
     const view = { ...initial };
     let frozen = false;
     let panning = null;
+    const pointers = new Map();
+    let previousPinch = null;
 
     function apply() {
       svg.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
@@ -349,13 +375,42 @@ export function createArtifactSdk(
       zoomAt(event.clientX, event.clientY, event.deltaY > 0 ? 1.15 : 1 / 1.15);
     }
     function onPointerDown(event) {
-      if (frozen || event.button !== 0) return;
-      panning = { x: event.clientX, y: event.clientY, vx: view.x, vy: view.y };
+      if (event.button !== 0) return;
+      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
       svg.setPointerCapture?.(event.pointerId);
+      if (pointers.size === 2) {
+        const [a, b] = [...pointers.values()];
+        previousPinch = { a, b };
+        panning = null;
+        return;
+      }
+      if (frozen) return;
+      panning = { id: event.pointerId, x: event.clientX, y: event.clientY, vx: view.x, vy: view.y };
       svg.style.cursor = "grabbing";
     }
     function onPointerMove(event) {
-      if (!panning) return;
+      if (!pointers.has(event.pointerId)) return;
+      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      if (pointers.size >= 2) {
+        const [a, b] = [...pointers.values()];
+        const currentPinch = { a, b };
+        const gesture = previousPinch && calculatePinchGesture({ previous: previousPinch, current: currentPinch });
+        if (gesture) {
+          event.preventDefault();
+          // Move the view with the fingers before scaling around their new
+          // midpoint. This makes a two-finger drag a touch pan even while
+          // annotation mode freezes one-finger diagram navigation.
+          const rect = svg.getBoundingClientRect();
+          if (rect.width && rect.height) {
+            view.x -= ((gesture.currentCenter.x - gesture.previousCenter.x) / rect.width) * view.w;
+            view.y -= ((gesture.currentCenter.y - gesture.previousCenter.y) / rect.height) * view.h;
+          }
+          zoomAt(gesture.currentCenter.x, gesture.currentCenter.y, gesture.factor);
+        }
+        previousPinch = currentPinch;
+        return;
+      }
+      if (!panning || panning.id !== event.pointerId) return;
       const rect = svg.getBoundingClientRect();
       if (!rect.width || !rect.height) return;
       view.x = panning.vx - ((event.clientX - panning.x) / rect.width) * view.w;
@@ -363,7 +418,9 @@ export function createArtifactSdk(
       apply();
     }
     function onPointerUp(event) {
-      panning = null;
+      pointers.delete(event.pointerId);
+      if (panning?.id === event.pointerId) panning = null;
+      if (pointers.size < 2) previousPinch = null;
       svg.releasePointerCapture?.(event.pointerId);
       svg.style.cursor = frozen ? "" : "grab";
     }
@@ -378,7 +435,11 @@ export function createArtifactSdk(
       frozen = !!next;
       panning = null;
       svg.style.cursor = frozen ? "" : "grab";
-      svg.style.touchAction = frozen ? "" : "none";
+      // `touch-action:none` is intentional in annotation mode too: allowing native
+      // panning would let the browser cancel the pointer stream before a second
+      // finger establishes our diagram-local pinch. One-finger diagram pan stays
+      // frozen, while two fingers zoom without moving annotation targets.
+      svg.style.touchAction = "none";
     }
     setFrozen(false);
 
@@ -807,6 +868,25 @@ export function createArtifactSdk(
     const style = getComputedStyle(el);
     const hasText = hasReadableText(el);
     const isTruncated = isIntentionalTextTruncation(style);
+
+    if (el.tagName?.toLowerCase() === "svg" && isMermaidSvg(el)) {
+      const scaledDown = classifyScaledDownSvg({
+        renderedWidth: rect.width,
+        intrinsicMaxWidth: toPixelNumber(style.maxWidth),
+      });
+      if (scaledDown) {
+        pushLayoutFinding(findings, seen, {
+          selector: selector(el),
+          kind: "scaled-down-diagram",
+          overflowPx: scaledDown.shrinkPx,
+          viewportWidth,
+          // Below 75%, nominal 16px labels render under 12px. That is a meaningful
+          // legibility failure, but remains a warning because font size and diagram
+          // density vary and this geometric heuristic cannot prove unreadability.
+          severity: "warning",
+        });
+      }
+    }
 
     const horizontal = classifyHorizontalOverflow({
       scrollWidth: el.scrollWidth,

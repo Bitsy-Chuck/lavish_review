@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  calculatePinchGesture,
   classifyHorizontalOverflow,
+  classifyScaledDownSvg,
   classifyVerticalOverflow,
   deriveLavishQueueKey,
   fragmentsSignificantlyOverlap,
@@ -11,6 +13,32 @@ import {
   isSvgLayoutDescendant,
   resolveVisibleSpillCandidates,
 } from "../src/artifact-sdk.js";
+
+test("calculatePinchGesture reports two-finger pan centers and zoom factor", () => {
+  assert.deepEqual(
+    calculatePinchGesture({
+      previous: { a: { x: 0, y: 0 }, b: { x: 100, y: 0 } },
+      current: { a: { x: 10, y: 20 }, b: { x: 210, y: 20 } },
+    }),
+    {
+      factor: 0.5,
+      previousCenter: { x: 50, y: 0 },
+      currentCenter: { x: 110, y: 20 },
+    },
+  );
+});
+
+test("classifyScaledDownSvg flags a diagram rendered below 75% of its intrinsic width", () => {
+  assert.deepEqual(classifyScaledDownSvg({ renderedWidth: 390, intrinsicMaxWidth: 900 }), {
+    scale: 390 / 900,
+    shrinkPx: 510,
+  });
+});
+
+test("classifyScaledDownSvg ignores a normally-sized diagram", () => {
+  assert.equal(classifyScaledDownSvg({ renderedWidth: 780, intrinsicMaxWidth: 900 }), null);
+  assert.equal(classifyScaledDownSvg({ renderedWidth: 900, intrinsicMaxWidth: 900 }), null);
+});
 
 function node(tag, attrs = {}, children = []) {
   const el = {

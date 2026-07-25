@@ -75,7 +75,7 @@ ${bullets(home.visual_guidance)}
 
 Run \`lavish-axi playbook <id>\` for focused, detailed guidance on any of these.
 ${PLAYBOOK_ROUTER_HELP}
-For flows, architecture, state, or sequence diagrams, do not hand-build boxes-and-arrows from div/flexbox; open the diagram playbook and use the theme-aware Mermaid snippet from \`lavish-axi design\` unless SVG is needed for richly annotated nodes.
+For relationships, messages, state, data models, timelines, hierarchy, or architecture, open the diagram playbook before choosing a visual form: it includes a diagram-type rubric and explicit cases where a table, list, chart, or SVG is better. After the content shape justifies Mermaid, use the theme-aware snippet from \`lavish-axi design\`; do not hand-build boxes-and-arrows from div/flexbox.
 
 ${playbookList(home.playbooks)}
 
