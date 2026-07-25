@@ -756,7 +756,7 @@ test("chrome disables sending only while working or ended", async () => {
   assert.match(js, /let agentPresence = "waiting"/);
   assert.match(js, /function updateSendState\(\)/);
   assert.match(js, /sendButton\.disabled = ended \|\| \(agentPresence === "working" && !presenceStalled\)/);
-  assert.match(js, /sendAndEndButton\.disabled = sendButton\.disabled/);
+  assert.match(js, /sendAndEndButton\.disabled = ended \|\| agentPresence === "working"/);
   assert.doesNotMatch(js, /hasContent/);
 });
 
@@ -2838,6 +2838,149 @@ test("chrome reconnects the event stream itself with capped jittered backoff", a
   // Reopening resyncs rather than assuming the gap was empty.
   assert.match(js, /if \(reconnected\) resyncState\(\)\.catch/);
   assert.match(js, /fetch\("\/api\/" \+ key \+ "\/state"/);
+});
+
+test("state snapshots and stream events share one monotonic revision", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+
+    const before = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.equal(typeof before.revision, "number");
+
+    const stream = await startRawEventStream(base, key);
+    try {
+      await stream.waitFor(/event: agent-presence\n/);
+      await fetch(`${base}/api/${key}/agent-reply`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "on it" }),
+      });
+      const seen = await stream.waitFor(/event: agent-reply\n/);
+      const replyRevision = JSON.parse(/^event: agent-reply\ndata: (.+)$/m.exec(seen)[1]).revision;
+      assert.ok(replyRevision > before.revision, `${replyRevision} should exceed ${before.revision}`);
+
+      // A snapshot taken after the reply reports at least that revision, so a client can order
+      // the two against each other rather than guessing which is fresher.
+      const after = await (await fetch(`${base}/api/${key}/state`)).json();
+      assert.ok(after.revision >= replyRevision, `${after.revision} should be at least ${replyRevision}`);
+      assert.deepEqual(
+        after.chat.map((item) => item.text),
+        ["on it"],
+      );
+    } finally {
+      await stream.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("queued feedback moves the revision even though it only wakes pollers", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const before = await (await fetch(`${base}/api/${key}/state`)).json();
+
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompts: [{ prompt: "tighten the spacing", tag: "message" }] }),
+    });
+
+    // The user message is new chat. If the revision stood still, a resync would deliver it under
+    // an already-applied revision and the client would drop it.
+    const after = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.ok(after.revision > before.revision, `${after.revision} should exceed ${before.revision}`);
+    assert.deepEqual(
+      after.chat.map((item) => item.text),
+      ["tighten the spacing"],
+    );
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("every state payload carries the server instance epoch", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+
+    // Revisions restart at zero when the server does, so they only mean anything paired with the
+    // instance that issued them.
+    const state = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.equal(typeof state.epoch, "number");
+    assert.ok(state.epoch > 0);
+
+    const stream = await startRawEventStream(base, key);
+    try {
+      const seen = await stream.waitFor(/event: agent-presence\n/);
+      const presence = JSON.parse(/^event: agent-presence\ndata: (.+)$/m.exec(seen)[1]);
+      assert.equal(presence.epoch, state.epoch);
+      assert.equal(typeof presence.revision, "number");
+    } finally {
+      await stream.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the event stream subscribes before reading its snapshot, so nothing falls in the gap", async () => {
+  const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
+  const route = source.slice(source.indexOf('app.get("/events/:key"'));
+  const body = route.slice(0, route.indexOf("\n  });"));
+
+  const subscribeAt = body.indexOf('events.on("agent-reply", sendAgentReply)');
+  const snapshotAt = body.indexOf("await readSessionSnapshot(");
+  assert.ok(subscribeAt !== -1 && snapshotAt !== -1);
+  assert.ok(subscribeAt < snapshotAt, "listeners must be registered before the snapshot read awaits");
+  // Events that land during the read are buffered rather than raced ahead of the snapshot.
+  assert.match(body, /let snapshotSent = false/);
+  assert.match(body, /buffered\.push\(\[event, data\]\)/);
+  // The disconnect cleanup is registered with the subscriptions, not after the await.
+  assert.ok(body.indexOf('req.on("close"') < snapshotAt, "close cleanup must not sit behind the await");
+});
+
+test("a snapshot read retries until its revision is stable", async () => {
+  const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
+
+  assert.match(source, /const readSessionSnapshot = async \(key\) => \{/);
+  assert.match(source, /const revision = revisionOf\(key\);\n\s+const session = await store\.findByKey\(key\);/);
+  assert.match(
+    source,
+    /if \(revisionOf\(key\) === revision \|\| attempt >= 4\) return \{ session, presence, revision \}/,
+  );
 });
 
 test("hasLiveReloadRootOptIn detects the data attribute and meta opt-in", () => {
