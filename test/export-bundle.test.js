@@ -15,6 +15,12 @@ function unchangedExportOf(html) {
   return injectArtifactBaseLayer(html);
 }
 
+function charsetByteOffset(html) {
+  const match = /<meta\b[^>]*\bcharset\s*=[^>]*>/i.exec(html);
+  assert.ok(match, "output must contain a meta charset declaration");
+  return Buffer.byteLength(html.slice(0, match.index));
+}
+
 function portablePathKey(absPath) {
   return String(absPath)
     .replace(/\\/g, "/")
@@ -711,6 +717,24 @@ test("export and share carry the same viewport meta and containment layer as the
   // Still no design system and still no annotation SDK - this is layout, not tooling.
   assert.doesNotMatch(out, /\/sdk\.js/);
   assert.doesNotMatch(out, /daisyui/);
+});
+
+test("export keeps charset in the sniff window with a large generated design import map", async () => {
+  const nonAscii = "Crème brûlée → 東京 🚀";
+  const moduleSource = `export default ${JSON.stringify("é".repeat(1_000))};`;
+  const html =
+    '<!doctype html><html><head><meta charset="utf-8"><title>T</title></head>' +
+    `<body><p>${nonAscii}</p><script type="module">import value from "/design/large.mjs"; window.value = value;</script>` +
+    "</body></html>";
+  const { html: out } = await buildSelfContainedHtml(html, {
+    baseDir: "/art",
+    readLocalFile: localReader({ "/pkg/design/large.mjs": moduleSource }),
+    resolveAbsolute: (refPath) => (refPath === "/design/large.mjs" ? "/pkg/design/large.mjs" : null),
+  });
+
+  assert.match(out, /<script type="importmap">/);
+  assert.ok(charsetByteOffset(out) < 1024);
+  assert.ok(Buffer.from(out, "utf8").toString("utf8").includes(nonAscii));
 });
 
 test("export honors the containment layer opt-out", async () => {
