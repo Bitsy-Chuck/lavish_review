@@ -90,7 +90,8 @@ test("state remains parseable while large updates are written", async () => {
           JSON.parse(await readFile(stateFile, "utf8"));
           clean += 1;
         } catch (error) {
-          if (error && error.code !== "ENOENT") torn += 1;
+          if (error instanceof SyntaxError) torn += 1;
+          else if (error.code !== "ENOENT") throw error;
         }
         try {
           await access(stopFile);
@@ -146,7 +147,7 @@ test("state remains parseable while large updates are written", async () => {
     if (process.env.LAVISH_AXI_REPORT_ATOMIC_COUNTS) {
       console.log(`state reader counts: ${JSON.stringify(counts)}`);
     }
-    assert.ok(counts.clean > 0);
+    assert.ok(counts.clean >= 100, `reader observed only ${counts.clean} clean state reads`);
     assert.equal(counts.torn, 0, `reader observed ${counts.torn} torn state writes`);
   } finally {
     if (reader && reader.exitCode === null) reader.kill();
@@ -180,22 +181,26 @@ test("no-op mutations neither create nor replace state", async () => {
   }
 });
 
-test("atomic replacement preserves an existing state file mode", async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
-  try {
-    const stateFile = path.join(dir, "state.json");
-    const artifact = path.join(dir, "artifact.html");
-    await writeFile(artifact, "<h1>Hello</h1>");
+test(
+  "atomic replacement preserves an existing state file mode",
+  { skip: process.platform === "win32" && "POSIX file modes only" },
+  async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+    try {
+      const stateFile = path.join(dir, "state.json");
+      const artifact = path.join(dir, "artifact.html");
+      await writeFile(artifact, "<h1>Hello</h1>");
 
-    const store = new SessionStore(stateFile);
-    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
-    await chmod(stateFile, 0o600);
-    await store.addAgentReply(session.key, "Working on it");
-    assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
+      const store = new SessionStore(stateFile);
+      const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+      await chmod(stateFile, 0o600);
+      await store.addAgentReply(session.key, "Working on it");
+      assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("queued prompts are returned with DOM snapshot context and then cleared", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
