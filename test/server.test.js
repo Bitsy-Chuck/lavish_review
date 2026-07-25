@@ -1577,8 +1577,15 @@ test("export inlines the Mermaid module + its chunk graph as offline data: modul
   // precedes the CONSUMING module script in document order (required for the browser to honor it).
   const maps = out.match(/<script type="importmap">/g) || [];
   assert.equal(maps.length, 1, "exactly one import map");
-  // The import map is the first child of <head> ...
-  assert.match(out, /<head\b[^>]*>\s*<script type="importmap">/, "import map is the first head child");
+  // The charset stays first and inside the browser's sniff window; the import map follows it.
+  const charset = /<meta\b[^>]*\bcharset\s*=[^>]*>/i.exec(out);
+  assert.ok(charset, "export contains a charset declaration");
+  assert.ok(Buffer.byteLength(out.slice(0, charset.index)) < 1024, "charset is inside the sniff window");
+  assert.match(
+    out,
+    /<head\b[^>]*>\s*<meta\b[^>]*\bcharset\s*=[^>]*>\s*<script type="importmap">/,
+    "import map follows the charset",
+  );
   // ... and its closing tag ends strictly before the real module script that references the bare id.
   const mapStart = out.indexOf('<script type="importmap">');
   const mapEnd = out.indexOf("</script>", mapStart) + "</script>".length;
