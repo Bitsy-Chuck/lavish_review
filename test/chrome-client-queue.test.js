@@ -276,6 +276,18 @@ async function createChromeHarness({
       assert.ok(handlers.length > 0, "chrome-client registered a message handler");
       for (const handler of handlers) handler({ source: whiteboard.source, data });
     },
+    // Answers the most recent snapshot request the way the real SDK does: by echoing its id.
+    lastSnapshotRequestId() {
+      const request = [...postedToFrame].reverse().find((message) => message.type === "lavish:requestSnapshot");
+      assert.ok(request, "chrome-client asked the artifact for a snapshot");
+      return request.requestId;
+    },
+    answerSnapshot(snapshot, requestId) {
+      const handlers = windowListeners.get("message") || [];
+      assert.ok(handlers.length > 0, "chrome-client registered a message handler");
+      const data = { type: "lavish:snapshot", requestId: requestId ?? this.lastSnapshotRequestId(), snapshot };
+      for (const handler of handlers) handler({ source: frame.contentWindow, data });
+    },
     dispatchDocumentKeydown(eventProps) {
       const handlers = documentListeners.get("keydown") || [];
       assert.ok(handlers.length > 0, "chrome-client registered a document keydown handler");
@@ -302,6 +314,9 @@ async function createChromeHarness({
     },
     runTimers,
     runTimersWhere,
+    pendingTimers() {
+      return [...timers.values()].map((timer) => ({ id: timer.id, ms: timer.ms }));
+    },
     srcLoads,
   };
 }
@@ -779,7 +794,7 @@ test("chrome client strips the internal queue key before posting prompts", async
   chrome.element("send").onclick();
   assert.equal(chrome.postedToFrame.at(-1).type, "lavish:requestSnapshot");
 
-  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  chrome.answerSnapshot("uid=1 body");
   await flushPromises();
 
   assert.equal(posts.length, 1);
@@ -807,7 +822,7 @@ test("chrome send and end carries the end intent with queued prompts", async () 
   chrome.element("sendAndEnd").onclick();
   assert.equal(chrome.postedToFrame.at(-1).type, "lavish:requestSnapshot");
 
-  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  chrome.answerSnapshot("uid=1 body");
   await flushPromises();
   await flushPromises();
 
@@ -863,12 +878,12 @@ test("chrome send and end during an in-flight submit still ends after the submit
     prompt: { prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" },
   });
   chrome.element("send").onclick();
-  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  chrome.answerSnapshot("uid=1 body");
   await flushPromises();
   assert.equal(posts.length, 1);
 
   chrome.element("sendAndEnd").onclick();
-  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  chrome.answerSnapshot("uid=1 body");
   await flushPromises();
   assert.equal(posts.length, 1);
 
@@ -1406,7 +1421,7 @@ test("chrome client stops reconnecting once the session has ended", async () => 
 
   const stream = chrome.latestEventSource();
   stream.listeners.get("open")();
-  stream.listeners.get("session-ended")();
+  stream.listeners.get("session-ended")({ data: JSON.stringify({ revision: 3 }) });
 
   assert.equal(chrome.element("endedOverlay").hidden, false);
   assert.equal(stream.closed, true);
@@ -1432,7 +1447,9 @@ test("chrome client unlocks the composer when a working presence goes stale", as
   await flushPromises();
 
   assert.equal(chrome.element("send").disabled, false);
-  assert.equal(chrome.element("sendAndEnd").disabled, false);
+  // Send & End stays locked: ending would tear the session down under an agent that may really
+  // be working. It reopens only when the server itself reports the agent is gone.
+  assert.equal(chrome.element("sendAndEnd").disabled, true);
   const bubble = chrome.element("chatLog").lastAppendedChild;
   assert.ok(bubble.classList.contains("agent-stalled"));
   assert.match(bubble.innerHTML, /No word from your agent for a while/);
@@ -1451,6 +1468,7 @@ test("chrome client re-locks the composer when the agent starts working again", 
 
   presence({ data: JSON.stringify({ state: "listening" }) });
   assert.equal(chrome.element("send").disabled, false);
+  assert.equal(chrome.element("sendAndEnd").disabled, false);
 
   presence({ data: JSON.stringify({ state: "working" }) });
   assert.equal(chrome.element("send").disabled, true);
@@ -1499,7 +1517,7 @@ test("chrome client keeps the typed message and offers a retry when the submit f
 
   chrome.element("chatInput").value = "Please tighten the spacing";
   chrome.element("send").onclick();
-  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  chrome.answerSnapshot("uid=1 body");
   await flushPromises();
   await flushPromises();
 
@@ -1512,7 +1530,7 @@ test("chrome client keeps the typed message and offers a retry when the submit f
 
   ok = true;
   chrome.element("submitRetry").onclick();
-  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  chrome.answerSnapshot("uid=1 body");
   await flushPromises();
   await flushPromises();
 
@@ -1533,7 +1551,7 @@ test("chrome client keeps annotation pills queued when their submit fails", asyn
     prompt: { prompt: "Fix the header", selector: "h1", tag: "annotation", text: "Header" },
   });
   chrome.element("send").onclick();
-  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  chrome.answerSnapshot("uid=1 body");
   await flushPromises();
   await flushPromises();
 
@@ -1558,7 +1576,7 @@ test("chrome client clears the composer only after the submit succeeds", async (
 
   chrome.element("chatInput").value = "Please tighten the spacing";
   chrome.element("send").onclick();
-  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  chrome.answerSnapshot("uid=1 body");
   await flushPromises();
 
   assert.equal(chrome.element("chatInput").value, "Please tighten the spacing");
@@ -1572,4 +1590,195 @@ test("chrome client clears the composer only after the submit succeeds", async (
 
   assert.equal(chrome.element("chatInput").value, "");
   assert.equal(chrome.element("chatLog").lastAppendedChild.classList.contains("pending"), false);
+});
+
+test("a reply that arrives while the resync is in flight survives the snapshot landing", async () => {
+  let releaseState = () => {};
+  const heldState = new Promise((resolve) => {
+    releaseState = () => resolve();
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (!String(url).endsWith("/state")) return { ok: true };
+      await heldState;
+      // Captured at revision 4: the reply below is revision 5 and is deliberately absent.
+      return {
+        ok: true,
+        json: async () => ({
+          status: "open",
+          ended: false,
+          presence: "listening",
+          revision: 4,
+          chat: [{ role: "user", text: "original question" }],
+        }),
+      };
+    },
+  });
+
+  const first = chrome.latestEventSource();
+  first.listeners.get("open")();
+  first.listeners.get("error")();
+  chrome.runTimersWhere((timer) => timer.ms >= 500 && timer.ms <= 1000);
+
+  const second = chrome.latestEventSource();
+  second.listeners.get("open")();
+  await flushPromises();
+
+  // The stream is live again while /state is still in flight, and a newer reply lands on it.
+  second.listeners.get("agent-reply")({ data: JSON.stringify({ text: "newer reply", revision: 5 }) });
+  assert.match(chrome.element("chatLog").lastAppendedChild.innerHTML, /newer reply/);
+
+  releaseState();
+  await flushPromises();
+  await flushPromises();
+
+  // The stale snapshot must not roll the chat back over the reply that overtook it.
+  assert.match(chrome.element("chatLog").lastAppendedChild.innerHTML, /newer reply/);
+});
+
+test("a resync snapshot newer than the stream still applies", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (!String(url).endsWith("/state")) return { ok: true };
+      return {
+        ok: true,
+        json: async () => ({
+          status: "open",
+          ended: false,
+          presence: "listening",
+          revision: 9,
+          chat: [{ role: "agent", text: "reply recovered by the resync" }],
+        }),
+      };
+    },
+  });
+
+  const first = chrome.latestEventSource();
+  first.listeners.get("open")();
+  first.listeners.get("agent-presence")({ data: JSON.stringify({ state: "waiting", revision: 3 }) });
+  first.listeners.get("error")();
+  chrome.runTimersWhere((timer) => timer.ms >= 500 && timer.ms <= 1000);
+
+  const second = chrome.latestEventSource();
+  second.listeners.get("open")();
+  await flushPromises();
+  await flushPromises();
+
+  assert.match(chrome.element("chatLog").lastAppendedChild.innerHTML, /reply recovered by the resync/);
+  assert.equal(chrome.element("send").disabled, false);
+});
+
+test("a stale presence event cannot roll presence backwards", async () => {
+  const chrome = await createChromeHarness();
+  const presence = chrome.eventSource().listeners.get("agent-presence");
+
+  presence({ data: JSON.stringify({ state: "working", revision: 7 }) });
+  assert.equal(chrome.element("send").disabled, true);
+
+  presence({ data: JSON.stringify({ state: "listening", revision: 5 }) });
+  assert.equal(chrome.element("send").disabled, true);
+
+  presence({ data: JSON.stringify({ state: "listening", revision: 8 }) });
+  assert.equal(chrome.element("send").disabled, false);
+});
+
+test("a late snapshot cannot satisfy the next snapshot request", async () => {
+  const posts = [];
+  const copied = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: init?.body ? JSON.parse(init.body) : null });
+      return { ok: true };
+    },
+  });
+  chrome.element("body").appendChild = () => {};
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Fix the header", selector: "h1", tag: "annotation", text: "Header" },
+  });
+
+  // A: a copy request that never gets answered in time.
+  chrome.element("copySnapshot").onclick();
+  const requestA = chrome.lastSnapshotRequestId();
+  chrome.runTimers(2500);
+  assert.equal(posts.length, 0);
+
+  // B: a send request that starts before A's answer finally shows up.
+  chrome.element("send").onclick();
+  const requestB = chrome.lastSnapshotRequestId();
+  assert.notEqual(requestA, requestB);
+
+  chrome.answerSnapshot("STALE snapshot from A", requestA);
+  await flushPromises();
+  // A's late answer must not be treated as B's, nor as a copy of B's page.
+  assert.equal(posts.length, 0);
+  assert.deepEqual(copied, []);
+
+  chrome.answerSnapshot("fresh snapshot from B", requestB);
+  await flushPromises();
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].body.domSnapshot, "fresh snapshot from B");
+});
+
+test("the event stream backoff escalates when a stream opens and dies immediately", async () => {
+  // The layout gate's 12s timer would otherwise sit inside the reconnect window being measured.
+  const chrome = await createChromeHarness({ sessionData: { ...defaultSessionData, layoutGateEnabled: false } });
+  const windows = [];
+
+  for (let cycle = 0; cycle < 5; cycle += 1) {
+    const stream = chrome.latestEventSource();
+    // Accepted with HTTP 200, then dropped before a single heartbeat - the shape that used to
+    // pin every retry to the first-attempt window.
+    stream.listeners.get("open")();
+    stream.listeners.get("error")();
+    const pending = chrome.pendingTimers().filter((timer) => timer.ms >= 500 && timer.ms <= 15_000);
+    assert.equal(pending.length, 1);
+    windows.push(pending[0].ms);
+    chrome.runTimersWhere((timer) => timer.id === pending[0].id);
+  }
+
+  // Each window is the capped 2^n range with jitter: 500-1000, 1000-2000, 2000-4000, ...
+  assert.ok(windows[1] > windows[0] / 2, `expected escalation, got ${windows}`);
+  assert.ok(windows[4] >= 4000, `expected the fifth attempt near the cap, got ${windows}`);
+  assert.ok(windows.every((ms) => ms <= 15_000));
+});
+
+test("a heartbeat proves the stream healthy and resets the backoff", async () => {
+  const chrome = await createChromeHarness({ sessionData: { ...defaultSessionData, layoutGateEnabled: false } });
+
+  for (let cycle = 0; cycle < 3; cycle += 1) {
+    const stream = chrome.latestEventSource();
+    stream.listeners.get("open")();
+    stream.listeners.get("error")();
+    const pending = chrome.pendingTimers().filter((timer) => timer.ms >= 500 && timer.ms <= 15_000);
+    chrome.runTimersWhere((timer) => timer.id === pending[0].id);
+  }
+
+  const healthy = chrome.latestEventSource();
+  healthy.listeners.get("open")();
+  healthy.listeners.get("heartbeat")({ data: "{}" });
+  healthy.listeners.get("error")();
+
+  const pending = chrome.pendingTimers().filter((timer) => timer.ms >= 500 && timer.ms <= 15_000);
+  assert.equal(pending.length, 1);
+  assert.ok(pending[0].ms <= 1000, `expected a reset first-attempt window, got ${pending[0].ms}`);
+});
+
+test("a restarted server re-bases the revision watermark instead of going deaf", async () => {
+  const chrome = await createChromeHarness();
+  const stream = chrome.eventSource();
+
+  stream.listeners.get("agent-presence")({ data: JSON.stringify({ state: "working", revision: 42, epoch: 1000 }) });
+  assert.equal(chrome.element("send").disabled, true);
+
+  // The server restarted: its in-memory counter starts over, so revision 1 here is NEWER than
+  // revision 42 from the instance that died.
+  stream.listeners.get("agent-presence")({ data: JSON.stringify({ state: "listening", revision: 1, epoch: 2000 }) });
+  assert.equal(chrome.element("send").disabled, false);
+
+  // A response still in flight from the dead instance must not drag state backwards.
+  stream.listeners.get("agent-presence")({ data: JSON.stringify({ state: "working", revision: 99, epoch: 1000 }) });
+  assert.equal(chrome.element("send").disabled, false);
 });

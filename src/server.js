@@ -177,7 +177,48 @@ export async function serve({
   const activePolls = new Map();
   const deliveredFeedback = new Set();
   const sseClients = new Set();
+  const stateRevisions = new Map();
+  // Revisions live in memory, so a restarted server counts from zero again. The epoch tells a
+  // client the counter it has been comparing against belongs to a previous instance, which it
+  // must re-base on rather than ignore. Start time makes epochs comparable, so a response still
+  // in flight from the old instance cannot drag the client backwards.
+  const stateEpoch = Date.now();
   const whiteboardChannelSecret = crypto.randomBytes(32);
+
+  // Every browser-visible state change (chat, presence, ended) gets a monotonic revision. A
+  // reconnecting client applies a snapshot or a live event only when its revision is newer than
+  // whatever it last applied, so a slow /state response can never overwrite a reply or a presence
+  // transition that reached it over the stream first.
+  const bumpRevision = (key) => {
+    const next = revisionOf(key) + 1;
+    stateRevisions.set(key, next);
+    return next;
+  };
+  const revisionOf = (key) => stateRevisions.get(key) || 0;
+
+  // Stamps the revision onto the event itself rather than letting each subscriber read the
+  // counter later, so listener registration order cannot change what a client sees.
+  const emitStateChange = (name, key, ...args) => {
+    const revision = bumpRevision(key);
+    events.emit(name, key, ...args, revision);
+    return revision;
+  };
+  const emitPresence = (key, state) => emitStateChange("agent-presence", key, state);
+
+  // Seqlock-style read: retry until the revision is unchanged across the async store read, so the
+  // revision stamped on a snapshot genuinely describes the chat and presence it carries. Labelling
+  // a snapshot with a revision newer than its content would let the client skip the very event
+  // that fills the gap, which is the failure this whole mechanism exists to prevent.
+  const readSessionSnapshot = async (key) => {
+    for (let attempt = 0; ; attempt += 1) {
+      const revision = revisionOf(key);
+      const session = await store.findByKey(key);
+      const presence = computePresence(key, activePolls, deliveredFeedback);
+      // The final attempt keeps the revision read *before* the snapshot: content that is newer
+      // than its label can at worst repeat an entry, while a label newer than its content loses one.
+      if (revisionOf(key) === revision || attempt >= 4) return { session, presence, revision };
+    }
+  };
   const verbose = debug || process.env.LAVISH_AXI_DEBUG === "1";
   const writeLog = typeof log === "function" ? log : (line) => process.stderr.write(`${line}\n`);
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
@@ -226,8 +267,9 @@ export async function serve({
       const sessionUrl = `http://${hostForUrl(linkHostName)}:${publicPort}/session/${key}`;
       const url = shouldDisableLayoutGateOpen(req.body || {}) ? appendNoGateParam(sessionUrl) : sessionUrl;
       const session = await store.upsertSession(file, sessionUrl);
+      bumpRevision(key);
       if (existing?.status === "ended") {
-        clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
+        clearFeedbackDelivery(key, activePolls, deliveredFeedback, emitPresence);
       }
       logEvent?.(`session opened key=${key} file=${file}`);
       await watchSession(session, watchers, events, logEvent);
@@ -245,7 +287,8 @@ export async function serve({
         req.query.timeoutMs === undefined ? null : Math.max(0, Math.min(Number(req.query.timeoutMs || 0), 2147483647));
       const immediate = await store.takeFeedback(key);
       if (immediate.status !== "waiting") {
-        if (immediate.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
+        bumpRevision(key);
+        if (immediate.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, emitPresence);
         res.json(immediate);
         return;
       }
@@ -259,7 +302,7 @@ export async function serve({
         }, pollHeartbeatMs);
         heartbeat.unref?.();
       }
-      setPollActive(key, activePolls, deliveredFeedback, events, true);
+      setPollActive(key, activePolls, deliveredFeedback, emitPresence, true);
       refreshIdleTimer();
       const timer = timeoutMs === null ? null : setTimeout(() => respond().catch(handleRespondError), timeoutMs);
       let cleaned = false;
@@ -271,7 +314,7 @@ export async function serve({
         if (heartbeat) clearInterval(heartbeat);
         events.off("feedback", onFeedback);
         events.off("ended", onFeedback);
-        setPollActive(key, activePolls, deliveredFeedback, events, false);
+        setPollActive(key, activePolls, deliveredFeedback, emitPresence, false);
         refreshIdleTimer();
       };
       const respond = async () => {
@@ -279,7 +322,8 @@ export async function serve({
         responding = true;
         try {
           const result = await store.takeFeedback(key);
-          if (result.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
+          if (result.status !== "waiting") bumpRevision(key);
+          if (result.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, emitPresence);
           if (streamHeartbeat) {
             res.end(JSON.stringify(result));
           } else {
@@ -323,9 +367,16 @@ export async function serve({
       // session is not "working" on it - it is waiting for an agent to show up. Without this the
       // presence latch survives forever once an agent takes delivery and never polls again.
       if (shouldEndSession || !activePolls.has(req.params.key)) {
-        clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+        clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, emitPresence);
       }
-      events.emit(shouldEndSession ? "ended" : "feedback", req.params.key);
+      if (shouldEndSession) {
+        emitStateChange("ended", req.params.key);
+      } else {
+        // "feedback" only wakes pollers, but the chat did change, so the revision must move too
+        // or a resync would carry the new message under an already-applied revision.
+        bumpRevision(req.params.key);
+        events.emit("feedback", req.params.key);
+      }
       res.json({ status: "queued", pending_prompts: session.pending_prompts });
       if (shouldEndSession) await shutdownIfNoLiveSessions();
     } catch (error) {
@@ -338,7 +389,7 @@ export async function serve({
   // rather than assuming nothing happened while it was gone.
   app.get("/api/:key/state", async (req, res, next) => {
     try {
-      const session = await store.findByKey(req.params.key);
+      const { session, presence, revision } = await readSessionSnapshot(req.params.key);
       if (!session) {
         res.status(404).json({ error: "session not found" });
         return;
@@ -347,9 +398,11 @@ export async function serve({
         key: session.key,
         status: session.status || "open",
         ended: session.status === "ended",
-        presence: computePresence(req.params.key, activePolls, deliveredFeedback),
+        presence,
         chat: session.chat || [],
         pending_prompts: session.pending_prompts || 0,
+        revision,
+        epoch: stateEpoch,
       });
     } catch (error) {
       next(error);
@@ -375,8 +428,8 @@ export async function serve({
   app.post("/api/:key/end", async (req, res, next) => {
     try {
       await store.endSession(req.params.key, "user");
-      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
-      events.emit("ended", req.params.key);
+      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, emitPresence);
+      emitStateChange("ended", req.params.key);
       res.json({ status: "ended" });
       await shutdownIfNoLiveSessions();
     } catch (error) {
@@ -392,7 +445,7 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
-      events.emit("agent-reply", req.params.key, text);
+      emitStateChange("agent-reply", req.params.key, text);
       res.json({ status: "sent" });
     } catch (error) {
       next(error);
@@ -476,8 +529,8 @@ export async function serve({
       const file = await canonicalFile(req.body.file);
       const key = sessionKey(file);
       await store.endSession(key, "agent");
-      clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
-      events.emit("ended", key);
+      clearFeedbackDelivery(key, activePolls, deliveredFeedback, emitPresence);
+      emitStateChange("ended", key);
       res.json({ status: "ended" });
       await shutdownIfNoLiveSessions();
     } catch (error) {
@@ -569,29 +622,41 @@ export async function serve({
         res.write(`id: ${eventId}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
       };
       res.write(`retry: ${SSE_RETRY_HINT_MS}\n\n`);
-      const session = await store.findByKey(req.params.key);
+
+      // Subscribe BEFORE reading the snapshot, or anything that happens during that read falls
+      // into a gap: too late for the snapshot, too early for the stream. Live events are held
+      // until the snapshot has been written so the client still receives them in revision order.
+      let snapshotSent = false;
+      const buffered = [];
+      const deliver = (event, data) => {
+        if (snapshotSent) {
+          write(event, data);
+          return;
+        }
+        buffered.push([event, data]);
+      };
       const sendReload = (key) => {
-        if (key === req.params.key) write("reload", {});
+        if (key === req.params.key) deliver("reload", {});
       };
-      const sendAgentReply = (key, text) => {
-        if (key === req.params.key) write("agent-reply", { text });
+      const sendAgentReply = (key, text, revision) => {
+        if (key === req.params.key) deliver("agent-reply", { text, revision, epoch: stateEpoch });
       };
-      const sendPresence = (key, state) => {
-        if (key === req.params.key) write("agent-presence", { state });
+      const sendPresence = (key, state, revision) => {
+        if (key === req.params.key) deliver("agent-presence", { state, revision, epoch: stateEpoch });
       };
-      const sendEnded = (key) => {
-        if (key === req.params.key) write("session-ended", {});
+      const sendEnded = (key, revision) => {
+        if (key === req.params.key) deliver("session-ended", { revision, epoch: stateEpoch });
       };
-      write("chat-sync", { chat: session?.chat || [] });
-      write("agent-presence", { state: computePresence(req.params.key, activePolls, deliveredFeedback) });
-      const heartbeat = setInterval(() => write("heartbeat", {}), SSE_HEARTBEAT_MS);
-      heartbeat.unref?.();
       events.on("reload", sendReload);
       events.on("agent-reply", sendAgentReply);
       events.on("agent-presence", sendPresence);
       events.on("ended", sendEnded);
+
+      // Registered alongside the subscriptions, not after the snapshot read, so a client that
+      // disconnects mid-read still unsubscribes.
+      let heartbeat = null;
       req.on("close", () => {
-        clearInterval(heartbeat);
+        if (heartbeat) clearInterval(heartbeat);
         sseClients.delete(res);
         events.off("reload", sendReload);
         events.off("agent-reply", sendAgentReply);
@@ -599,6 +664,16 @@ export async function serve({
         events.off("ended", sendEnded);
         refreshIdleTimer();
       });
+
+      const { session, presence, revision } = await readSessionSnapshot(req.params.key);
+      write("chat-sync", { chat: session?.chat || [], revision, epoch: stateEpoch });
+      write("agent-presence", { state: presence, revision, epoch: stateEpoch });
+      snapshotSent = true;
+      for (const [event, data] of buffered) write(event, data);
+      buffered.length = 0;
+
+      heartbeat = setInterval(() => write("heartbeat", {}), SSE_HEARTBEAT_MS);
+      heartbeat.unref?.();
     } catch (error) {
       next(error);
     }
@@ -1080,7 +1155,7 @@ export function hasLiveReloadRootOptIn(html) {
   return /<meta\b(?=[^>]*name=["']lavish-live-reload["'])(?=[^>]*content=["']root["'])[^>]*>/i.test(searchableHtml);
 }
 
-function setPollActive(key, activePolls, deliveredFeedback, events, active) {
+function setPollActive(key, activePolls, deliveredFeedback, emitPresence, active) {
   const previousPresence = computePresence(key, activePolls, deliveredFeedback);
   const count = activePolls.get(key) || 0;
   const nextCount = active ? count + 1 : Math.max(0, count - 1);
@@ -1092,24 +1167,24 @@ function setPollActive(key, activePolls, deliveredFeedback, events, active) {
     deliveredFeedback.delete(key);
   }
   const nextPresence = computePresence(key, activePolls, deliveredFeedback);
-  if (nextPresence !== previousPresence) events.emit("agent-presence", key, nextPresence);
+  if (nextPresence !== previousPresence) emitPresence(key, nextPresence);
 }
 
-function markFeedbackDelivered(key, activePolls, deliveredFeedback, events) {
+function markFeedbackDelivered(key, activePolls, deliveredFeedback, emitPresence) {
   const previousPresence = computePresence(key, activePolls, deliveredFeedback);
   deliveredFeedback.add(key);
   const nextPresence = computePresence(key, activePolls, deliveredFeedback);
   if (nextPresence !== previousPresence) {
-    events.emit("agent-presence", key, nextPresence);
+    emitPresence(key, nextPresence);
   }
 }
 
-function clearFeedbackDelivery(key, activePolls, deliveredFeedback, events) {
+function clearFeedbackDelivery(key, activePolls, deliveredFeedback, emitPresence) {
   const previousPresence = computePresence(key, activePolls, deliveredFeedback);
   deliveredFeedback.delete(key);
   const nextPresence = computePresence(key, activePolls, deliveredFeedback);
   if (nextPresence !== previousPresence) {
-    events.emit("agent-presence", key, nextPresence);
+    emitPresence(key, nextPresence);
   }
 }
 

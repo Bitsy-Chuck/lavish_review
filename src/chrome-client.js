@@ -81,6 +81,7 @@ let layoutGateCycle = 0;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let layoutGateTimer;
 const snapshotRequests = [];
+let snapshotRequestSeq = 0;
 let endAfterSubmit = false;
 let workingBubble = null;
 let submitQueuedPromise = null;
@@ -105,6 +106,10 @@ const SSE_RECONNECT_MAX_MS = 15_000;
 // The server heartbeats every 15s. Missing three in a row means the stream is dead even when
 // EventSource never fired an error, which is exactly how a half-open proxied connection behaves.
 const SSE_HEARTBEAT_TIMEOUT_MS = 50_000;
+// A stream that opens with HTTP 200 and is dropped immediately would otherwise reset the backoff
+// on every `open`, pinning every retry to the first-attempt window. The backoff only resets once
+// the connection has proven itself: a heartbeat received, or this long without failing.
+const SSE_HEALTHY_AFTER_MS = 20_000;
 
 /** @type {EventSource | null} */
 let eventStream = null;
@@ -115,8 +120,15 @@ let eventStreamAttempt = 0;
 let eventStreamReconnectTimer;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let eventStreamWatchdogTimer;
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let eventStreamHealthyTimer;
 /** @type {Promise<void> | null} */
 let resyncPromise = null;
+// Highest server revision whose state has been applied. Snapshots and live events both carry one,
+// so a slow /state response that was captured before a reply can never overwrite it.
+let appliedStateRevision = -1;
+// Which server instance those revisions belong to. Revisions are in-memory and restart at zero.
+let appliedStateEpoch = 0;
 let presenceStalled = false;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let presenceStallTimer;
@@ -199,7 +211,11 @@ function updateSendState() {
   // `presenceStalled` is the escape hatch: server presence can stay latched at "working" forever
   // once an agent takes delivery and never polls again, and that must not mute the composer.
   sendButton.disabled = ended || (agentPresence === "working" && !presenceStalled);
-  sendAndEndButton.disabled = sendButton.disabled;
+  // Send & End is deliberately not unlocked by the stall. Ordinary Send is safe either way - the
+  // feedback stays queued and the server drops presence to waiting once nothing is polling - but
+  // ending would tear down a session underneath an agent that really is still working. It comes
+  // back as soon as the server itself says the agent is gone.
+  sendAndEndButton.disabled = ended || agentPresence === "working";
 }
 
 function setSendHint(text) {
@@ -236,6 +252,26 @@ function hideSubmitError() {
 
 function setConnectionBanner(visible) {
   connectionBanner.hidden = !visible || ended;
+}
+
+// True when this payload describes state newer than anything applied so far, in which case it
+// also becomes the new watermark. A payload without a revision is always applied, so an older
+// server still works.
+function claimStateRevision(revision, epoch) {
+  const instance = Number(epoch);
+  if (Number.isFinite(instance) && instance !== appliedStateEpoch) {
+    // A restarted server counts from zero, so its revisions are not comparable with the previous
+    // instance's - re-base instead of going deaf until it climbs past the old high-water mark.
+    // Anything still in flight from an older instance is stale and stays ignored.
+    if (instance < appliedStateEpoch) return false;
+    appliedStateEpoch = instance;
+    appliedStateRevision = -1;
+  }
+  const next = Number(revision);
+  if (!Number.isFinite(next)) return true;
+  if (next <= appliedStateRevision) return false;
+  appliedStateRevision = next;
+  return true;
 }
 
 function hideSendHint() {
@@ -368,8 +404,10 @@ function handlePresenceStall() {
 function markWorkingBubbleStalled() {
   if (!workingBubble) return;
   workingBubble.classList.add("agent-stalled");
+  // Kept short on purpose: the phone panel gives the chat only a few lines, and an explanation
+  // that scrolls out of view explains nothing.
   workingBubble.innerHTML =
-    '<span class="spinner"></span><span>No word from your agent for a while. It may have stopped listening - you can send again, and it will be delivered the next time the agent checks in.</span>';
+    '<span class="spinner"></span><span>No word from your agent for a while. You can send again - nothing is lost.</span>';
 }
 
 function scrollPanelToBottom() {
@@ -422,15 +460,20 @@ function postToFrame(message) {
 }
 
 function requestSnapshot(action) {
-  const request = { action, settled: false, timer: undefined };
+  snapshotRequestSeq += 1;
+  const request = { id: "lavish-snapshot-" + snapshotRequestSeq, action, settled: false, timer: undefined };
   request.timer = setTimeout(() => handleSnapshotTimeout(request), SNAPSHOT_TIMEOUT_MS);
   snapshotRequests.push(request);
-  postToFrame({ type: "lavish:requestSnapshot" });
+  postToFrame({ type: "lavish:requestSnapshot", requestId: request.id });
 }
 
-function takeSnapshotRequest() {
-  const request = snapshotRequests.shift();
-  if (!request) return null;
+// Resolved strictly by id. Matching positionally would let a late answer to a request that already
+// timed out satisfy the next one, submitting it with a stale DOM snapshot - or under the wrong
+// action entirely, since a copy and a send look identical once the queue has shifted.
+function takeSnapshotRequest(requestId) {
+  const index = snapshotRequests.findIndex((request) => request.id === requestId);
+  if (index === -1) return null;
+  const [request] = snapshotRequests.splice(index, 1);
   request.settled = true;
   clearTimeout(request.timer);
   return request;
@@ -454,7 +497,9 @@ function handleSnapshotTimeout(request) {
 }
 
 function sendQueued(endAfter) {
-  if (ended || (agentPresence === "working" && !presenceStalled)) return;
+  if (ended) return;
+  // Same asymmetry as updateSendState, for the paths that bypass the buttons.
+  if (agentPresence === "working" && (endAfter || !presenceStalled)) return;
   closeMenus();
   hideSubmitError();
 
@@ -1387,9 +1432,9 @@ window.addEventListener("message", (event) => {
     enqueuePrompt(msg.prompt);
   }
   if (msg.type === "lavish:snapshot") {
-    const request = takeSnapshotRequest();
-    // A snapshot that arrives after its request already timed out has no pending request left, and
-    // acting on it would submit the queue a second time.
+    const request = takeSnapshotRequest(msg.requestId);
+    // A snapshot whose request already timed out no longer matches any id, and acting on it would
+    // submit the queue a second time - or hand the next request someone else's stale DOM.
     const snapshotAction = request ? request.action : "";
     if (snapshotAction === "copy") {
       copyText(msg.snapshot || "");
@@ -1510,7 +1555,8 @@ function connectEventStream() {
     const reconnected = eventStreamEverOpened;
     eventStreamConnected = true;
     eventStreamEverOpened = true;
-    eventStreamAttempt = 0;
+    clearTimeout(eventStreamHealthyTimer);
+    eventStreamHealthyTimer = setTimeout(markEventStreamHealthy, SSE_HEALTHY_AFTER_MS);
     setConnectionBanner(false);
     noteEventStreamActivity();
     // Nothing replays what was missed while the stream was down, so a reconnected client re-reads
@@ -1521,7 +1567,11 @@ function connectEventStream() {
     if (stream !== eventStream) return;
     handleEventStreamFailure();
   });
-  stream.addEventListener("heartbeat", () => noteEventStreamActivity());
+  stream.addEventListener("heartbeat", () => {
+    // A heartbeat is proof the server is really talking to us, not just accepting sockets.
+    markEventStreamHealthy();
+    noteEventStreamActivity();
+  });
   stream.addEventListener("reload", () => {
     noteEventStreamActivity();
     resetFrame().then((reloaded) => {
@@ -1531,17 +1581,29 @@ function connectEventStream() {
   stream.addEventListener("chrome-reload", () => reloadAfterServerRestart());
   stream.addEventListener("agent-reply", (event) => {
     noteEventStreamActivity();
-    addChat("agent", JSON.parse(event.data).text);
+    const payload = JSON.parse(event.data);
+    if (!claimStateRevision(payload.revision, payload.epoch)) return;
+    addChat("agent", payload.text);
   });
   stream.addEventListener("chat-sync", (event) => {
     noteEventStreamActivity();
-    syncChat(JSON.parse(event.data).chat || []);
+    const payload = JSON.parse(event.data);
+    if (!claimStateRevision(payload.revision, payload.epoch)) return;
+    syncChat(payload.chat || []);
   });
   stream.addEventListener("agent-presence", (event) => {
     noteEventStreamActivity();
-    setAgentPresence(JSON.parse(event.data).state);
+    const payload = JSON.parse(event.data);
+    if (!claimStateRevision(payload.revision, payload.epoch)) return;
+    setAgentPresence(payload.state);
   });
-  stream.addEventListener("session-ended", () => markSessionEnded());
+  // Ending is terminal and cannot be undone by a newer revision, so it is never skipped - the
+  // revision is only recorded so a later snapshot does not look older than it really is.
+  stream.addEventListener("session-ended", (event) => {
+    const payload = JSON.parse(event?.data || "{}");
+    claimStateRevision(payload.revision, payload.epoch);
+    markSessionEnded();
+  });
 }
 
 function closeEventStream() {
@@ -1555,13 +1617,22 @@ function stopEventStream() {
   eventStreamReconnectTimer = undefined;
   clearTimeout(eventStreamWatchdogTimer);
   eventStreamWatchdogTimer = undefined;
+  clearTimeout(eventStreamHealthyTimer);
+  eventStreamHealthyTimer = undefined;
   eventStreamConnected = false;
   closeEventStream();
+}
+
+function markEventStreamHealthy() {
+  eventStreamHealthyTimer = undefined;
+  eventStreamAttempt = 0;
 }
 
 function handleEventStreamFailure() {
   clearTimeout(eventStreamWatchdogTimer);
   eventStreamWatchdogTimer = undefined;
+  clearTimeout(eventStreamHealthyTimer);
+  eventStreamHealthyTimer = undefined;
   eventStreamConnected = false;
   closeEventStream();
   if (ended) return;
@@ -1607,9 +1678,12 @@ async function resyncStateOnce() {
   const response = await fetch("/api/" + key + "/state", { cache: "no-store" });
   if (!response.ok) throw new Error("failed to resync session state");
   const state = await response.json();
+  // The stream stayed live while this request was in flight. If anything newer already landed,
+  // this snapshot is stale by definition and applying it would erase that reply or presence.
+  if (state.ended) markSessionEnded();
+  if (!claimStateRevision(state.revision, state.epoch)) return;
   syncChat(Array.isArray(state.chat) ? state.chat : []);
   setAgentPresence(String(state.presence || "waiting"));
-  if (state.ended) markSessionEnded();
 }
 
 window.addEventListener("online", reconnectEventStreamNow);
