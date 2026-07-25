@@ -177,13 +177,15 @@ export class SessionStore {
   }
 
   async mutate(operation) {
+    // Operations must not call mutate for this same file: the inner mutation would wait on itself.
     const prior = mutationTails.get(this.file) || Promise.resolve();
     const result = prior
       .catch(() => {})
       .then(async () => {
         const state = await this.readState();
-        const value = operation(state);
-        await this.writeState(state);
+        const before = JSON.stringify(state);
+        const value = await operation(state);
+        if (JSON.stringify(state) !== before) await this.writeState(state);
         return value;
       });
     const tail = result.catch(() => {});
