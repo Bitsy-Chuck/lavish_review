@@ -138,6 +138,51 @@ test("recorder logs a finding once and suppresses the resize storm that follows"
   });
 });
 
+// The display `selector` is capped for readability, so two different elements deep in the DOM
+// can render as the same string. Suppressing on it dropped one of them from the log forever.
+test("two elements sharing a truncated selector are logged as two records", async () => {
+  await withTempDir(async (dir) => {
+    const recorder = createLayoutWarningRecorder(dir);
+    const shared = { selector: "div > div > div > div > pre", kind: "element-scroll-overflow" };
+    const firstIdentity = "html > body > div:nth-of-type(1) > div > div > div > div > pre";
+    const secondIdentity = "html > body > div:nth-of-type(2) > div > div > div > div > pre";
+    const first = warning({ ...shared, identity: firstIdentity });
+    const second = warning({ ...shared, identity: secondIdentity });
+
+    assert.equal(await recorder.record({ key: KEY, file: FILE, warnings: [first] }), 1);
+    // A second, different element later breaks the same way. It renders as the same capped
+    // selector, so suppression keyed on that selector would treat it as already-logged and
+    // drop it permanently - the page keeps reporting it, so no later report presents it as new.
+    assert.equal(await recorder.record({ key: KEY, file: FILE, warnings: [first, second] }), 1);
+    // Both on disk now: identity dedupes, it does not merely disable dedupe.
+    assert.equal(await recorder.record({ key: KEY, file: FILE, warnings: [first, second] }), 0);
+
+    const lines = await readLines(dir);
+    assert.deepEqual(
+      lines.map((line) => line.identity),
+      [firstIdentity, secondIdentity],
+    );
+    assert.deepEqual(
+      lines.map((line) => line.selector),
+      [shared.selector, shared.selector],
+      "the human-readable selector is unchanged, and is deliberately ambiguous here",
+    );
+  });
+});
+
+test("a record omits identity when the display selector is already the whole path", async () => {
+  await withTempDir(async (dir) => {
+    await appendLayoutWarnings(dir, { key: KEY, file: FILE, warnings: [warning()], at: "2026-07-18T12:00:00.000Z" });
+
+    const [line] = await readLines(dir);
+    assert.equal(
+      Object.hasOwn(line, "identity"),
+      false,
+      "records that were never ambiguous keep the exact shape - and the exact key - they had before",
+    );
+  });
+});
+
 test("a warning whose write failed is still logged by the next report of the same warning", async () => {
   await withTempDir(async (dir) => {
     // Reproduces the server interleaving that a retry-with-changed:true test cannot reach.
