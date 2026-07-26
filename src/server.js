@@ -183,17 +183,17 @@ export async function serve({
   const deliveredFeedback = new Set();
   const sseClients = new Set();
   const stateRevisions = new Map();
-  // Revisions live in memory, so a restarted server counts from zero again. The epoch tells a
-  // client the counter it has been comparing against belongs to a previous instance, which it
-  // must re-base on rather than ignore. Start time makes epochs comparable, so a response still
-  // in flight from the old instance cannot drag the client backwards.
-  const stateEpoch = Date.now();
+  // Instances are identified, never ordered. A clock cannot do this job: it can run backwards,
+  // two servers can start in the same millisecond, and a replacement with a lower timestamp would
+  // have its state rejected forever - the permanent deafness this whole change exists to remove.
+  // An opaque id only ever answers "same server or not", and the client re-bases when it differs.
+  const bootId = crypto.randomUUID();
   const whiteboardChannelSecret = crypto.randomBytes(32);
 
-  // Every browser-visible state change (chat, presence, ended) gets a monotonic revision. A
-  // reconnecting client applies a snapshot or a live event only when its revision is newer than
-  // whatever it last applied, so a slow /state response can never overwrite a reply or a presence
-  // transition that reached it over the stream first.
+  // Every browser-visible state change (chat, presence, ended) gets a monotonic revision, and the
+  // browser is only ever sent the WHOLE state under one. Deltas were the problem: a snapshot that
+  // overlapped a later delta applied the same reply twice, because syncChat followed by addChat is
+  // not idempotent. A full-state replace is, so overlap is harmless by construction.
   const bumpRevision = (key) => {
     const next = revisionOf(key) + 1;
     stateRevisions.set(key, next);
@@ -201,29 +201,36 @@ export async function serve({
   };
   const revisionOf = (key) => stateRevisions.get(key) || 0;
 
-  // Stamps the revision onto the event itself rather than letting each subscriber read the
-  // counter later, so listener registration order cannot change what a client sees.
-  const emitStateChange = (name, key, ...args) => {
+  // Bumps the revision and tells every attached browser that its state is stale.
+  const noteStateChange = (key) => {
     const revision = bumpRevision(key);
+    events.emit("session-state", key, revision);
+    return revision;
+  };
+  const emitStateChange = (name, key, ...args) => {
+    const revision = noteStateChange(key);
     events.emit(name, key, ...args, revision);
     return revision;
   };
   const emitPresence = (key, state) => emitStateChange("agent-presence", key, state);
 
-  // Seqlock-style read: retry until the revision is unchanged across the async store read, so the
-  // revision stamped on a snapshot genuinely describes the chat and presence it carries. Labelling
-  // a snapshot with a revision newer than its content would let the client skip the very event
-  // that fills the gap, which is the failure this whole mechanism exists to prevent.
-  const readSessionSnapshot = async (key) => {
-    for (let attempt = 0; ; attempt += 1) {
-      const revision = revisionOf(key);
-      const session = await store.findByKey(key);
-      const presence = computePresence(key, activePolls, deliveredFeedback);
-      // The final attempt keeps the revision read *before* the snapshot: content that is newer
-      // than its label can at worst repeat an entry, while a label newer than its content loses one.
-      if (revisionOf(key) === revision || attempt >= 4) return { session, presence, revision };
-    }
+  // The caller fixes the revision label BEFORE calling this, so what comes back is never older
+  // than the label it will be stamped with. That single ordering rule is what makes "highest
+  // revision wins" safe: a payload that loses the comparison is guaranteed to be superseded by
+  // content that already includes its own change, so nothing can be dropped.
+  const readSessionState = async (key) => {
+    const session = await store.findByKey(key);
+    if (!session) return null;
+    return {
+      key: session.key,
+      status: session.status || "open",
+      ended: session.status === "ended",
+      presence: computePresence(key, activePolls, deliveredFeedback),
+      chat: session.chat || [],
+      pending_prompts: session.pending_prompts || 0,
+    };
   };
+
   const verbose = debug || process.env.LAVISH_AXI_DEBUG === "1";
   const writeLog = typeof log === "function" ? log : (line) => process.stderr.write(`${line}\n`);
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
@@ -277,7 +284,7 @@ export async function serve({
       const sessionUrl = `http://${hostForUrl(linkHostName)}:${publicPort}/session/${key}`;
       const url = shouldDisableLayoutGateOpen(req.body || {}) ? appendNoGateParam(sessionUrl) : sessionUrl;
       const session = await store.upsertSession(file, sessionUrl);
-      bumpRevision(key);
+      noteStateChange(key);
       if (existing?.status === "ended") {
         clearFeedbackDelivery(key, activePolls, deliveredFeedback, emitPresence);
       }
@@ -297,7 +304,7 @@ export async function serve({
         req.query.timeoutMs === undefined ? null : Math.max(0, Math.min(Number(req.query.timeoutMs || 0), 2147483647));
       const immediate = await store.takeFeedback(key);
       if (immediate.status !== "waiting") {
-        bumpRevision(key);
+        noteStateChange(key);
         if (immediate.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, emitPresence);
         res.json(immediate);
         return;
@@ -332,7 +339,7 @@ export async function serve({
         responding = true;
         try {
           const result = await store.takeFeedback(key);
-          if (result.status !== "waiting") bumpRevision(key);
+          if (result.status !== "waiting") noteStateChange(key);
           if (result.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, emitPresence);
           if (streamHeartbeat) {
             res.end(JSON.stringify(result));
@@ -384,7 +391,7 @@ export async function serve({
       } else {
         // "feedback" only wakes pollers, but the chat did change, so the revision must move too
         // or a resync would carry the new message under an already-applied revision.
-        bumpRevision(req.params.key);
+        noteStateChange(req.params.key);
         events.emit("feedback", req.params.key);
       }
       res.json({ status: "queued", pending_prompts: session.pending_prompts });
@@ -394,26 +401,20 @@ export async function serve({
     }
   });
 
-  // Authoritative state for a browser that just reconnected. The event stream carries no history,
-  // so a client that missed events while offline re-reads chat, presence and session status here
-  // rather than assuming nothing happened while it was gone.
+  // Authoritative state on demand, in the same shape the stream pushes. The stream sends this
+  // unprompted on every (re)connect, so a reconnecting browser does not need to ask; this exists
+  // for a client that wants to re-check without waiting for an event, such as one deciding whether
+  // a "working" presence has actually gone stale.
   app.get("/api/:key/state", async (req, res, next) => {
     try {
-      const { session, presence, revision } = await readSessionSnapshot(req.params.key);
-      if (!session) {
+      // Label first, content second - see readSessionState.
+      const revision = revisionOf(req.params.key);
+      const state = await readSessionState(req.params.key);
+      if (!state) {
         res.status(404).json({ error: "session not found" });
         return;
       }
-      res.json({
-        key: session.key,
-        status: session.status || "open",
-        ended: session.status === "ended",
-        presence,
-        chat: session.chat || [],
-        pending_prompts: session.pending_prompts || 0,
-        revision,
-        epoch: stateEpoch,
-      });
+      res.json({ ...state, revision, bootId });
     } catch (error) {
       next(error);
     }
@@ -635,8 +636,8 @@ export async function serve({
       sseClients.add(res);
       refreshIdleTimer();
       // `id:` is a per-connection sequence, used for ordering and for spotting gaps in a capture.
-      // Lavish keeps no event log, so Last-Event-ID replay is deliberately NOT supported: the
-      // client treats GET /api/:key/state as authoritative after every reconnect instead.
+      // Lavish keeps no event log, so Last-Event-ID replay is deliberately NOT supported: every
+      // `state` event carries the whole state, so the newest one is always a complete recovery.
       let eventId = 0;
       const write = (event, data) => {
         if (res.writableEnded) return;
@@ -645,57 +646,69 @@ export async function serve({
       };
       res.write(`retry: ${SSE_RETRY_HINT_MS}\n\n`);
 
-      // Subscribe BEFORE reading the snapshot, or anything that happens during that read falls
-      // into a gap: too late for the snapshot, too early for the stream. Live events are held
-      // until the snapshot has been written so the client still receives them in revision order.
-      let snapshotSent = false;
-      const buffered = [];
-      const deliver = (event, data) => {
-        if (snapshotSent) {
-          write(event, data);
-          return;
+      // One combined `state` event carries chat, presence and ended together under a single
+      // revision. Sending them separately under the SAME revision is what made a client accept the
+      // chat and then reject the presence that shared its number.
+      //
+      // The pump serializes and coalesces: a change that lands while a read is in flight raises
+      // the pending revision instead of racing a second write, so writes are always in revision
+      // order and a burst collapses into one send.
+      let pendingRevision = null;
+      let pushing = false;
+      const pushState = async () => {
+        if (pushing) return;
+        pushing = true;
+        try {
+          while (pendingRevision !== null && !res.writableEnded) {
+            // The label is fixed before the read, never after, so content is never older than it.
+            const revision = pendingRevision;
+            pendingRevision = null;
+            let state = null;
+            try {
+              state = await readSessionState(req.params.key);
+            } catch {
+              // Fall through to the degraded push below.
+            }
+            // Presence lives in memory, so it stays trustworthy even when the store is unreadable
+            // or the session has gone. Omitting chat from a degraded push leaves whatever the
+            // browser already has rather than blanking the conversation.
+            const payload = state || { presence: computePresence(req.params.key, activePolls, deliveredFeedback) };
+            write("state", { ...payload, revision, bootId });
+          }
+        } finally {
+          pushing = false;
         }
-        buffered.push([event, data]);
       };
+      const queueState = (revision) => {
+        pendingRevision = pendingRevision === null ? revision : Math.max(pendingRevision, revision);
+        pushState();
+      };
+
+      // Subscribe BEFORE the first read, or anything that happens during it falls into a gap: too
+      // late for that read, too early for the stream. The pump then orders the initial state ahead
+      // of whatever arrived while it was being read.
       const sendReload = (key) => {
-        if (key === req.params.key) deliver("reload", {});
+        if (key === req.params.key) write("reload", {});
       };
-      const sendAgentReply = (key, text, revision) => {
-        if (key === req.params.key) deliver("agent-reply", { text, revision, epoch: stateEpoch });
-      };
-      const sendPresence = (key, state, revision) => {
-        if (key === req.params.key) deliver("agent-presence", { state, revision, epoch: stateEpoch });
-      };
-      const sendEnded = (key, revision) => {
-        if (key === req.params.key) deliver("session-ended", { revision, epoch: stateEpoch });
+      const onStateChanged = (key, revision) => {
+        if (key === req.params.key) queueState(revision);
       };
       events.on("reload", sendReload);
-      events.on("agent-reply", sendAgentReply);
-      events.on("agent-presence", sendPresence);
-      events.on("ended", sendEnded);
+      events.on("session-state", onStateChanged);
 
-      // Registered alongside the subscriptions, not after the snapshot read, so a client that
+      // Registered alongside the subscriptions, not behind the first read, so a client that
       // disconnects mid-read still unsubscribes.
-      let heartbeat = null;
+      const heartbeat = setInterval(() => write("heartbeat", {}), SSE_HEARTBEAT_MS);
+      heartbeat.unref?.();
       req.on("close", () => {
-        if (heartbeat) clearInterval(heartbeat);
+        clearInterval(heartbeat);
         sseClients.delete(res);
         events.off("reload", sendReload);
-        events.off("agent-reply", sendAgentReply);
-        events.off("agent-presence", sendPresence);
-        events.off("ended", sendEnded);
+        events.off("session-state", onStateChanged);
         refreshIdleTimer();
       });
 
-      const { session, presence, revision } = await readSessionSnapshot(req.params.key);
-      write("chat-sync", { chat: session?.chat || [], revision, epoch: stateEpoch });
-      write("agent-presence", { state: presence, revision, epoch: stateEpoch });
-      snapshotSent = true;
-      for (const [event, data] of buffered) write(event, data);
-      buffered.length = 0;
-
-      heartbeat = setInterval(() => write("heartbeat", {}), SSE_HEARTBEAT_MS);
-      heartbeat.unref?.();
+      queueState(revisionOf(req.params.key));
     } catch (error) {
       next(error);
     }

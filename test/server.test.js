@@ -50,15 +50,20 @@ async function startPresenceStream(base, key) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let lastPresence = null;
 
   return {
     async next() {
       const deadline = Date.now() + 500;
       while (true) {
-        const match = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m);
+        const match = buffer.match(/^event: state\ndata: (.+)\n\n/m);
         if (match) {
           buffer = buffer.replace(match[0], "");
-          return JSON.parse(match[1]).state;
+          const presence = JSON.parse(match[1]).presence;
+          // Whole-state pushes repeat the current presence whenever anything else changes.
+          if (presence === lastPresence) continue;
+          lastPresence = presence;
+          return presence;
         }
         const remaining = Math.max(1, deadline - Date.now());
         const { value, done } = await Promise.race([
@@ -715,7 +720,9 @@ test("chrome includes a chat-like prompt composer and agent reply listener", asy
   assert.match(css, /\.chat:empty::before\{/);
   assert.match(css, /Agent hasn't sent a message yet/);
   assert.match(html, /id="chatInput"/);
-  assert.match(js, /agent-reply/);
+  // Agent replies reach the browser inside the combined state event, not as a chat delta.
+  assert.match(js, /stream\.addEventListener\("state"/);
+  assert.match(js, /function applyServerState\(payload, generation\)/);
 });
 
 test("chrome bootstraps persisted chat history so missed replies still appear", () => {
@@ -738,14 +745,16 @@ test("chrome client renders persisted chat history", async () => {
 test("chrome can sync persisted chat after the event stream reconnects", async () => {
   const js = await chromeClientSource();
 
-  assert.match(js, /chat-sync/);
+  assert.match(js, /stream\.addEventListener\("state"/);
   assert.match(js, /function syncChat/);
+  // Reconnecting is itself the recovery: the server opens every connection with a whole state.
+  assert.match(js, /if \(Array\.isArray\(payload\.chat\)\) syncChat\(payload\.chat\)/);
 });
 
 test("chrome shows agent working state when a previous poll has released", async () => {
   const js = await chromeClientSource();
 
-  assert.match(js, /agent-presence/);
+  assert.match(js, /setAgentPresence\(String\(payload\.presence \|\| "waiting"\)\)/);
   assert.match(js, /Working\.\.\./);
   assert.match(js, /spinner/);
 });
@@ -1577,8 +1586,15 @@ test("export inlines the Mermaid module + its chunk graph as offline data: modul
   // precedes the CONSUMING module script in document order (required for the browser to honor it).
   const maps = out.match(/<script type="importmap">/g) || [];
   assert.equal(maps.length, 1, "exactly one import map");
-  // The import map is the first child of <head> ...
-  assert.match(out, /<head\b[^>]*>\s*<script type="importmap">/, "import map is the first head child");
+  // The charset stays first and inside the browser's sniff window; the import map follows it.
+  const charset = /<meta\b[^>]*\bcharset\s*=[^>]*>/i.exec(out);
+  assert.ok(charset, "export contains a charset declaration");
+  assert.ok(Buffer.byteLength(out.slice(0, charset.index)) < 1024, "charset is inside the sniff window");
+  assert.match(
+    out,
+    /<head\b[^>]*>\s*<meta\b[^>]*\bcharset\s*=[^>]*>\s*<script type="importmap">/,
+    "import map follows the charset",
+  );
   // ... and its closing tag ends strictly before the real module script that references the bare id.
   const mapStart = out.indexOf('<script type="importmap">');
   const mapEnd = out.indexOf("</script>", mapStart) + "</script>".length;
@@ -2395,12 +2411,13 @@ test("SSE agent-presence reflects waiting, listening, and working transitions", 
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         let lines;
-        while ((lines = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m))) {
+        while ((lines = buffer.match(/^event: state\ndata: (.+)\n\n/m))) {
           const data = JSON.parse(lines[1]);
-          presenceEvents.push(data.state);
           buffer = buffer.replace(lines[0], "");
+          if (data.presence === presenceEvents[presenceEvents.length - 1]) continue;
+          presenceEvents.push(data.presence);
           const waiter = presenceWaiters.shift();
-          if (waiter) waiter(data.state);
+          if (waiter) waiter(data.presence);
         }
       }
     });
@@ -2469,8 +2486,8 @@ test("SSE handshake reports waiting on a fresh session that never had a poll", a
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      const match = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m);
-      if (match) state = JSON.parse(match[1]).state;
+      const match = buffer.match(/^event: state\ndata: (.+)\n\n/m);
+      if (match) state = JSON.parse(match[1]).presence;
     }
     controller.abort();
     assert.equal(state, "waiting");
@@ -2623,12 +2640,13 @@ test("SSE agent-presence switches to working when poll immediately takes queued 
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         let lines;
-        while ((lines = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m))) {
+        while ((lines = buffer.match(/^event: state\ndata: (.+)\n\n/m))) {
           const data = JSON.parse(lines[1]);
-          presenceEvents.push(data.state);
           buffer = buffer.replace(lines[0], "");
+          if (data.presence === presenceEvents[presenceEvents.length - 1]) continue;
+          presenceEvents.push(data.presence);
           const waiter = presenceWaiters.shift();
-          if (waiter) waiter(data.state);
+          if (waiter) waiter(data.presence);
         }
       }
     });
@@ -2774,11 +2792,16 @@ test("the event stream sends reconnect hints and event ids", async () => {
     const { key } = await open.json();
     const stream = await startRawEventStream(base, key);
     try {
-      const seen = await stream.waitFor(/^id: 2\nevent: agent-presence\n/m);
+      const seen = await stream.waitFor(/^id: 1\nevent: state\n/m);
       assert.match(seen, /^retry: 2000\n\n/);
-      assert.match(seen, /^id: 1\nevent: chat-sync\n/m);
       // Ids are a per-connection sequence for ordering only; there is no replay log behind them.
-      assert.match(seen, /^id: 2\nevent: agent-presence\n/m);
+      assert.match(seen, /^id: 1\nevent: state\n/m);
+      // Chat and presence arrive together under one revision. Splitting them across two events
+      // that shared a revision is what made a client accept the chat and drop the presence.
+      const initial = JSON.parse(/^event: state\ndata: (.+)$/m.exec(seen)[1]);
+      assert.ok("chat" in initial && "presence" in initial && "ended" in initial);
+      assert.doesNotMatch(seen, /event: chat-sync/);
+      assert.doesNotMatch(seen, /event: agent-presence/);
     } finally {
       await stream.close();
     }
@@ -2811,13 +2834,13 @@ test("the event stream tells the browser when the session ends", async () => {
     });
     const stream = await startRawEventStream(base, key);
     try {
-      await stream.waitFor(/event: agent-presence\n/);
+      await stream.waitFor(/event: state\n/);
       await fetch(`${base}/api/end`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ file: artifact }),
       });
-      await stream.waitFor(/event: session-ended\n/);
+      await stream.waitFor(/"ended":true/);
     } finally {
       await stream.close();
     }
@@ -2963,8 +2986,9 @@ test("chrome reconnects the event stream itself with capped jittered backoff", a
   // Heartbeat watchdog: a half-open stream never fires `error`.
   assert.match(js, /const SSE_HEARTBEAT_TIMEOUT_MS = 50_000/);
   assert.match(js, /function noteEventStreamActivity\(\)/);
-  // Reopening resyncs rather than assuming the gap was empty.
-  assert.match(js, /if \(reconnected\) resyncState\(\)\.catch/);
+  // Obsolete connections cannot touch state, which is what keeps a stale instance from ending
+  // the session or rolling presence back after a newer one has been accepted.
+  assert.match(js, /if \(generation !== eventStreamGeneration\) return;/);
   assert.match(js, /fetch\("\/api\/" \+ key \+ "\/state"/);
 });
 
@@ -2987,14 +3011,18 @@ test("state snapshots and stream events share one monotonic revision", async () 
 
     const stream = await startRawEventStream(base, key);
     try {
-      await stream.waitFor(/event: agent-presence\n/);
+      await stream.waitFor(/event: state\n/);
       await fetch(`${base}/api/${key}/agent-reply`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ text: "on it" }),
       });
-      const seen = await stream.waitFor(/event: agent-reply\n/);
-      const replyRevision = JSON.parse(/^event: agent-reply\ndata: (.+)$/m.exec(seen)[1]).revision;
+      const seen = await stream.waitFor(/on it/);
+      const pushes = [...seen.matchAll(/^event: state\ndata: (.+)$/gm)].map((match) => JSON.parse(match[1]));
+      const withReply = pushes.find((push) => push.chat.some((item) => item.text === "on it"));
+      const replyRevision = withReply.revision;
+      // Whole states, never chat deltas - that is what makes an overlapping snapshot idempotent.
+      assert.doesNotMatch(seen, /event: agent-reply/);
       assert.ok(replyRevision > before.revision, `${replyRevision} should exceed ${before.revision}`);
 
       // A snapshot taken after the reply reports at least that revision, so a client can order
@@ -3049,7 +3077,7 @@ test("queued feedback moves the revision even though it only wakes pollers", asy
   }
 });
 
-test("every state payload carries the server instance epoch", async () => {
+test("every state payload carries the opaque server boot id", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -3064,17 +3092,19 @@ test("every state payload carries the server instance epoch", async () => {
     const { key } = await open.json();
 
     // Revisions restart at zero when the server does, so they only mean anything paired with the
-    // instance that issued them.
+    // instance that issued them. The id is opaque on purpose: a timestamp could order two
+    // instances wrongly and make a legitimate replacement look stale forever.
     const state = await (await fetch(`${base}/api/${key}/state`)).json();
-    assert.equal(typeof state.epoch, "number");
-    assert.ok(state.epoch > 0);
+    assert.equal(typeof state.bootId, "string");
+    assert.ok(state.bootId.length >= 16);
+    assert.doesNotMatch(state.bootId, /^\d+$/);
 
     const stream = await startRawEventStream(base, key);
     try {
-      const seen = await stream.waitFor(/event: agent-presence\n/);
-      const presence = JSON.parse(/^event: agent-presence\ndata: (.+)$/m.exec(seen)[1]);
-      assert.equal(presence.epoch, state.epoch);
-      assert.equal(typeof presence.revision, "number");
+      const seen = await stream.waitFor(/event: state\n/);
+      const pushed = JSON.parse(/^event: state\ndata: (.+)$/m.exec(seen)[1]);
+      assert.equal(pushed.bootId, state.bootId);
+      assert.equal(typeof pushed.revision, "number");
     } finally {
       await stream.close();
     }
@@ -3084,31 +3114,81 @@ test("every state payload carries the server instance epoch", async () => {
   }
 });
 
-test("the event stream subscribes before reading its snapshot, so nothing falls in the gap", async () => {
+test("the event stream subscribes before it reads, so nothing falls in the gap", async () => {
   const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
   const route = source.slice(source.indexOf('app.get("/events/:key"'));
   const body = route.slice(0, route.indexOf("\n  });"));
 
-  const subscribeAt = body.indexOf('events.on("agent-reply", sendAgentReply)');
-  const snapshotAt = body.indexOf("await readSessionSnapshot(");
-  assert.ok(subscribeAt !== -1 && snapshotAt !== -1);
-  assert.ok(subscribeAt < snapshotAt, "listeners must be registered before the snapshot read awaits");
-  // Events that land during the read are buffered rather than raced ahead of the snapshot.
-  assert.match(body, /let snapshotSent = false/);
-  assert.match(body, /buffered\.push\(\[event, data\]\)/);
-  // The disconnect cleanup is registered with the subscriptions, not after the await.
-  assert.ok(body.indexOf('req.on("close"') < snapshotAt, "close cleanup must not sit behind the await");
+  const subscribeAt = body.indexOf('events.on("session-state", onStateChanged)');
+  const cleanupAt = body.indexOf('req.on("close"');
+  const firstPushAt = body.indexOf("queueState(revisionOf(");
+  assert.ok(subscribeAt !== -1 && cleanupAt !== -1 && firstPushAt !== -1);
+  assert.ok(subscribeAt < firstPushAt, "listeners must be registered before the first read is kicked off");
+  assert.ok(cleanupAt < firstPushAt, "close cleanup must not sit behind the first read");
+  // Registration is entirely synchronous now: the only await lives inside the serialized pump, so
+  // there is no window between subscribing and reading for a change to fall into.
+  const registration = body.slice(0, firstPushAt).replace(/const pushState[\s\S]*?\n {6}\};/, "");
+  assert.doesNotMatch(registration, /\bawait\b/);
 });
 
-test("a snapshot read retries until its revision is stable", async () => {
+test("changes racing the first read still reach the browser", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+
+    // Open the stream and immediately fire changes without waiting for its first state, so they
+    // land while that first read is still in flight.
+    const stream = await startRawEventStream(base, key);
+    try {
+      for (const text of ["one", "two", "three"]) {
+        await fetch(`${base}/api/${key}/agent-reply`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+      }
+      const seen = await stream.waitFor(/three/);
+      const pushes = [...seen.matchAll(/^event: state\ndata: (.+)$/gm)].map((match) => JSON.parse(match[1]));
+      const latest = pushes[pushes.length - 1];
+      assert.deepEqual(
+        latest.chat.map((item) => item.text),
+        ["one", "two", "three"],
+      );
+      // Revisions never go backwards across pushes on one connection.
+      const revisions = pushes.map((push) => push.revision);
+      assert.deepEqual(
+        revisions,
+        [...revisions].sort((a, b) => a - b),
+      );
+    } finally {
+      await stream.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("state payloads are labelled before their content is read", async () => {
   const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
 
-  assert.match(source, /const readSessionSnapshot = async \(key\) => \{/);
-  assert.match(source, /const revision = revisionOf\(key\);\n\s+const session = await store\.findByKey\(key\);/);
-  assert.match(
-    source,
-    /if \(revisionOf\(key\) === revision \|\| attempt >= 4\) return \{ session, presence, revision \}/,
-  );
+  // Both producers fix the revision first and read the store second. Content newer than its label
+  // is harmless - a later push supersedes it, and application is a full replace - whereas a label
+  // newer than its content would make the client skip the very change it describes.
+  assert.match(source, /const revision = revisionOf\(req\.params\.key\);\n\s+const state = await readSessionState\(/);
+  assert.match(source, /const revision = pendingRevision;\n\s+pendingRevision = null;/);
+  // The seqlock retry is gone: it narrowed the window without closing it, because the store
+  // mutation lands before its revision bump no matter how many times the read is repeated.
+  assert.doesNotMatch(source, /readSessionSnapshot/);
 });
 
 test("hasLiveReloadRootOptIn detects the data attribute and meta opt-in", () => {
