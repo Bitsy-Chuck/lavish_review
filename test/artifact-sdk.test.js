@@ -289,6 +289,237 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
   }
 });
 
+/**
+ * Build one fake element carrying the geometry the layout audit actually reads.
+ * `overflowBy` makes it genuinely overflow its own scroll box, which is what
+ * `classifyHorizontalOverflow` flags - so a finding here is produced by the real
+ * audit path rather than injected.
+ *
+ * @param {string} tag
+ * @param {{ attrs?: Record<string, string>, width?: number, height?: number, overflowBy?: number,
+ *   style?: Record<string, string>, ownerSVGElement?: unknown }} [options]
+ */
+function auditNode(tag, { attrs = {}, width = 400, height = 40, overflowBy = 0, style = {}, ownerSVGElement } = {}) {
+  const el = node(tag, attrs);
+  el.style = { ...style };
+  el.getBoundingClientRect = () => ({ left: 0, top: 0, right: width, bottom: height, width, height });
+  el.getClientRects = () => [];
+  el.clientWidth = width;
+  el.scrollWidth = width + overflowBy;
+  el.clientHeight = height;
+  el.scrollHeight = height;
+  // Real SVG children report an ownerSVGElement, which is how the audit knows to
+  // skip SVG internals while still descending into <foreignObject> HTML.
+  if (ownerSVGElement !== undefined) el.ownerSVGElement = ownerSVGElement;
+  return el;
+}
+
+// Chain elements parent -> child and return the innermost one.
+function auditChain(root, elements) {
+  let parent = root;
+  for (const el of elements) parent = append(parent, el);
+  return parent;
+}
+
+// Stand up the minimum browser surface `auditLayout` touches, run `build` to
+// populate <body>, then hand the real audit closure to `run`.
+function withLayoutAudit(build, run) {
+  const saved = Object.fromEntries(
+    ["window", "document", "parent", "Element", "CSS", "getComputedStyle"].map((key) => [key, globalThis[key]]),
+  );
+  const setGlobal = (key, value) => {
+    Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+  };
+  const styleDefaults = {
+    display: "block",
+    visibility: "visible",
+    opacity: "1",
+    overflowX: "visible",
+    overflowY: "visible",
+    position: "static",
+    maxWidth: "100%",
+    borderLeftWidth: "0px",
+    borderRightWidth: "0px",
+    borderTopWidth: "0px",
+    borderBottomWidth: "0px",
+    paddingLeft: "0px",
+    paddingRight: "0px",
+    paddingTop: "0px",
+    paddingBottom: "0px",
+  };
+
+  try {
+    setGlobal(
+      "Element",
+      class {
+        static [Symbol.hasInstance](value) {
+          return value?.nodeType === 1;
+        }
+      },
+    );
+    setGlobal("CSS", { escape: (value) => String(value) });
+
+    const body = auditNode("body", { width: 400, height: 400 });
+    const documentElement = auditNode("html", { width: 400, height: 400 });
+    append(documentElement, body);
+    documentElement.scrollWidth = 400;
+    documentElement.clientWidth = 400;
+
+    const fixture = build(body) || {};
+
+    setGlobal("window", {
+      innerWidth: 400,
+      innerHeight: 800,
+      addEventListener() {},
+      setTimeout() {},
+      requestAnimationFrame() {},
+    });
+    setGlobal("parent", { postMessage() {} });
+    setGlobal("document", {
+      body,
+      documentElement,
+      querySelectorAll: () => [],
+      createElement: (tag) => auditNode(tag),
+      elementFromPoint: () => null,
+    });
+    setGlobal("getComputedStyle", (el) => ({ ...styleDefaults, .../** @type {any} */ (el.style || {}) }));
+
+    const hooks = {};
+    createArtifactSdk(() => "", undefined, undefined, hooks);
+    run({ hooks, body, documentElement, ...fixture });
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete globalThis[key];
+      else setGlobal(key, value);
+    }
+  }
+}
+
+// Two structurally identical subtrees, deep enough that the display selector's
+// segment cap throws away the only thing that told them apart. Before findings
+// carried an identity separate from the display selector, both <pre> elements
+// keyed as `div > div > div > div > pre` and the second one was silently
+// dropped by dedupe - the log lost a real, distinct problem.
+test("two identical subtrees past the selector display cap stay two findings", () => {
+  withLayoutAudit(
+    (body) => {
+      const wrappers = [1, 2].map(() => {
+        const wrapper = auditNode("div");
+        append(body, wrapper);
+        return auditChain(wrapper, [auditNode("div"), auditNode("div"), auditNode("div"), auditNode("div")]);
+      });
+      const first = append(wrappers[0], auditNode("pre", { overflowBy: 120 }));
+      const second = append(wrappers[1], auditNode("pre", { overflowBy: 240 }));
+      return { first, second };
+    },
+    ({ hooks }) => {
+      const findings = hooks.auditLayout().filter((finding) => finding.kind === "element-scroll-overflow");
+
+      assert.equal(findings.length, 2, "both broken <pre> elements survive dedupe");
+      assert.deepEqual(
+        findings.map((finding) => finding.selector),
+        ["div > div > div > div > pre", "div > div > div > div > pre"],
+        "the display selector is still capped, and is deliberately ambiguous here",
+      );
+      assert.deepEqual(
+        findings.map((finding) => finding.identity),
+        [
+          "html > body > div:nth-of-type(1) > div > div > div > div > pre",
+          "html > body > div:nth-of-type(2) > div > div > div > div > pre",
+        ],
+        "identity keeps the full path, including the nth-of-type the cap discarded",
+      );
+      assert.deepEqual(
+        findings.map((finding) => finding.overflowPx),
+        [120, 240],
+        "each finding reports its own element's overflow, not the first one's",
+      );
+    },
+  );
+});
+
+// The old harness had one <pre> per parent, so `:nth-of-type` was never
+// exercised at all. It is the only thing separating same-tag siblings.
+test("same-tag siblings are separated by :nth-of-type", () => {
+  withLayoutAudit(
+    (body) => {
+      const section = append(body, auditNode("section"));
+      // Interleaved <p> elements: :nth-of-type counts same-tag siblings only, so
+      // these <pre> elements are 1 and 2 - not the 2 and 4 :nth-child would give.
+      append(section, auditNode("p"));
+      append(section, auditNode("pre", { overflowBy: 30 }));
+      append(section, auditNode("p"));
+      append(section, auditNode("pre", { overflowBy: 60 }));
+    },
+    ({ hooks }) => {
+      const findings = hooks.auditLayout().filter((finding) => finding.kind === "element-scroll-overflow");
+
+      assert.deepEqual(
+        findings.map((finding) => finding.selector),
+        ["html > body > section > pre:nth-of-type(1)", "html > body > section > pre:nth-of-type(2)"],
+      );
+      assert.deepEqual(
+        findings.map((finding) => finding.identity),
+        [undefined, undefined],
+        "a path that fits the cap carries no separate identity, so its key is unchanged",
+      );
+    },
+  );
+});
+
+// Mermaid derives every descendant id from the svg root id it regenerates on
+// each render, so `g#mermaid-<ms>-flowchart-P-0` is a new string after every
+// reload or theme re-render. Identity anchored on it never latches: `persistent`
+// never fires and the durable log fills with duplicates of one problem.
+test("Mermaid descendant identity survives a regenerated svg id", () => {
+  withLayoutAudit(
+    (body) => {
+      const container = append(body, auditNode("div", { attrs: { "data-lavish-mermaid": "" } }));
+      const svg = append(container, auditNode("svg", { attrs: { id: "mermaid-1785021297984" } }));
+      const svgChild = (tag, attrs = {}) => auditNode(tag, { attrs, ownerSVGElement: svg });
+      const nodes = append(svg, svgChild("g"));
+      const nodeLayer = append(nodes, svgChild("g"));
+
+      const labels = ["P-0", "Q-1"].map((suffix, index) => {
+        const group = append(nodeLayer, svgChild("g", { id: `mermaid-1785021297984-flowchart-${suffix}` }));
+        const inner = append(group, svgChild("g"));
+        const foreignObject = append(inner, svgChild("foreignObject"));
+        // <foreignObject> re-enters HTML, so its content has no ownerSVGElement
+        // and is really audited - this is where the reported findings landed.
+        return append(foreignObject, auditNode("div", { overflowBy: 40 * (index + 1) }));
+      });
+      return { svg, labels };
+    },
+    ({ hooks, svg }) => {
+      // The key the log and the persistent flag actually dedupe on, spelled out
+      // the same way `layoutWarningKey` spells it.
+      const keys = () =>
+        hooks
+          .auditLayout()
+          .filter((finding) => finding.kind === "element-scroll-overflow")
+          .map((finding) => `${finding.kind}:${finding.identity || finding.selector}`);
+
+      const before = keys();
+      assert.deepEqual(
+        before.filter((key) => key.includes("mermaid-")),
+        [],
+        "no generated Mermaid id appears anywhere in a diagram descendant's key",
+      );
+      assert.deepEqual(
+        before,
+        [
+          "element-scroll-overflow:html > body > div > svg > g > g > g:nth-of-type(1) > g > foreignobject > div",
+          "element-scroll-overflow:html > body > div > svg > g > g > g:nth-of-type(2) > g > foreignobject > div",
+        ],
+        "dropping the volatile ids still leaves the two labels distinguishable by position",
+      );
+
+      svg.id = "mermaid-1785099999999";
+      assert.deepEqual(keys(), before, "a re-render that regenerates the svg id keeps descendant identity");
+    },
+  );
+});
+
 function node(tag, attrs = {}, children = []) {
   const el = {
     tagName: tag.toUpperCase(),

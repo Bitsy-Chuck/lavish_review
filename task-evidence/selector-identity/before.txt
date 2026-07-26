@@ -1,0 +1,49 @@
+
+=== run 0
+svg ids: mermaid-1785023945015-slotA, mermaid-1785023945200-slotB
+findings: 17   distinct keys: 17
+  page-horizontal-overflow:html
+  element-scroll-overflow:html > body > div:nth-of-type(1)
+  element-scroll-overflow:html > body > div:nth-of-type(1) > div
+  element-scroll-overflow:html > body > div:nth-of-type(1) > div > div
+  element-scroll-overflow:body > div:nth-of-type(1) > div > div > div
+  element-scroll-overflow:div:nth-of-type(1) > div > div > div > div
+  element-scroll-overflow:div > div > div > div > pre
+  element-scroll-overflow:html > body > div:nth-of-type(2)
+  element-scroll-overflow:html > body > div:nth-of-type(2) > div
+  element-scroll-overflow:html > body > div:nth-of-type(2) > div > div
+  element-scroll-overflow:body > div:nth-of-type(2) > div > div > div
+  element-scroll-overflow:div:nth-of-type(2) > div > div > div > div
+  element-parent-overflow:g#mermaid-1785023945015-slotA-flowchart-A-0 > g > foreignobject > div
+  element-parent-overflow:g#mermaid-1785023945015-slotA-flowchart-B-1 > g > foreignobject > div
+  element-parent-overflow:g#mermaid-1785023945200-slotB-flowchart-P-0 > g > foreignobject > div
+  element-parent-overflow:g#mermaid-1785023945200-slotB-flowchart-Q-1 > g > foreignobject > div
+  overlapping-text:g > foreignobject > div > span > p
+
+=== run 1
+svg ids: mermaid-1785023957321-slotA, mermaid-1785023957423-slotB
+findings: 17   distinct keys: 17
+  page-horizontal-overflow:html
+  element-scroll-overflow:html > body > div:nth-of-type(1)
+  element-scroll-overflow:html > body > div:nth-of-type(1) > div
+  element-scroll-overflow:html > body > div:nth-of-type(1) > div > div
+  element-scroll-overflow:body > div:nth-of-type(1) > div > div > div
+  element-scroll-overflow:div:nth-of-type(1) > div > div > div > div
+  element-scroll-overflow:div > div > div > div > pre
+  element-scroll-overflow:html > body > div:nth-of-type(2)
+  element-scroll-overflow:html > body > div:nth-of-type(2) > div
+  element-scroll-overflow:html > body > div:nth-of-type(2) > div > div
+  element-scroll-overflow:body > div:nth-of-type(2) > div > div > div
+  element-scroll-overflow:div:nth-of-type(2) > div > div > div > div
+  element-parent-overflow:g#mermaid-1785023957321-slotA-flowchart-A-0 > g > foreignobject > div
+  element-parent-overflow:g#mermaid-1785023957321-slotA-flowchart-B-1 > g > foreignobject > div
+  element-parent-overflow:g#mermaid-1785023957423-slotB-flowchart-P-0 > g > foreignobject > div
+  element-parent-overflow:g#mermaid-1785023957423-slotB-flowchart-Q-1 > g > foreignobject > div
+  overlapping-text:g > foreignobject > div > span > p
+
+identity stable across 2 independent page loads: NO
+  run 1 minted new keys:
+    element-parent-overflow:g#mermaid-1785023957321-slotA-flowchart-A-0 > g > foreignobject > div
+    element-parent-overflow:g#mermaid-1785023957321-slotA-flowchart-B-1 > g > foreignobject > div
+    element-parent-overflow:g#mermaid-1785023957423-slotB-flowchart-P-0 > g > foreignobject > div
+    element-parent-overflow:g#mermaid-1785023957423-slotB-flowchart-Q-1 > g > foreignobject > div

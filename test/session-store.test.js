@@ -434,6 +434,52 @@ test("a warning re-reported after the agent already received it is marked persis
   }
 });
 
+// Two elements deep in the DOM can share a display selector, so `persistent` has to key on the
+// browser's full identity. Keying on the selector alone told the agent it had already seen a
+// finding it had never been shown.
+test("findings sharing a display selector track persistence independently", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const shared = {
+      selector: "div > div > div > div > pre",
+      kind: "element-scroll-overflow",
+      overflowPx: 24,
+      viewportWidth: 720,
+      severity: "error",
+    };
+    const first = { ...shared, identity: "html > body > div:nth-of-type(1) > div > div > div > div > pre" };
+    const second = { ...shared, identity: "html > body > div:nth-of-type(2) > div > div > div > div > pre" };
+
+    await store.recordLayoutWarnings(session.key, { layout_warnings: [first] });
+    const delivered = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(delivered.layout_warnings.length, 1);
+    assert.equal(delivered.layout_warnings[0].persistent, false);
+
+    // Only the first element was ever shown to the agent. The second renders as the same
+    // selector but is a different element the agent has never been told about.
+    await store.recordLayoutWarnings(session.key, { layout_warnings: [first, second] });
+    const repeat = feedbackResult(await store.takeFeedback(session.key));
+    assert.deepEqual(
+      repeat.layout_warnings.map((warning) => warning.persistent),
+      [true, false],
+      "the re-reported finding is persistent; its selector twin is still a fresh sighting",
+    );
+    assert.deepEqual(
+      repeat.layout_warnings.map((warning) => warning.identity),
+      [first.identity, second.identity],
+      "identity reaches the agent intact, so it can tell the two apart too",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("a warning is fresh again after a clean audit resolves it", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
   try {

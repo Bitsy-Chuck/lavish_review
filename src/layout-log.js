@@ -54,6 +54,7 @@ const writeTails = new Map();
  *
  * @typedef {object} LayoutWarning
  * @property {string} selector
+ * @property {string} [identity]
  * @property {string} kind
  * @property {number} overflowPx
  * @property {number} viewportWidth
@@ -265,6 +266,7 @@ function buildRecords({ key, file, warnings, at }) {
     key: String(key || ""),
     file: String(file || ""),
     selector: String(warning.selector || ""),
+    ...(warning.identity ? { identity: String(warning.identity) } : {}),
     kind: String(warning.kind || "layout-warning"),
     overflowPx: finiteNumber(warning.overflowPx),
     viewportWidth: finiteNumber(warning.viewportWidth),
