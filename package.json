@@ -26,6 +26,7 @@
     "format:check": "prettier --check .",
     "prepack": "npm run build",
     "prepare": "npm run build",
+    "prepublishOnly": "node -e \"console.error('lavish-axi is a local-only fork; publishing is disabled'); process.exit(1)\"",
     "test": "node --test",
     "typecheck": "tsc --noEmit"
   },

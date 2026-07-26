@@ -58,7 +58,11 @@ test("build copies local design assets for published artifact injection", async 
 test("the package cannot be published to the npm registry", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 
-  assert.equal(packageJson.private, true, "private: true is what makes `npm publish` refuse outright");
+  // `private: true` alone is NOT sufficient: npm 11 still walks a `npm publish --dry-run` on a
+  // private package through to a successful pack. The prepublishOnly script is the guard that
+  // actually fails the command, so it is the one that has to stay.
+  assert.match(packageJson.scripts.prepublishOnly, /process\.exit\(1\)/, "publishing must fail loudly");
+  assert.equal(packageJson.private, true, "private: true is the declarative half of the same intent");
   assert.equal(packageJson.publishConfig, undefined, "publishConfig only means something when publishing");
 });
 
