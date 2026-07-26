@@ -240,11 +240,16 @@ function normalizePrompt(prompt) {
  * Natural grouping key for a finding: the same element failing the same way. Exported because
  * the durable layout log (`layout-log.js`) dedupes on exactly this identity.
  *
- * @param {{ kind: string, selector: string }} warning
+ * Keyed on `identity` - the finding's full element path - and not on `selector`, which is capped
+ * for display and so collides between distinct elements. `selector` remains the fallback for
+ * warnings recorded before identity existed, and for findings whose selector is already the
+ * whole path.
+ *
+ * @param {{ kind: string, selector: string, identity?: string }} warning
  * @returns {string}
  */
 export function layoutWarningKey(warning) {
-  return `${warning.kind}:${warning.selector}`;
+  return `${warning.kind}:${warning.identity || warning.selector}`;
 }
 
 // A finding whose key was already delivered to the agent in a prior poll is marked persistent
@@ -257,13 +262,16 @@ function normalizeLayoutWarnings(layoutWarnings, deliveredKeys = new Set()) {
     .map((warning) => {
       const selector = String(warning.selector || "");
       const kind = String(warning.kind || "layout-warning");
+      const identity = String(warning.identity || "");
       return {
         selector,
         kind,
+        // Omitted when absent so warnings that never had one keep their original wire shape.
+        ...(identity ? { identity } : {}),
         overflowPx: normalizeFiniteNumber(warning.overflowPx),
         viewportWidth: normalizeFiniteNumber(warning.viewportWidth),
         severity: warning.severity === "warning" ? "warning" : "error",
-        persistent: deliveredKeys.has(layoutWarningKey({ kind, selector })),
+        persistent: deliveredKeys.has(layoutWarningKey({ kind, selector, identity })),
       };
     });
 }

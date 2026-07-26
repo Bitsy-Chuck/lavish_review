@@ -325,6 +325,31 @@ export function createArtifactSdk(
     return parts.join(" > ");
   }
 
+  // The dedupe identity of an element: its full path, never capped and never carrying an id.
+  // `selector` above is built to be read by a human, so it stops at 5 parts and short-circuits on
+  // an id. Both make it ambiguous as a key - two different elements deeper than the cap render as
+  // one string, and inside a Mermaid diagram the id short-circuit makes the string change on every
+  // re-render because Mermaid regenerates its ids. Position is what stays stable across a reload,
+  // so identity uses only tag names plus :nth-of-type, all the way to the root.
+  function identitySelector(el) {
+    if (!el || !el.tagName) return "";
+
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === 1) {
+      let part = node.tagName.toLowerCase();
+      const parent = node.parentElement;
+      if (parent) {
+        const same = [...parent.children].filter((x) => x.tagName === node.tagName);
+        if (same.length > 1) part += ":nth-of-type(" + (same.indexOf(node) + 1) + ")";
+      }
+      parts.unshift(part);
+      node = parent;
+    }
+
+    return parts.join(" > ");
+  }
+
   function context(el) {
     const base = {
       uid: uid(el),
@@ -909,16 +934,22 @@ export function createArtifactSdk(
 
   function pushLayoutFinding(findings, seen, finding) {
     const selectorValue = finding.selector || "";
-    const key = `${finding.kind}:${selectorValue}`;
+    const identityValue = finding.el ? identitySelector(finding.el) : "";
+    // Dedupe on identity, not on the display selector, or a second element that renders as the
+    // same capped selector is silently dropped and never reaches the agent at all.
+    const key = `${finding.kind}:${identityValue || selectorValue}`;
     if (seen.has(key)) return;
     seen.add(key);
-    findings.push({
+    const record = {
       selector: selectorValue,
       kind: String(finding.kind || "layout-warning"),
       overflowPx: roundedOverflowPx(finding.overflowPx),
       viewportWidth: Math.round(Number(finding.viewportWidth) || window.innerWidth || 0),
       severity: finding.severity === "warning" ? "warning" : "error",
-    });
+    };
+    // Omitted when it adds nothing, so the common case keeps its existing shape on the wire.
+    if (identityValue && identityValue !== selectorValue) record.identity = identityValue;
+    findings.push(record);
   }
 
   function isIntentionalTextTruncation(style) {
@@ -939,9 +970,10 @@ export function createArtifactSdk(
   function pushScaledDownDiagramFinding(el, measurement, viewportWidth, findings, seen) {
     const scaledDown = classifyScaledDownSvg(measurement);
     if (!scaledDown) return;
-    const identity = el.tagName?.toLowerCase() === "svg" ? el.closest(".mermaid, [data-lavish-mermaid]") || el : el;
+    const diagram = el.tagName?.toLowerCase() === "svg" ? el.closest(".mermaid, [data-lavish-mermaid]") || el : el;
     pushLayoutFinding(findings, seen, {
-      selector: selector(identity),
+      el: diagram,
+      selector: selector(diagram),
       kind: "scaled-down-diagram",
       overflowPx: scaledDown.shrinkPx,
       viewportWidth,
@@ -999,6 +1031,7 @@ export function createArtifactSdk(
     });
     if (horizontal) {
       pushLayoutFinding(findings, seen, {
+        el,
         selector: selector(el),
         kind: horizontal.kind,
         overflowPx: horizontal.overflowPx,
@@ -1018,6 +1051,7 @@ export function createArtifactSdk(
     if (vertical) {
       if (vertical.clips) {
         pushLayoutFinding(findings, seen, {
+          el,
           selector: selector(el),
           kind: vertical.kind,
           overflowPx: vertical.overflowPx,
@@ -1045,6 +1079,7 @@ export function createArtifactSdk(
       const positionedOffCanvas =
         style.position === "absolute" || style.position === "fixed" || style.position === "sticky";
       pushLayoutFinding(findings, seen, {
+        el,
         selector: selector(el),
         kind: "element-parent-overflow",
         overflowPx: parentOverflowPx,
@@ -1057,6 +1092,7 @@ export function createArtifactSdk(
   function resolveSpillCandidates(spillCandidates, findings, seen) {
     for (const candidate of resolveVisibleSpillCandidates(spillCandidates, { epsilon: layoutAuditOverflowEpsilon })) {
       pushLayoutFinding(findings, seen, {
+        el: candidate.el,
         selector: candidate.selector,
         kind: "clipped-text",
         overflowPx: candidate.overflowPx,
@@ -1103,6 +1139,7 @@ export function createArtifactSdk(
           if (getComputedStyle(top).position !== "static") continue;
           if (!fragmentsSignificantlyOverlap([rect], elementLineFragments(top))) continue;
           pushLayoutFinding(findings, seen, {
+            el,
             selector: selector(el),
             kind: "overlapping-text",
             overflowPx: 0,
