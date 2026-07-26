@@ -737,6 +737,18 @@ test("export keeps charset in the sniff window with a large generated design imp
   assert.ok(Buffer.from(out, "utf8").toString("utf8").includes(nonAscii));
 });
 
+test("fragment export inserts a generated import map after its leading charset", async () => {
+  const html =
+    '<p>Crème</p><script type="module">import value from "/design/fragment.mjs"; window.value = value;</script>';
+  const { html: out } = await buildSelfContainedHtml(html, {
+    baseDir: "/art",
+    readLocalFile: localReader({ "/pkg/design/fragment.mjs": 'export default "ok";' }),
+    resolveAbsolute: (refPath) => (refPath === "/design/fragment.mjs" ? "/pkg/design/fragment.mjs" : null),
+  });
+
+  assert.match(out, /^<meta charset="utf-8"><script type="importmap">/);
+});
+
 test("export honors the containment layer opt-out", async () => {
   const html = '<!doctype html><html data-lavish-layout-safety="off"><head></head><body>x</body></html>';
   const { html: out } = await buildSelfContainedHtml(html, { baseDir: "/art", readLocalFile: localReader({}) });

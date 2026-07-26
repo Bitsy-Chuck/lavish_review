@@ -59,6 +59,17 @@ test("keeps an existing meta charset ahead of the injected base layer", () => {
   assert.match(result, /<head><meta charset="utf-8"><meta name="viewport"/);
 });
 
+test("does not promote a commented charset ahead of the live head declaration", () => {
+  const html =
+    '<!doctype html><html><head><!-- legacy fallback was <meta charset="iso-8859-1"> -->' +
+    '<meta charset="utf-8"><title>T</title></head><body>Crème brûlée → 東京</body></html>';
+  const result = injectArtifactBaseLayer(html);
+
+  assert.match(result, /<head><meta charset="utf-8">/);
+  assert.equal(result.match(/<!-- legacy fallback was <meta charset="iso-8859-1"> -->/g)?.length, 1);
+  assert.ok(result.indexOf('<meta charset="utf-8">') < result.indexOf("<!-- legacy fallback"));
+});
+
 test("served artifacts keep charset in the sniff window with a large import map", () => {
   const nonAscii = "Crème brûlée → 東京 🚀";
   const largeImportMap = `<script type="importmap">{"imports":{"design":"data:text/javascript;base64,${"YQ==".repeat(
@@ -86,6 +97,42 @@ test("preserves BOM and XML declarations while emitting one early compatible cha
   assert.match(xhtmlResult, /^<\?xml[^>]*><html[^>]*><head><meta charset="utf-8" \/>/);
   assert.equal(xhtmlResult.match(/<meta\b[^>]*\bcharset\s*=/gi).length, 1);
   assert.ok(charsetByteOffset(xhtmlResult) < 1024);
+});
+
+test("preserves BOM and XML declarations on headless fragments", () => {
+  const bomResult = injectArtifactBaseLayer("\uFEFF<h1>Crème</h1>");
+  assert.ok(bomResult.startsWith('\uFEFF<meta charset="utf-8">'));
+
+  const xmlResult = injectArtifactBaseLayer('<?xml version="1.0" encoding="UTF-8"?><h1>Crème</h1>');
+  assert.ok(xmlResult.startsWith('<?xml version="1.0" encoding="UTF-8"?><meta charset="utf-8" />'));
+});
+
+test("creates a charset head inside an explicit headless html element", () => {
+  const result = injectArtifactBaseLayer("<!doctype html><html><body>Crème</body></html>");
+
+  assert.match(result, /<html><head><meta charset="utf-8"><meta name="viewport"/);
+});
+
+test("does not hoist a body charset when the explicit head is closed", () => {
+  const html =
+    '<!doctype html><html><head><title>T</title></head><body><meta charset="iso-8859-1"><p>x</p></body></html>';
+  const result = injectArtifactBaseLayer(html);
+
+  assert.match(result, /<head><meta charset="utf-8">/);
+  assert.match(result, /<body><meta charset="iso-8859-1">/);
+});
+
+test("leaves charset-like markup inert in template, noscript, and script content", () => {
+  const html =
+    '<!doctype html><html><head><template><meta charset="iso-8859-1"><p>template</p></template>' +
+    '<noscript><meta charset="iso-8859-1"><p>noscript</p></noscript>' +
+    "<script>const sample = '<meta charset=\"iso-8859-1\">';</script></head><body>x</body></html>";
+  const result = injectArtifactBaseLayer(html);
+
+  assert.match(result, /<head><meta charset="utf-8">/);
+  assert.match(result, /<template><meta charset="iso-8859-1"><p>template<\/p><\/template>/);
+  assert.match(result, /<noscript><meta charset="iso-8859-1"><p>noscript<\/p><\/noscript>/);
+  assert.match(result, /const sample = '<meta charset="iso-8859-1">';/);
 });
 
 test("never adds a second viewport meta when the artifact declares its own", () => {

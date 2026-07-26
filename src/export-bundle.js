@@ -194,7 +194,8 @@ function injectDesignImportMap(out, ctx) {
     const at = htmlOpen.index + htmlOpen[0].length;
     return `${out.slice(0, at)}${tag}${out.slice(at)}`;
   }
-  return `${tag}${out}`;
+  const at = headInsertionIndex(out);
+  return `${out.slice(0, at)}${tag}${out.slice(at)}`;
 }
 
 /** Derive a portable download name for an exported artifact (report.html -> report.export.html). */
