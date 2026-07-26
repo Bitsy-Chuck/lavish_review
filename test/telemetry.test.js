@@ -43,6 +43,18 @@ test("telemetry can be disabled by environment", () => {
   assert.equal(config.enabled, false);
 });
 
+// This fork is local-only and must never contact a third-party analytics endpoint. There is no
+// hardcoded fallback host any more, so a website id alone - baked in, or set by a stray env var -
+// cannot be enough to start reporting.
+test("telemetry stays off when no host is configured, even with a website id", () => {
+  for (const input of [
+    { env: { LAVISH_AXI_UMAMI_WEBSITE_ID: "stray-id" }, buildHost: "", buildWebsiteID: "" },
+    { env: {}, buildHost: "", buildWebsiteID: "baked-id" },
+  ]) {
+    assert.deepEqual(resolveTelemetryConfig(input), { enabled: false, host: "", websiteID: "" });
+  }
+});
+
 test("telemetry uses env values before build-time defaults", () => {
   const config = resolveTelemetryConfig({
     env: {

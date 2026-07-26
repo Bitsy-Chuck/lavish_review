@@ -1,4 +1,3 @@
-const HARDCODED_FALLBACK_HOST = "https://a.kunchenguid.com";
 const UMAMI_PATH = "/api/send";
 const DEFAULT_HOSTNAME = "cli";
 const DEFAULT_TITLE = "Lavish Editor CLI";
@@ -17,8 +16,15 @@ export function resolveTelemetryConfig(input) {
     return { enabled: false, host: "", websiteID: "" };
   }
 
-  const host =
-    String(input.env.LAVISH_AXI_UMAMI_HOST || "").trim() || input.buildHost.trim() || HARDCODED_FALLBACK_HOST;
+  // No hardcoded fallback host. This fork used to fall back to the upstream author's analytics
+  // endpoint, which meant a stray website id was enough to make a local build phone home to a
+  // third party. Telemetry now requires both values to be supplied explicitly, so the default -
+  // and the only behavior a local build can have - is off.
+  const host = String(input.env.LAVISH_AXI_UMAMI_HOST || "").trim() || input.buildHost.trim();
+  if (!host) {
+    return { enabled: false, host: "", websiteID: "" };
+  }
+
   return { enabled: true, host, websiteID };
 }
 
