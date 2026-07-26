@@ -42,5 +42,5 @@ Otherwise the installed skill silently drifts from the build.
 - Do not reformat repo-provided `.agents/` skill content; `.prettierignore` excludes it intentionally.
 - `CHANGELOG.md` is frozen history from when release automation still ran here. Leave it as-is
   rather than extending it.
-- Telemetry is inert in a local build: `resolveTelemetryConfig` needs a website id, and nothing
-  bakes one in anymore. `LAVISH_AXI_TELEMETRY=0` remains as a belt-and-braces opt-out.
+- There is no telemetry. The upstream Umami client was deleted, and a test fails if any analytics
+  or usage reporting reappears under `src/`, `scripts/`, or `bin/`. Do not add one back.

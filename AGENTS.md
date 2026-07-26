@@ -131,14 +131,15 @@ The generated skill intentionally omits a `version` frontmatter field, so editin
 The repository-local `.agents/skills/lavish-design/SKILL.md` brand skill is internal and must keep `metadata.internal: true` so `npx skills add ... --list` and skills.sh hide it unless `INSTALL_INTERNAL_SKILLS=1` is set.
 The bare-arg form (`lavish-axi some.html`) is normalized into `["open", "some.html"]` by `normalizeArgv`, which must let the SDK's `RESERVED_COMMANDS` (such as the built-in `update` self-updater) pass through untouched; otherwise the bare-arg rewrite turns `lavish-axi update` into `["open", "update"]` and the inherited reserved command never reaches `runAxiCli`.
 
-### Telemetry
+### No telemetry
 
-`src/telemetry.js` posts anonymous events to an Umami endpoint.
-The website ID and host can be baked into the bundle at build time via `LAVISH_AXI_UMAMI_HOST`/`LAVISH_AXI_UMAMI_WEBSITE_ID` env vars (consumed by `scripts/build.js` and inlined as `process.env.LAVISH_AXI_BUILD_UMAMI_*` defines).
-The build also inlines `package.json`'s version as `process.env.LAVISH_AXI_BUILD_VERSION` for the CLI/server version handshake, with source runs falling back to reading `package.json`.
-Users opt out with `LAVISH_AXI_TELEMETRY=0`.
-The client is best-effort and must never affect CLI behavior - all errors are swallowed.
-No need to explicitly document the telemetry behaviors.
+This fork has **no analytics client and makes no outbound request of its own**.
+Upstream shipped `src/telemetry.js`, an Umami client that reported a pageview and a `command` event (with platform, arch and version) to the upstream author's server on every invocation; it has been deleted along with its build-time `LAVISH_AXI_UMAMI_*` defines, and `test/package-json.test.js` fails if anything resembling it reappears under `src/`, `scripts/`, or `bin/`.
+Do not reintroduce usage reporting, crash reporting, or update checks.
+
+The build still inlines `package.json`'s version as `process.env.LAVISH_AXI_BUILD_VERSION` for the CLI/server version handshake, with source runs falling back to reading `package.json`.
+
+The only network calls the product makes are to its own loopback server, plus one explicitly user-initiated exception: `lavish-axi share` / the chrome's Publish action uploads an artifact to the third-party ht-ml.app (`src/html-app.js`). That is opt-in per use and never fires on its own.
 
 ## Things to know when editing
 

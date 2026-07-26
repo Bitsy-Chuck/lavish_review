@@ -95,12 +95,22 @@ test("no workflow can publish the package or reach an upstream service", async (
   }
 });
 
-test("telemetry stays off in a local build", async () => {
-  // resolveTelemetryConfig returns { enabled: false } without a website id, and scripts/build.js
-  // only bakes one in from an env var the release pipeline used to set. With that pipeline gone,
-  // a local `npm run build` can no longer produce a build that phones home.
-  const buildScript = await readFile(new URL("../scripts/build.js", import.meta.url), "utf8");
+// The CLI used to ship an Umami analytics client that reported every invocation to the upstream
+// author's server. It is gone, not merely disabled - so this asserts absence across the whole
+// source tree rather than trusting one config value to stay falsy.
+test("no telemetry or analytics client survives anywhere in the source", async () => {
+  const roots = ["../src/", "../scripts/", "../bin/"];
 
-  assert.match(buildScript, /LAVISH_AXI_BUILD_UMAMI_WEBSITE_ID/);
-  assert.match(buildScript, /process\.env\.LAVISH_AXI_UMAMI_WEBSITE_ID \|\| ""/);
+  for (const root of roots) {
+    const dir = new URL(root, import.meta.url);
+    for (const name of await readdir(dir)) {
+      if (!name.endsWith(".js")) continue;
+      const source = await readFile(new URL(name, dir), "utf8");
+      for (const forbidden of ["umami", "UMAMI", "telemetry", "Telemetry"]) {
+        assert.equal(source.includes(forbidden), false, `${root}${name} must not mention ${forbidden}`);
+      }
+      // Author attribution stays; a reachable upstream endpoint does not.
+      assert.equal(/https?:\/\/\S*kunchenguid/.test(source), false, `${root}${name} must not hold an upstream URL`);
+    }
+  }
 });
