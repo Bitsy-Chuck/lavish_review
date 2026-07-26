@@ -1124,6 +1124,86 @@ test("unverified whiteboard frames cannot invoke whiteboard persistence", async 
   assert.equal(whiteboard.posted.length, 0);
 });
 
+test("an initialized inline whiteboard tells the artifact frame to swap the diagram out", async () => {
+  const chrome = await createChromeHarness({ fetchImpl: async (url) => whiteboardFetch(url) });
+  await initializeInlineWhiteboard(chrome);
+
+  const activation = chrome.postedToFrame.find((message) => message.type === "lavish:whiteboardActive");
+  assert.ok(activation);
+  assert.equal(activation.diagramIndex, 0);
+});
+
+test("a rejected whiteboard channel tells the artifact frame to keep the plain diagram", async () => {
+  const chrome = await createChromeHarness({ fetchImpl: async () => ({ ok: false }) });
+  const whiteboard = chrome.createInlineWhiteboard();
+
+  chrome.sendInlineWhiteboardMessage(whiteboard, {
+    type: "lavish-whiteboard:ready",
+    diagramIndex: 0,
+    channelToken: "inline-channel",
+  });
+  await flushPromises();
+  await flushPromises();
+
+  const fallback = chrome.postedToFrame.find((message) => message.type === "lavish:whiteboardUnavailable");
+  assert.ok(fallback);
+  assert.equal(fallback.diagramIndex, 0);
+  assert.equal(
+    chrome.postedToFrame.some((message) => message.type === "lavish:whiteboardActive"),
+    false,
+  );
+});
+
+test("a network error while authenticating the whiteboard channel keeps the plain diagram", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (url.includes("/whiteboard-channel")) throw new Error("proxy dropped the request");
+      return whiteboardFetch(url);
+    },
+  });
+  const whiteboard = chrome.createInlineWhiteboard();
+
+  chrome.sendInlineWhiteboardMessage(whiteboard, {
+    type: "lavish-whiteboard:ready",
+    diagramIndex: 0,
+    channelToken: "inline-channel",
+  });
+  await flushPromises();
+  await flushPromises();
+
+  const fallback = chrome.postedToFrame.find((message) => message.type === "lavish:whiteboardUnavailable");
+  assert.ok(fallback);
+  assert.equal(fallback.diagramIndex, 0);
+});
+
+test("a whiteboard init that cannot find the diagram source keeps the plain diagram", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (url.includes("/mermaid-sources")) return { ok: true, json: async () => ({ sources: [] }) };
+      return whiteboardFetch(url);
+    },
+  });
+  const whiteboard = chrome.createInlineWhiteboard();
+
+  chrome.sendInlineWhiteboardMessage(whiteboard, {
+    type: "lavish-whiteboard:ready",
+    diagramIndex: 0,
+    diagramId: "mermaid-1",
+    channelToken: "inline-channel",
+  });
+  await flushPromises();
+  await flushPromises();
+  await flushPromises();
+
+  const fallback = chrome.postedToFrame.find((message) => message.type === "lavish:whiteboardUnavailable");
+  assert.ok(fallback);
+  assert.equal(fallback.diagramIndex, 0);
+  assert.equal(
+    whiteboard.posted.some((message) => message.type === "lavish-whiteboard:init"),
+    false,
+  );
+});
+
 test("whiteboard fullscreen waits for the authenticated inline frame to flush", async () => {
   const chrome = await createChromeHarness({ fetchImpl: async (url) => whiteboardFetch(url) });
   const inline = await initializeInlineWhiteboard(chrome);

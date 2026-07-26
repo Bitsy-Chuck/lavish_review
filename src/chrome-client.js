@@ -1118,12 +1118,16 @@ async function fetchMermaidSources() {
 }
 
 async function authenticateWhiteboardChannel(token) {
-  const response = await fetch("/api/" + key + "/whiteboard-channel", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ token }),
-  });
-  return response.ok;
+  try {
+    const response = await fetch("/api/" + key + "/whiteboard-channel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 function showWhiteboardError(text) {
@@ -1470,13 +1474,28 @@ function handleInlineWhiteboardMessage(event, message) {
     const channelId = String(message.channelToken || "");
     if (!channelId) return;
     authenticateWhiteboardChannel(channelId).then((authenticated) => {
-      if (!authenticated || ended || inlineWhiteboardChannels.has(index)) return;
+      if (ended || inlineWhiteboardChannels.has(index)) return;
+      // The artifact SDK keeps the plain diagram visible until the editor is
+      // confirmed working, so every boot outcome must be reported: active swaps
+      // the whiteboard in, unavailable restores the diagram instead of leaving
+      // a silently blank frame.
+      if (!authenticated) {
+        postToFrame({ type: "lavish:whiteboardUnavailable", diagramIndex: index });
+        return;
+      }
       const channel = { window: event.source, channelId, initialized: false };
       inlineWhiteboardChannels.set(index, channel);
       whiteboardRecord(index).diagramId = String(message.diagramId || "");
       handleWhiteboardReady(index, "inline", () => inlineWhiteboardChannels.get(index) === channel).then(
         (initialized) => {
-          if (inlineWhiteboardChannels.get(index) === channel) channel.initialized = initialized;
+          if (inlineWhiteboardChannels.get(index) !== channel) return;
+          channel.initialized = initialized;
+          if (initialized) {
+            postToFrame({ type: "lavish:whiteboardActive", diagramIndex: index });
+            return;
+          }
+          inlineWhiteboardChannels.delete(index);
+          postToFrame({ type: "lavish:whiteboardUnavailable", diagramIndex: index });
         },
       );
     });
@@ -1500,7 +1519,12 @@ function handleOverlayWhiteboardMessage(event, message) {
       const isCurrent = () =>
         overlayIndex === index && overlayChannelId === channelId && event.source === whiteboardFrame.contentWindow;
       if (!authenticated) {
-        if (isCurrent()) overlayChannelId = "";
+        if (isCurrent()) {
+          overlayChannelId = "";
+          showWhiteboardError(
+            "Could not open the whiteboard: the editor frame could not authenticate with the local server.",
+          );
+        }
         return;
       }
       if (!isCurrent()) return;

@@ -193,10 +193,16 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
       createElement(tag) {
         const el = node(tag);
         el.style = {};
+        el.isConnected = true;
         el.setAttribute = (name, value) => {
           attrsFor(el)[name] = String(value);
         };
         el.getBoundingClientRect = () => rect(iframeWidth, 456);
+        el.remove = () => {
+          el.isConnected = false;
+          const siblings = el.parentElement?.children;
+          if (siblings) siblings.splice(siblings.indexOf(el), 1);
+        };
         return el;
       },
       elementFromPoint() {
@@ -211,9 +217,13 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
     const hooks = {};
     createArtifactSdk(() => "", undefined, undefined, hooks);
     hooks.enhanceMermaid();
-    assert.equal(container.style.display, "none");
     const embeddedIframe = body.children.find((child) => child.tagName === "IFRAME");
     assert.match(embeddedIframe.style.cssText, /box-sizing:border-box/);
+    assert.match(embeddedIframe.style.cssText, /display:none/);
+    assert.notEqual(container.style.display, "none", "the diagram stays visible until the whiteboard confirms boot");
+    hooks.handleWhiteboardControl({ type: "lavish:whiteboardActive", diagramIndex: 0 });
+    assert.equal(container.style.display, "none");
+    assert.equal(embeddedIframe.style.display, "block");
     assert.equal(shortContainer.style.display, undefined, "a short live diagram is not whiteboard-embedded");
     assert.equal(svg.style.touchAction, "pan-y");
     hooks.setMermaidFrozen(false);
@@ -259,6 +269,7 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
 
     shortDiagramHeight = 80;
     hooks.enhanceMermaid();
+    hooks.handleWhiteboardControl({ type: "lavish:whiteboardActive", diagramIndex: 1 });
     assert.equal(shortContainer.style.display, "none");
     assert.equal(
       hooks.auditLayout().find((finding) => finding.kind === "scaled-down-diagram" && finding.selector.includes("div"))
@@ -280,6 +291,17 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
         severity: "warning",
       },
       "embedded audits use the iframe's current width after a resize",
+    );
+
+    const scrollerIframe = scroller.children.find((child) => child.tagName === "IFRAME");
+    hooks.handleWhiteboardControl({ type: "lavish:whiteboardUnavailable", diagramIndex: 1 });
+    assert.equal(scroller.children.includes(scrollerIframe), false, "a failed whiteboard's frame is removed");
+    assert.equal(shortContainer.style.display, "", "the plain diagram is restored when the whiteboard fails");
+    hooks.enhanceMermaid();
+    assert.equal(
+      scroller.children.some((child) => child.tagName === "IFRAME"),
+      false,
+      "a failed container is not re-embedded into a retry loop",
     );
   } finally {
     for (const [key, value] of Object.entries(saved)) {

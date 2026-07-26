@@ -546,7 +546,12 @@ export function createArtifactSdk(
   // order is the diagram's identity; the server recovers the matching source
   // from the artifact file. This SDK owns their lifecycle during fullscreen
   // transitions.
-  const whiteboardEmbeds = new Map(); // container -> { iframe, index }
+  // Embedding is a visible-until-proven handshake: the frame boots hidden next
+  // to the still-visible diagram, and only the chrome's lavish:whiteboardActive
+  // swaps them. If any part of the boot chain fails (or never reports back),
+  // the reader keeps a plain diagram instead of a blank frame.
+  const whiteboardEmbeds = new Map(); // container -> { container, iframe, index, active }
+  const failedWhiteboardContainers = new WeakSet(); // containers whose editor failed to boot
   const mermaidMeasurements = new WeakMap(); // hidden container -> geometry captured before replacement
 
   function mermaidContainerIndex(container) {
@@ -563,6 +568,7 @@ export function createArtifactSdk(
   function embedWhiteboard(svg) {
     const container = svg.closest(".mermaid");
     if (!container) return;
+    if (failedWhiteboardContainers.has(container)) return;
     const existing = whiteboardEmbeds.get(container);
     if (existing && existing.iframe.isConnected) {
       existing.index = mermaidContainerIndex(container);
@@ -590,14 +596,34 @@ export function createArtifactSdk(
     iframe.setAttribute("sandbox", "allow-scripts allow-popups");
     iframe.src = whiteboardFrameSrc({ index, diagramId: svg.id || "" });
     iframe.style.cssText =
-      `display:block;box-sizing:border-box;width:100%;height:${whiteboardEmbedHeightPx(rect)}px;border:1px solid rgba(128,128,128,.35);` +
+      `display:none;box-sizing:border-box;width:100%;height:${whiteboardEmbedHeightPx(rect)}px;border:1px solid rgba(128,128,128,.35);` +
       "border-radius:12px;background:transparent";
+    container.insertAdjacentElement("afterend", iframe);
+    whiteboardEmbeds.set(container, { container, iframe, index, diagramId: svg.id || "", active: false });
+  }
+
+  function activateWhiteboard(entry) {
+    entry.active = true;
+    entry.iframe.style.display = "block";
     // The design snippet re-renders Mermaid inside the container on theme
     // changes, so the frame lives as a sibling: re-renders stay harmless
     // inside the hidden container instead of destroying the editor.
-    container.style.display = "none";
-    container.insertAdjacentElement("afterend", iframe);
-    whiteboardEmbeds.set(container, { iframe, index, diagramId: svg.id || "" });
+    entry.container.style.display = "none";
+  }
+
+  function discardWhiteboard(entry) {
+    failedWhiteboardContainers.add(entry.container);
+    whiteboardEmbeds.delete(entry.container);
+    mermaidMeasurements.delete(entry.container);
+    entry.iframe.remove();
+    entry.container.style.display = "";
+  }
+
+  function handleWhiteboardControl(msg) {
+    const target = whiteboardEntryByIndex(msg.diagramIndex);
+    if (!target) return;
+    if (msg.type === "lavish:whiteboardActive") activateWhiteboard(target);
+    if (msg.type === "lavish:whiteboardUnavailable") discardWhiteboard(target);
   }
 
   function whiteboardEmbedEntries() {
@@ -629,6 +655,9 @@ export function createArtifactSdk(
     if (msg.type === "lavish:resumeWhiteboard") {
       const target = whiteboardEntryByIndex(msg.diagramIndex);
       if (target) target.iframe.src = whiteboardFrameSrc(target);
+    }
+    if (msg.type === "lavish:whiteboardActive" || msg.type === "lavish:whiteboardUnavailable") {
+      handleWhiteboardControl(msg);
     }
   });
 
@@ -1364,6 +1393,7 @@ export function createArtifactSdk(
     testHooks.enhanceMermaid = enhanceMermaid;
     testHooks.auditLayout = auditLayout;
     testHooks.setMermaidFrozen = setMermaidFrozen;
+    testHooks.handleWhiteboardControl = handleWhiteboardControl;
     return;
   }
 
