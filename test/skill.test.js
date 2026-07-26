@@ -20,7 +20,7 @@ test("createSkillMarkdown emits Hermes Agent metadata in frontmatter", () => {
   const md = createSkillMarkdown();
   const frontmatter = md.slice(4, md.indexOf("\n---\n", 4));
 
-  assert.match(frontmatter, /^author: Kun Chen \(kunchenguid\)$/m);
+  assert.doesNotMatch(frontmatter, /^author:/m, "the local-only fork ships the skill without an author line");
   assert.match(frontmatter, /^metadata:\n {2}hermes:\n {4}tags: \[[^\]]+\]\n {4}category: \S+$/m);
   assert.doesNotMatch(frontmatter, /^version:/m, "version is omitted to avoid release churn");
 });

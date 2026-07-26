@@ -106,11 +106,9 @@ test("no telemetry or analytics client survives anywhere in the source", async (
     for (const name of await readdir(dir)) {
       if (!name.endsWith(".js")) continue;
       const source = await readFile(new URL(name, dir), "utf8");
-      for (const forbidden of ["umami", "UMAMI", "telemetry", "Telemetry"]) {
+      for (const forbidden of ["umami", "UMAMI", "telemetry", "Telemetry", "kunchenguid"]) {
         assert.equal(source.includes(forbidden), false, `${root}${name} must not mention ${forbidden}`);
       }
-      // Author attribution stays; a reachable upstream endpoint does not.
-      assert.equal(/https?:\/\/\S*kunchenguid/.test(source), false, `${root}${name} must not hold an upstream URL`);
     }
   }
 });
