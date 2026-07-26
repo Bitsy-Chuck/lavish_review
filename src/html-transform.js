@@ -50,7 +50,7 @@ export function injectArtifactBaseLayer(html) {
 export function ensureEarlyCharset(html) {
   const source = String(html ?? "");
   const structure = documentStructure(source);
-  const headStart = structure.head?.sourceCodeLocation?.startTag?.endOffset;
+  const headStart = elementStartEndOffset(structure.head);
   if (headStart !== undefined) {
     const charset = structure.charset?.sourceCodeLocation;
     if (!charset) {
@@ -127,7 +127,10 @@ function documentStructure(source) {
   const parseSource = source.startsWith("\uFEFF") ? ` ${source.slice(1)}` : source;
   const document = parse(parseSource, { sourceCodeLocationInfo: true, scriptingEnabled: true });
   const html = document.childNodes.find((node) => "tagName" in node && node.tagName === "html");
-  const head = html && "childNodes" in html ? html.childNodes.find((node) => node.nodeName === "head") : undefined;
+  const headNode = html && "childNodes" in html ? html.childNodes.find((node) => node.nodeName === "head") : undefined;
+  // A node named "head" is always an element, but `find` widens to ChildNode - narrow it back before
+  // descending, or the comment-node member of that union has no childNodes to read.
+  const head = headNode && "childNodes" in headNode ? headNode : undefined;
   const charset = head?.childNodes.find(
     (node) => node.nodeName === "meta" && node.attrs?.some((attribute) => attribute.name === "charset"),
   );
