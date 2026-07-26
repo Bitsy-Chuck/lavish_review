@@ -13,6 +13,7 @@ async function createChromeHarness({
   fetchImpl = async () => ({ ok: true }),
   sessionData = defaultSessionData,
   artifactSrc = "",
+  narrowScreen = false,
 } = {}) {
   const source = await readFile(sourceUrl, "utf8");
   const storage = new Map();
@@ -49,6 +50,18 @@ async function createChromeHarness({
       timers.delete(timer.id);
       timer.fn();
     }
+  }
+
+  // Jittered delays have no fixed ms to match on, so let callers select by range.
+  function runTimersWhere(predicate) {
+    let ran = 0;
+    for (const timer of [...timers.values()]) {
+      if (!predicate({ id: timer.id, ms: timer.ms })) continue;
+      timers.delete(timer.id);
+      timer.fn();
+      ran += 1;
+    }
+    return ran;
   }
 
   function element(id) {
@@ -94,8 +107,40 @@ async function createChromeHarness({
       addEventListener(type, handler) {
         listeners.set(type, handler);
       },
-      querySelectorAll() {
-        return [];
+      // The sheet handle asks whether a pointer landed on the toggle button, so the stub needs a
+      // real containment answer rather than the default "no children" one.
+      contains(other) {
+        return other === this;
+      },
+      dispatch(type, event = {}) {
+        const handler = listeners.get(type);
+        assert.ok(handler, `element #${id} has a ${type} listener`);
+        return handler(event);
+      },
+      children: [],
+      // Faithful enough for the chrome's class selectors - chatLog reads both
+      // ".bubble.user,.bubble.agent:not(.agent-working)" and ".bubble.agent:not(.agent-working)",
+      // and telling those two apart is the whole point of the second one. Anything richer than a
+      // comma-separated list of `.class` and `:not(.class)` tokens resolves against structure this
+      // harness does not model, so it answers nothing rather than answering wrongly.
+      querySelectorAll(selector) {
+        const parts = String(selector)
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean);
+        if (!parts.length || !parts.every((part) => /^(?:\.[\w-]+|:not\(\.[\w-]+\))+$/.test(part))) return [];
+        return this.children.filter((child) => {
+          const classes = new Set(
+            `${child.className || ""} ${child.classList ? child.classList.toString() : ""}`
+              .split(/\s+/)
+              .filter(Boolean),
+          );
+          return parts.some((part) => {
+            const excluded = [...part.matchAll(/:not\(\.([\w-]+)\)/g)].map((match) => match[1]);
+            const required = [...part.replace(/:not\([^)]*\)/g, "").matchAll(/\.([\w-]+)/g)].map((match) => match[1]);
+            return required.every((name) => classes.has(name)) && excluded.every((name) => !classes.has(name));
+          });
+        });
       },
       querySelector(selector) {
         if (selector !== "span") return null;
@@ -104,7 +149,9 @@ async function createChromeHarness({
         return elements.get(childId);
       },
       appendChild(child) {
+        if (child.parentElement) child.parentElement.children = child.parentElement.children.filter((c) => c !== child);
         child.parentElement = this;
+        this.children.push(child);
         this.lastAppendedChild = child;
         return child;
       },
@@ -113,7 +160,10 @@ async function createChromeHarness({
         if (typeof this.onclick === "function") return this.onclick(event);
         return undefined;
       },
-      remove() {},
+      remove() {
+        if (this.parentElement) this.parentElement.children = this.parentElement.children.filter((c) => c !== this);
+        this.parentElement = null;
+      },
       focus() {
         this.focused = true;
       },
@@ -172,11 +222,16 @@ async function createChromeHarness({
       constructor(url) {
         this.url = url;
         this.listeners = new Map();
+        this.closed = false;
         eventSources.push(this);
       }
 
       addEventListener(type, handler) {
         this.listeners.set(type, handler);
+      }
+
+      close() {
+        this.closed = true;
       }
     },
     document: {
@@ -213,6 +268,11 @@ async function createChromeHarness({
         if (!windowListeners.has(type)) windowListeners.set(type, []);
         windowListeners.get(type).push(handler);
       },
+      // The mobile conversation sheet only exists below the chrome's narrow breakpoint; every entry
+      // point checks this before it does anything.
+      matchMedia(media) {
+        return { media, matches: narrowScreen, addEventListener() {}, removeEventListener() {} };
+      },
     },
   };
 
@@ -238,6 +298,21 @@ async function createChromeHarness({
       assert.equal(eventSources.length, 1);
       return eventSources[0];
     },
+    eventSources() {
+      return eventSources;
+    },
+    latestEventSource() {
+      return eventSources[eventSources.length - 1];
+    },
+    sendState(payload, stream) {
+      const target = stream || eventSources[eventSources.length - 1];
+      const handler = target.listeners.get("state");
+      assert.ok(handler, "chrome-client subscribed to the state event");
+      handler({ data: JSON.stringify({ bootId: "boot-1", ...payload }) });
+    },
+    chatTexts() {
+      return element("chatLog").children.map((child) => String(child.innerHTML));
+    },
     sendFrameMessage(data) {
       const handlers = windowListeners.get("message") || [];
       assert.ok(handlers.length > 0, "chrome-client registered a message handler");
@@ -252,6 +327,28 @@ async function createChromeHarness({
       const handlers = windowListeners.get("message") || [];
       assert.ok(handlers.length > 0, "chrome-client registered a message handler");
       for (const handler of handlers) handler({ source: whiteboard.source, data });
+    },
+    // Answers the most recent snapshot request the way the real SDK does: by echoing its id.
+    lastSnapshotRequestId() {
+      const request = [...postedToFrame].reverse().find((message) => message.type === "lavish:requestSnapshot");
+      assert.ok(request, "chrome-client asked the artifact for a snapshot");
+      return request.requestId;
+    },
+    answerSnapshot(snapshot, requestId) {
+      const handlers = windowListeners.get("message") || [];
+      assert.ok(handlers.length > 0, "chrome-client registered a message handler");
+      const data = { type: "lavish:snapshot", requestId: requestId ?? this.lastSnapshotRequestId(), snapshot };
+      for (const handler of handlers) handler({ source: frame.contentWindow, data });
+    },
+    dispatchDocumentPointerDown(eventProps) {
+      const handlers = documentListeners.get("pointerdown") || [];
+      assert.ok(handlers.length > 0, "chrome-client registered a document pointerdown handler");
+      for (const { handler } of handlers) handler({ button: 0, clientY: 0, ...eventProps });
+    },
+    dispatchDocumentPointerUp(eventProps) {
+      const handlers = documentListeners.get("pointerup") || [];
+      assert.ok(handlers.length > 0, "chrome-client registered a document pointerup handler");
+      for (const { handler } of handlers) handler({ button: 0, clientY: 0, ...eventProps });
     },
     dispatchDocumentKeydown(eventProps) {
       const handlers = documentListeners.get("keydown") || [];
@@ -278,6 +375,10 @@ async function createChromeHarness({
       return reloadCount;
     },
     runTimers,
+    runTimersWhere,
+    pendingTimers() {
+      return [...timers.values()].map((timer) => ({ id: timer.id, ms: timer.ms }));
+    },
     srcLoads,
   };
 }
@@ -322,9 +423,7 @@ test("chrome client scrolls new chat bubbles into view above queued prompts", as
   assert.equal(panelScroll.scrollTop, 1800);
 
   panelScroll.scrollTop = 640;
-  chrome.eventSource().listeners.get("agent-reply")({
-    data: JSON.stringify({ text: "I updated the title." }),
-  });
+  chrome.sendState({ revision: 1, presence: "listening", chat: [{ role: "agent", text: "I updated the title." }] });
 
   const bubble = chrome.element("chatLog").lastAppendedChild;
   assert.equal(bubble.scrolledIntoView.block, "nearest");
@@ -755,7 +854,7 @@ test("chrome client strips the internal queue key before posting prompts", async
   chrome.element("send").onclick();
   assert.equal(chrome.postedToFrame.at(-1).type, "lavish:requestSnapshot");
 
-  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  chrome.answerSnapshot("uid=1 body");
   await flushPromises();
 
   assert.equal(posts.length, 1);
@@ -783,7 +882,7 @@ test("chrome send and end carries the end intent with queued prompts", async () 
   chrome.element("sendAndEnd").onclick();
   assert.equal(chrome.postedToFrame.at(-1).type, "lavish:requestSnapshot");
 
-  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  chrome.answerSnapshot("uid=1 body");
   await flushPromises();
   await flushPromises();
 
@@ -839,12 +938,12 @@ test("chrome send and end during an in-flight submit still ends after the submit
     prompt: { prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" },
   });
   chrome.element("send").onclick();
-  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  chrome.answerSnapshot("uid=1 body");
   await flushPromises();
   assert.equal(posts.length, 1);
 
   chrome.element("sendAndEnd").onclick();
-  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  chrome.answerSnapshot("uid=1 body");
   await flushPromises();
   assert.equal(posts.length, 1);
 
@@ -1315,4 +1414,760 @@ test("whiteboard close stays responsive while overlay initialization is pending"
 
   releaseOverlaySources?.();
   await flushPromises();
+});
+
+test("chrome client reconnects the event stream after an error and recovers what it missed", async () => {
+  const chrome = await createChromeHarness();
+
+  const first = chrome.latestEventSource();
+  first.listeners.get("open")();
+  chrome.sendState({ revision: 1, presence: "listening", chat: [] }, first);
+  assert.equal(chrome.element("connectionBanner").hidden, true);
+
+  first.listeners.get("error")();
+
+  // The dead stream is explicitly closed - the spec will not retry a stream that failed on a
+  // non-200 response, so leaving it open would leave the page deaf forever.
+  assert.equal(first.closed, true);
+  assert.equal(chrome.element("connectionBanner").hidden, false);
+  assert.equal(chrome.eventSources().length, 1);
+
+  // Backoff, not a hot loop: the first retry lands inside the jittered 1s window.
+  const ran = chrome.runTimersWhere((timer) => timer.ms >= 500 && timer.ms <= 1000);
+  assert.equal(ran, 1);
+  assert.equal(chrome.eventSources().length, 2);
+
+  const second = chrome.latestEventSource();
+  second.listeners.get("open")();
+  assert.equal(chrome.element("connectionBanner").hidden, true);
+
+  // No separate fetch: the server opens every connection with the whole state, so what arrived
+  // while the page was offline is simply there.
+  chrome.sendState(
+    { revision: 7, presence: "listening", chat: [{ role: "agent", text: "Reply you missed while offline" }] },
+    second,
+  );
+  assert.deepEqual(chrome.chatTexts().length, 1);
+  assert.match(chrome.chatTexts()[0], /Reply you missed while offline/);
+  assert.equal(chrome.element("send").disabled, false);
+});
+
+test("chrome client treats a silent event stream as dead even without an error", async () => {
+  const chrome = await createChromeHarness();
+
+  const first = chrome.latestEventSource();
+  first.listeners.get("open")();
+  assert.equal(chrome.element("connectionBanner").hidden, true);
+
+  // No heartbeat for three intervals: a half-open connection never fires `error`.
+  chrome.runTimers(50_000);
+
+  assert.equal(first.closed, true);
+  assert.equal(chrome.element("connectionBanner").hidden, false);
+  chrome.runTimersWhere((timer) => timer.ms >= 500 && timer.ms <= 1000);
+  assert.equal(chrome.eventSources().length, 2);
+});
+
+test("chrome client stops reconnecting once the session has ended", async () => {
+  const chrome = await createChromeHarness();
+
+  const stream = chrome.latestEventSource();
+  stream.listeners.get("open")();
+  chrome.sendState({ revision: 4, presence: "waiting", chat: [], ended: true }, stream);
+
+  assert.equal(chrome.element("endedOverlay").hidden, false);
+  assert.equal(stream.closed, true);
+
+  stream.listeners.get("error")();
+  chrome.runTimersWhere((timer) => timer.ms >= 500 && timer.ms <= 15_000);
+
+  assert.equal(chrome.eventSources().length, 1);
+  assert.equal(chrome.element("connectionBanner").hidden, true);
+});
+
+test("chrome client unlocks the composer when a working presence goes stale", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({ bootId: "boot-1", revision: 2, presence: "working", ended: false, chat: [] }),
+    }),
+  });
+
+  chrome.sendState({ revision: 1, presence: "working", chat: [] });
+  assert.equal(chrome.element("send").disabled, true);
+  assert.equal(chrome.element("sendAndEnd").disabled, true);
+  assert.match(chrome.element("chatLog").lastAppendedChild.innerHTML, /Working\.\.\./);
+
+  chrome.runTimers(45_000);
+  await flushPromises();
+
+  assert.equal(chrome.element("send").disabled, false);
+  // Send & End stays locked: ending would tear the session down under an agent that may really
+  // be working. It reopens only when the server itself reports the agent is gone.
+  assert.equal(chrome.element("sendAndEnd").disabled, true);
+  const bubble = chrome.element("chatLog").lastAppendedChild;
+  assert.ok(bubble.classList.contains("agent-stalled"));
+  assert.match(bubble.innerHTML, /No word from your agent for a while/);
+});
+
+test("chrome client re-locks the composer when the agent starts working again", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({ bootId: "boot-1", revision: 2, presence: "working", ended: false, chat: [] }),
+    }),
+  });
+
+  chrome.sendState({ revision: 1, presence: "working", chat: [] });
+  chrome.runTimers(45_000);
+  await flushPromises();
+  assert.equal(chrome.element("send").disabled, false);
+
+  chrome.sendState({ revision: 3, presence: "listening", chat: [] });
+  assert.equal(chrome.element("send").disabled, false);
+  assert.equal(chrome.element("sendAndEnd").disabled, false);
+
+  chrome.sendState({ revision: 4, presence: "working", chat: [] });
+  assert.equal(chrome.element("send").disabled, true);
+});
+
+test("chrome client sends without a snapshot when the artifact never answers", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: JSON.parse(init.body) });
+      return { ok: true };
+    },
+  });
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Fix the header", selector: "h1", tag: "annotation", text: "Header" },
+  });
+  chrome.element("send").onclick();
+  assert.equal(posts.length, 0);
+
+  chrome.runTimers(2500);
+  await flushPromises();
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, "/api/abc/prompts");
+  assert.equal(posts[0].body.domSnapshot, "");
+  assert.match(chrome.element("sendHint").textContent, /without a page snapshot/);
+  assert.equal(chrome.queued().length, 0);
+
+  // A snapshot that finally arrives after the timeout must not submit the queue a second time.
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "late" });
+  await flushPromises();
+  assert.equal(posts.length, 1);
+});
+
+test("chrome client keeps the typed message and offers a retry when the submit fails", async () => {
+  const posts = [];
+  let ok = false;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: init?.body ? JSON.parse(init.body) : null });
+      return { ok };
+    },
+  });
+
+  chrome.element("chatInput").value = "Please tighten the spacing";
+  chrome.element("send").onclick();
+  chrome.answerSnapshot("uid=1 body");
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(posts.length, 1);
+  // The composer never loses text the server did not accept.
+  assert.equal(chrome.element("chatInput").value, "Please tighten the spacing");
+  assert.equal(chrome.element("submitError").hidden, false);
+  assert.equal(chrome.element("submitRetry").hidden, false);
+  assert.equal(chrome.queued().length, 0);
+
+  ok = true;
+  chrome.element("submitRetry").onclick();
+  chrome.answerSnapshot("uid=1 body");
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(posts.length, 2);
+  assert.deepEqual(posts[1].body.prompts, [
+    { uid: "", prompt: "Please tighten the spacing", selector: "", tag: "message", text: "Freeform message" },
+  ]);
+  assert.equal(chrome.element("chatInput").value, "");
+  assert.equal(chrome.element("submitError").hidden, true);
+  assert.equal(chrome.queued().length, 0);
+});
+
+test("chrome client keeps annotation pills queued when their submit fails", async () => {
+  const chrome = await createChromeHarness({ fetchImpl: async () => ({ ok: false }) });
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Fix the header", selector: "h1", tag: "annotation", text: "Header" },
+  });
+  chrome.element("send").onclick();
+  chrome.answerSnapshot("uid=1 body");
+  await flushPromises();
+  await flushPromises();
+
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["Fix the header"],
+  );
+  assert.equal(chrome.element("submitError").hidden, false);
+});
+
+test("chrome client clears the composer only after the submit succeeds", async () => {
+  let releasePost = () => {};
+  const held = new Promise((resolve) => {
+    releasePost = () => resolve();
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => {
+      await held;
+      return { ok: true };
+    },
+  });
+
+  chrome.element("chatInput").value = "Please tighten the spacing";
+  chrome.element("send").onclick();
+  chrome.answerSnapshot("uid=1 body");
+  await flushPromises();
+
+  assert.equal(chrome.element("chatInput").value, "Please tighten the spacing");
+  // The in-flight message shows as a dimmed bubble, not as a duplicate pill.
+  assert.ok(chrome.element("chatLog").lastAppendedChild.classList.contains("pending"));
+  assert.equal(chrome.element("annotationPills").innerHTML, "");
+
+  releasePost();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.element("chatInput").value, "");
+  assert.equal(chrome.element("chatLog").lastAppendedChild.classList.contains("pending"), false);
+});
+
+test("a state whose content outran its revision does not duplicate chat", async () => {
+  const chrome = await createChromeHarness();
+
+  // The exact interleaving the seqlock could not close: the store commits a reply BEFORE its
+  // handler bumps the revision, so a read in that window returns the reply under the OLD number.
+  chrome.sendState({
+    revision: 5,
+    presence: "listening",
+    chat: [
+      { role: "user", text: "original question" },
+      { role: "agent", text: "the reply" },
+    ],
+  });
+  // The handler then pushes the same reply under its own, higher revision.
+  chrome.sendState({
+    revision: 6,
+    presence: "listening",
+    chat: [
+      { role: "user", text: "original question" },
+      { role: "agent", text: "the reply" },
+    ],
+  });
+
+  // Whole-state application is idempotent, so the overlap is a no-op rather than a second bubble.
+  assert.equal(chrome.chatTexts().length, 2);
+  assert.match(chrome.chatTexts()[1], /the reply/);
+});
+
+test("a stale state cannot roll a newer one back", async () => {
+  const chrome = await createChromeHarness();
+
+  chrome.sendState({ revision: 6, presence: "listening", chat: [{ role: "agent", text: "newer reply" }] });
+  assert.equal(chrome.chatTexts().length, 1);
+
+  // A push captured before that reply, arriving late.
+  chrome.sendState({ revision: 4, presence: "waiting", chat: [] });
+
+  assert.equal(chrome.chatTexts().length, 1);
+  assert.match(chrome.chatTexts()[0], /newer reply/);
+});
+
+test("a newer state from the stall re-check still applies", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (!String(url).endsWith("/state")) return { ok: true };
+      return {
+        ok: true,
+        json: async () => ({
+          bootId: "boot-1",
+          revision: 9,
+          presence: "listening",
+          ended: false,
+          chat: [{ role: "agent", text: "reply recovered by the re-check" }],
+        }),
+      };
+    },
+  });
+
+  chrome.sendState({ revision: 1, presence: "working", chat: [] });
+  chrome.runTimers(45_000);
+  await flushPromises();
+  await flushPromises();
+
+  assert.match(chrome.chatTexts().at(-1), /reply recovered by the re-check/);
+  assert.equal(chrome.element("send").disabled, false);
+});
+
+test("a stale presence cannot roll presence backwards", async () => {
+  const chrome = await createChromeHarness();
+
+  chrome.sendState({ revision: 7, presence: "working", chat: [] });
+  assert.equal(chrome.element("send").disabled, true);
+
+  chrome.sendState({ revision: 5, presence: "listening", chat: [] });
+  assert.equal(chrome.element("send").disabled, true);
+
+  chrome.sendState({ revision: 8, presence: "listening", chat: [] });
+  assert.equal(chrome.element("send").disabled, false);
+});
+
+test("a late snapshot cannot satisfy the next snapshot request", async () => {
+  const posts = [];
+  const copied = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: init?.body ? JSON.parse(init.body) : null });
+      return { ok: true };
+    },
+  });
+  chrome.element("body").appendChild = () => {};
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Fix the header", selector: "h1", tag: "annotation", text: "Header" },
+  });
+
+  // A: a copy request that never gets answered in time.
+  chrome.element("copySnapshot").onclick();
+  const requestA = chrome.lastSnapshotRequestId();
+  chrome.runTimers(2500);
+  assert.equal(posts.length, 0);
+
+  // B: a send request that starts before A's answer finally shows up.
+  chrome.element("send").onclick();
+  const requestB = chrome.lastSnapshotRequestId();
+  assert.notEqual(requestA, requestB);
+
+  chrome.answerSnapshot("STALE snapshot from A", requestA);
+  await flushPromises();
+  // A's late answer must not be treated as B's, nor as a copy of B's page.
+  assert.equal(posts.length, 0);
+  assert.deepEqual(copied, []);
+
+  chrome.answerSnapshot("fresh snapshot from B", requestB);
+  await flushPromises();
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].body.domSnapshot, "fresh snapshot from B");
+});
+
+test("the event stream backoff escalates when a stream opens and dies immediately", async () => {
+  // The layout gate's 12s timer would otherwise sit inside the reconnect window being measured.
+  const chrome = await createChromeHarness({ sessionData: { ...defaultSessionData, layoutGateEnabled: false } });
+  const windows = [];
+
+  for (let cycle = 0; cycle < 5; cycle += 1) {
+    const stream = chrome.latestEventSource();
+    // Accepted with HTTP 200, then dropped before a single heartbeat - the shape that used to
+    // pin every retry to the first-attempt window.
+    stream.listeners.get("open")();
+    stream.listeners.get("error")();
+    const pending = chrome.pendingTimers().filter((timer) => timer.ms >= 500 && timer.ms <= 15_000);
+    assert.equal(pending.length, 1);
+    windows.push(pending[0].ms);
+    chrome.runTimersWhere((timer) => timer.id === pending[0].id);
+  }
+
+  // Each window is the capped 2^n range with jitter: 500-1000, 1000-2000, 2000-4000, ...
+  assert.ok(windows[1] > windows[0] / 2, `expected escalation, got ${windows}`);
+  assert.ok(windows[4] >= 4000, `expected the fifth attempt near the cap, got ${windows}`);
+  assert.ok(windows.every((ms) => ms <= 15_000));
+});
+
+test("a heartbeat proves the stream healthy and resets the backoff", async () => {
+  const chrome = await createChromeHarness({ sessionData: { ...defaultSessionData, layoutGateEnabled: false } });
+
+  for (let cycle = 0; cycle < 3; cycle += 1) {
+    const stream = chrome.latestEventSource();
+    stream.listeners.get("open")();
+    stream.listeners.get("error")();
+    const pending = chrome.pendingTimers().filter((timer) => timer.ms >= 500 && timer.ms <= 15_000);
+    chrome.runTimersWhere((timer) => timer.id === pending[0].id);
+  }
+
+  const healthy = chrome.latestEventSource();
+  healthy.listeners.get("open")();
+  healthy.listeners.get("heartbeat")({ data: "{}" });
+  healthy.listeners.get("error")();
+
+  const pending = chrome.pendingTimers().filter((timer) => timer.ms >= 500 && timer.ms <= 15_000);
+  assert.equal(pending.length, 1);
+  assert.ok(pending[0].ms <= 1000, `expected a reset first-attempt window, got ${pending[0].ms}`);
+});
+
+test("a replacement server re-bases the watermark whatever its revisions look like", async () => {
+  for (const replacementRevision of [1, 42, 99]) {
+    const chrome = await createChromeHarness();
+
+    chrome.sendState({ bootId: "boot-old", revision: 42, presence: "working", chat: [] });
+    assert.equal(chrome.element("send").disabled, true);
+
+    // A different boot id is a different server, full stop. Its counter is unrelated to the old
+    // one's, so a lower, equal or higher revision must all be accepted - ordering instances by a
+    // number is exactly how a legitimate replacement ends up ignored forever.
+    chrome.sendState({ bootId: "boot-new", revision: replacementRevision, presence: "listening", chat: [] });
+    assert.equal(chrome.element("send").disabled, false, `replacement revision ${replacementRevision} was ignored`);
+  }
+});
+
+test("the initial state applies presence, not just chat", async () => {
+  const chrome = await createChromeHarness();
+  const stream = chrome.latestEventSource();
+  stream.listeners.get("open")();
+
+  // Chat and presence share one revision on first connect. Sent as two events under that shared
+  // number, the chat was accepted and the presence was rejected for not being newer - so a session
+  // that was genuinely working showed an idle, sendable composer.
+  chrome.sendState(
+    { revision: 3, presence: "working", ended: false, chat: [{ role: "user", text: "kick off some work" }] },
+    stream,
+  );
+
+  assert.equal(chrome.element("send").disabled, true);
+  assert.equal(chrome.element("sendAndEnd").disabled, true);
+  assert.match(chrome.element("chatLog").lastAppendedChild.innerHTML, /Working\.\.\./);
+  assert.equal(chrome.chatTexts().filter((html) => /kick off some work/.test(html)).length, 1);
+});
+
+test("the initial state applies presence even when the chat is empty", async () => {
+  const chrome = await createChromeHarness();
+  const stream = chrome.latestEventSource();
+  stream.listeners.get("open")();
+
+  chrome.sendState({ revision: 0, presence: "working", ended: false, chat: [] }, stream);
+
+  assert.equal(chrome.element("send").disabled, true);
+});
+
+test("a stale terminal state cannot end the session after a newer server is accepted", async () => {
+  const chrome = await createChromeHarness();
+
+  const first = chrome.latestEventSource();
+  first.listeners.get("open")();
+  chrome.sendState({ bootId: "boot-old", revision: 5, presence: "listening", chat: [] }, first);
+
+  first.listeners.get("error")();
+  chrome.runTimersWhere((timer) => timer.ms >= 500 && timer.ms <= 1000);
+  const second = chrome.latestEventSource();
+  second.listeners.get("open")();
+  chrome.sendState({ bootId: "boot-new", revision: 1, presence: "listening", chat: [] }, second);
+  assert.equal(chrome.element("chatInput").disabled, false);
+
+  // The replaced connection now delivers the old server's terminal state. Ending is irreversible,
+  // so accepting it from an obsolete generation would permanently close a live session.
+  chrome.sendState({ bootId: "boot-old", revision: 99, presence: "waiting", chat: [], ended: true }, first);
+
+  assert.equal(chrome.element("chatInput").disabled, false);
+  assert.equal(chrome.element("send").disabled, false);
+});
+
+test("a stale state re-check response cannot end the session after reconnecting", async () => {
+  let releaseState = () => {};
+  const heldState = new Promise((resolve) => {
+    releaseState = () => resolve();
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (!String(url).endsWith("/state")) return { ok: true };
+      await heldState;
+      // The dying server's answer: it believes the session ended.
+      return {
+        ok: true,
+        json: async () => ({ bootId: "boot-old", revision: 99, presence: "waiting", ended: true, chat: [] }),
+      };
+    },
+  });
+
+  const first = chrome.latestEventSource();
+  first.listeners.get("open")();
+  chrome.sendState({ bootId: "boot-old", revision: 1, presence: "working", chat: [] }, first);
+  chrome.runTimers(45_000);
+
+  // The stream is replaced while that re-check is still in flight.
+  first.listeners.get("error")();
+  chrome.runTimersWhere((timer) => timer.ms >= 500 && timer.ms <= 1000);
+  const second = chrome.latestEventSource();
+  second.listeners.get("open")();
+  chrome.sendState({ bootId: "boot-new", revision: 1, presence: "listening", chat: [] }, second);
+
+  releaseState();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.element("chatInput").disabled, false);
+  assert.equal(chrome.element("send").disabled, false);
+});
+
+test("a genuine terminal state from the live connection still ends the session", async () => {
+  const chrome = await createChromeHarness();
+  const stream = chrome.latestEventSource();
+  stream.listeners.get("open")();
+
+  chrome.sendState({ bootId: "boot-1", revision: 2, presence: "listening", chat: [] }, stream);
+  chrome.sendState({ bootId: "boot-1", revision: 3, presence: "waiting", chat: [], ended: true }, stream);
+
+  assert.equal(chrome.element("endedOverlay").hidden, false);
+  assert.equal(chrome.element("chatInput").disabled, true);
+  assert.equal(chrome.element("send").disabled, true);
+});
+
+// ---------------------------------------------------------------------------
+// Mobile conversation sheet. The panel used to be permanently open below the narrow breakpoint,
+// which on a 390x844 phone left the artifact ~433px - roughly half the screen. As a sheet it starts
+// collapsed and opens itself only when there is something in it worth reading.
+//
+// "Something worth reading" used to be the arrival of an `agent-reply` delta. There is no such
+// event any more: the server pushes whole states, so the sheet keys off the accepted state showing
+// an agent message the reviewer did not already have.
+// ---------------------------------------------------------------------------
+
+test("the conversation sheet starts collapsed on a narrow screen", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "collapsed");
+  assert.equal(chrome.element("sheetToggle")["aria-expanded"], "false");
+  assert.equal(chrome.element("sheetToggle")["aria-label"], "Expand conversation");
+});
+
+test("an agent reply in an accepted state opens the collapsed sheet", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+
+  chrome.sendState({ revision: 1, presence: "listening", chat: [{ role: "agent", text: "Look at card two" }] });
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "half");
+  assert.equal(chrome.element("sheetToggle")["aria-expanded"], "true");
+  assert.equal(chrome.element("sheetToggle")["aria-label"], "Collapse conversation");
+});
+
+// ---------------------------------------------------------------------------
+// The sheet is raised from inside applyServerState, BELOW the generation and revision gates. That
+// ordering is the whole guarantee, and it is invisible to every test above: a build that raises
+// first and validates second still passes all of them. These three make the ordering load-bearing.
+// ---------------------------------------------------------------------------
+
+// Fails if openSheetAtLeast runs before the revision gate: the losing payload carries a reply, so a
+// raise that happens before the comparison opens the sheet over state the client has rejected.
+test("a superseded state cannot raise the sheet, however much chat it carries", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+
+  chrome.sendState({ revision: 9, presence: "listening", chat: [] });
+  assert.equal(chrome.element("body").dataset.lavishSheet, "collapsed");
+
+  // Captured before revision 9 and arriving after it: superseded by definition, and guaranteed to
+  // be missing whatever revision 9 already applied.
+  chrome.sendState({ revision: 4, presence: "listening", chat: [{ role: "agent", text: "stale reply" }] });
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "collapsed");
+  assert.equal(chrome.element("sheetToggle")["aria-expanded"], "false");
+  assert.equal(chrome.chatTexts().length, 0);
+});
+
+// Fails if openSheetAtLeast runs before the generation gate: the answer belongs to a server the
+// client has already stopped talking to, so nothing in it may reach the screen - including the
+// sheet.
+test("a state re-check answered by a server we have replaced cannot raise the sheet", async () => {
+  let releaseState = () => {};
+  const heldState = new Promise((resolve) => {
+    releaseState = () => resolve();
+  });
+  const chrome = await createChromeHarness({
+    narrowScreen: true,
+    fetchImpl: async (url) => {
+      if (!String(url).endsWith("/state")) return { ok: true };
+      await heldState;
+      return {
+        ok: true,
+        json: async () => ({
+          bootId: "boot-old",
+          revision: 99,
+          presence: "listening",
+          ended: false,
+          chat: [{ role: "agent", text: "ghost reply from the dead instance" }],
+        }),
+      };
+    },
+  });
+
+  const first = chrome.latestEventSource();
+  first.listeners.get("open")();
+  chrome.sendState({ bootId: "boot-old", revision: 1, presence: "working", chat: [] }, first);
+  chrome.runTimers(45_000);
+
+  first.listeners.get("error")();
+  chrome.runTimersWhere((timer) => timer.ms >= 500 && timer.ms <= 1000);
+  const second = chrome.latestEventSource();
+  second.listeners.get("open")();
+  chrome.sendState({ bootId: "boot-new", revision: 1, presence: "listening", chat: [] }, second);
+  assert.equal(chrome.element("body").dataset.lavishSheet, "collapsed");
+
+  releaseState();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "collapsed");
+  assert.equal(chrome.chatTexts().length, 0);
+});
+
+// Whole states are re-applied freely - that idempotency is what killed the duplicate bubble. The
+// sheet has to be idempotent with them, or every reconnect would re-open a sheet the reviewer
+// closed on purpose.
+test("a state that only repeats chat already on screen does not re-raise a collapsed sheet", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+  const chat = [{ role: "agent", text: "Look at card two" }];
+
+  chrome.sendState({ revision: 1, presence: "listening", chat });
+  assert.equal(chrome.element("body").dataset.lavishSheet, "half");
+
+  // The reviewer read it and put the sheet away.
+  chrome.element("sheetToggle").onclick();
+  chrome.element("sheetToggle").onclick();
+  assert.equal(chrome.element("body").dataset.lavishSheet, "collapsed");
+
+  // A reconnect re-pushes the whole state under a newer revision. Same conversation, nothing new.
+  chrome.sendState({ revision: 2, presence: "listening", chat });
+  assert.equal(chrome.element("body").dataset.lavishSheet, "collapsed");
+  assert.equal(chrome.chatTexts().length, 1);
+
+  // A state that genuinely grows the conversation still raises it.
+  chrome.sendState({ revision: 3, presence: "listening", chat: [...chat, { role: "agent", text: "And card three" }] });
+  assert.equal(chrome.element("body").dataset.lavishSheet, "half");
+});
+
+test("queuing an annotation opens the sheet and shows how many are waiting", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Tighten this", selector: "#a", tag: "p", text: "A" },
+  });
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "half");
+  assert.equal(chrome.element("sheetCount").textContent, "1");
+  assert.equal(chrome.element("sheetCount").hidden, false);
+});
+
+// Auto-OPEN only. A collapse is a decision the reviewer made about their own screen; an agent reply
+// may raise the sheet from collapsed, but it must never lower one the reviewer opened further.
+test("an agent reply never lowers a sheet the reviewer opened wider", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+  const toggle = chrome.element("sheetToggle");
+
+  toggle.onclick();
+  toggle.onclick();
+  assert.equal(chrome.element("body").dataset.lavishSheet, "expanded");
+
+  chrome.sendState({ revision: 1, presence: "listening", chat: [{ role: "agent", text: "Done" }] });
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "expanded");
+});
+
+test("the sheet toggle cycles collapsed -> half -> expanded -> collapsed", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+  const body = chrome.element("body");
+  const toggle = chrome.element("sheetToggle");
+
+  for (const expected of ["half", "expanded", "collapsed", "half"]) {
+    toggle.onclick();
+    assert.equal(body.dataset.lavishSheet, expected);
+  }
+});
+
+test("a swipe on the sheet handle steps one state, a tap cycles", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+  const body = chrome.element("body");
+  const head = chrome.element("panelHead");
+  const swipe = (from, to) => {
+    chrome.dispatchDocumentPointerDown({ clientY: from, target: head });
+    chrome.dispatchDocumentPointerUp({ clientY: to });
+  };
+
+  swipe(600, 500); // up
+  assert.equal(body.dataset.lavishSheet, "half");
+  swipe(500, 400); // up again
+  assert.equal(body.dataset.lavishSheet, "expanded");
+  swipe(400, 500); // down
+  assert.equal(body.dataset.lavishSheet, "half");
+
+  // Under the threshold a drag is just a finger that did not hold still - treat it as a tap.
+  swipe(500, 496);
+  assert.equal(body.dataset.lavishSheet, "expanded");
+});
+
+// The toggle button runs its own click handler, so the handle must not also step on its pointer -
+// otherwise one tap would move the sheet twice.
+test("a tap on the toggle button does not also trigger the handle swipe path", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+  const head = chrome.element("panelHead");
+  const toggle = chrome.element("sheetToggle");
+
+  chrome.dispatchDocumentPointerDown({ clientY: 600, target: toggle });
+  chrome.dispatchDocumentPointerUp({ clientY: 600 });
+  assert.equal(chrome.element("body").dataset.lavishSheet, "collapsed");
+
+  toggle.onclick();
+  assert.equal(chrome.element("body").dataset.lavishSheet, "half");
+
+  // A press that landed outside the handle entirely must not arm the swipe either.
+  chrome.dispatchDocumentPointerDown({ clientY: 600, target: head.parentElement || chrome.element("artifact") });
+  chrome.dispatchDocumentPointerUp({ clientY: 400 });
+  assert.equal(chrome.element("body").dataset.lavishSheet, "half");
+});
+
+test("focusing the composer opens the sheet", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+
+  chrome.element("chatInput").dispatch("focus");
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "half");
+});
+
+// On desktop the panel is a plain always-visible column, so none of the sheet machinery may fire.
+test("the sheet stays inert on a wide screen", async () => {
+  const chrome = await createChromeHarness();
+
+  chrome.sendState({ revision: 1, presence: "listening", chat: [{ role: "agent", text: "Look at card two" }] });
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Tighten this", selector: "#a", tag: "p", text: "A" },
+  });
+  chrome.element("chatInput").dispatch("focus");
+
+  assert.equal(chrome.element("body").dataset.lavishSheet, "collapsed");
+});
+
+test("Escape collapses an open sheet, but an open menu outranks it", async () => {
+  const chrome = await createChromeHarness({ narrowScreen: true });
+  const body = chrome.element("body");
+  // Stub elements default to visible, and Escape checks the overlays before anything else.
+  chrome.element("whiteboardOverlay").hidden = true;
+  chrome.element("shareDialog").hidden = true;
+
+  chrome.element("sheetToggle").onclick();
+  assert.equal(body.dataset.lavishSheet, "half");
+
+  chrome.element("moreMenu").hidden = false;
+  chrome.dispatchDocumentKeydown({ key: "Escape" });
+  assert.equal(body.dataset.lavishSheet, "half");
+  assert.equal(chrome.element("moreMenu").hidden, true);
+
+  chrome.dispatchDocumentKeydown({ key: "Escape" });
+  assert.equal(body.dataset.lavishSheet, "collapsed");
 });

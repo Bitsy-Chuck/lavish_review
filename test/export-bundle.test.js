@@ -6,6 +6,20 @@ import test from "node:test";
 import { pathToFileURL } from "node:url";
 
 import { buildSelfContainedHtml, exportFileName, splitExportWarnings } from "../src/export-bundle.js";
+import { injectArtifactBaseLayer } from "../src/html-transform.js";
+
+// Exports and shares carry the same viewport meta and containment layer the served artifact gets,
+// so byte-for-byte "the asset transform rewrote nothing" assertions compare against that baseline
+// rather than the raw input.
+function unchangedExportOf(html) {
+  return injectArtifactBaseLayer(html);
+}
+
+function charsetByteOffset(html) {
+  const match = /<meta\b[^>]*\bcharset\s*=[^>]*>/i.exec(html);
+  assert.ok(match, "output must contain a meta charset declaration");
+  return Buffer.byteLength(html.slice(0, match.index));
+}
 
 function portablePathKey(absPath) {
   return String(absPath)
@@ -689,6 +703,60 @@ test("inlines local images referenced by src into data URIs", async () => {
   assert.match(out, /<img src="data:image\/png;base64,iVBORw==" alt="x">/);
 });
 
+// A share link is opened on a phone at least as often as on a laptop, and an exported copy is what
+// gets handed to someone else. Both used to ship without a viewport meta, so they laid out at the
+// ~980px desktop fallback and were scaled down, and without the containment layer they could
+// overflow where the reviewed copy did not.
+test("export and share carry the same viewport meta and containment layer as the served artifact", async () => {
+  const html = '<!doctype html><html><head><meta charset="utf-8"><title>T</title></head><body>x</body></html>';
+  const { html: out } = await buildSelfContainedHtml(html, { baseDir: "/art", readLocalFile: localReader({}) });
+
+  assert.match(out, /<meta name="viewport" content="width=device-width, initial-scale=1">/);
+  assert.match(out, /@layer lavish-safety/);
+  assert.ok(out.indexOf('<meta charset="utf-8">') < out.indexOf('<meta name="viewport"'));
+  // Still no design system and still no annotation SDK - this is layout, not tooling.
+  assert.doesNotMatch(out, /\/sdk\.js/);
+  assert.doesNotMatch(out, /daisyui/);
+});
+
+test("export keeps charset in the sniff window with a large generated design import map", async () => {
+  const nonAscii = "Crème brûlée → 東京 🚀";
+  const moduleSource = `export default ${JSON.stringify("é".repeat(1_000))};`;
+  const html =
+    '<!doctype html><html><head><meta charset="utf-8"><title>T</title></head>' +
+    `<body><p>${nonAscii}</p><script type="module">import value from "/design/large.mjs"; window.value = value;</script>` +
+    "</body></html>";
+  const { html: out } = await buildSelfContainedHtml(html, {
+    baseDir: "/art",
+    readLocalFile: localReader({ "/pkg/design/large.mjs": moduleSource }),
+    resolveAbsolute: (refPath) => (refPath === "/design/large.mjs" ? "/pkg/design/large.mjs" : null),
+  });
+
+  assert.match(out, /<script type="importmap">/);
+  assert.ok(charsetByteOffset(out) < 1024);
+  assert.ok(Buffer.from(out, "utf8").toString("utf8").includes(nonAscii));
+});
+
+test("fragment export inserts a generated import map after its leading charset", async () => {
+  const html =
+    '<p>Crème</p><script type="module">import value from "/design/fragment.mjs"; window.value = value;</script>';
+  const { html: out } = await buildSelfContainedHtml(html, {
+    baseDir: "/art",
+    readLocalFile: localReader({ "/pkg/design/fragment.mjs": 'export default "ok";' }),
+    resolveAbsolute: (refPath) => (refPath === "/design/fragment.mjs" ? "/pkg/design/fragment.mjs" : null),
+  });
+
+  assert.match(out, /^<meta charset="utf-8"><script type="importmap">/);
+});
+
+test("export honors the containment layer opt-out", async () => {
+  const html = '<!doctype html><html data-lavish-layout-safety="off"><head></head><body>x</body></html>';
+  const { html: out } = await buildSelfContainedHtml(html, { baseDir: "/art", readLocalFile: localReader({}) });
+
+  assert.doesNotMatch(out, /@layer lavish-safety/);
+  assert.match(out, /name="viewport"/);
+});
+
 test("does not rewrite markup-like text inside attribute values", async () => {
   const html =
     "<!doctype html><html><body><div data-template=\"<img src='secret.json'>\"></div>" +
@@ -702,7 +770,7 @@ test("does not rewrite markup-like text inside attribute values", async () => {
     },
   });
 
-  assert.equal(out, html);
+  assert.equal(out, unchangedExportOf(html));
   assert.deepEqual(reads, []);
   assert.deepEqual(warnings, []);
 });
@@ -773,7 +841,7 @@ test("leaves unchanged srcset values byte-for-byte when no candidate is inlined"
     readLocalFile: localReader({}),
   });
 
-  assert.equal(out, html);
+  assert.equal(out, unchangedExportOf(html));
   assert.equal(warnings.length, 0);
 });
 

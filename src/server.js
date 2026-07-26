@@ -10,8 +10,11 @@ import chokidar from "chokidar";
 import express from "express";
 
 import {
+  calculatePinchGesture,
   classifyHorizontalOverflow,
+  classifyScaledDownSvg,
   classifyVerticalOverflow,
+  createTwoPointerTracker,
   createArtifactSdk,
   deriveLavishQueueKey,
   fragmentsSignificantlyOverlap,
@@ -20,6 +23,7 @@ import {
   isSvgLayoutDescendant,
   MODE_TOGGLE_HOTKEY_KEY,
   resolveVisibleSpillCandidates,
+  scaledDownDiagramSeverity,
 } from "./artifact-sdk.js";
 import * as mermaidNode from "./mermaid-node.js";
 import { extractMermaidSources, mermaidSourceHash } from "./mermaid-source.js";
@@ -38,6 +42,7 @@ import {
 } from "./export-bundle.js";
 import { publishToHtmlApp } from "./html-app.js";
 import { injectLavishSdk } from "./html-transform.js";
+import { createLayoutWarningRecorder } from "./layout-log.js";
 import { bindHost, hostForUrl, linkHost } from "./paths.js";
 import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
 
@@ -96,6 +101,18 @@ function allowSandboxedArtifactOrigin(res) {
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
 const WHITEBOARD_CHANNEL_TOKEN_TTL_MS = 5 * 60_000;
+
+// Browser event-stream resilience knobs.
+//
+// `retry:` is the reconnect hint the EventSource spec lets the server set. It only governs the
+// browser's own automatic reconnect; chrome-client.js additionally drives an explicit reconnect
+// loop because a non-200 response (an HTTP 502 from `tailscale serve` in front of a dead backend,
+// for example) makes the spec's processing model fail the stream permanently with no retry at all.
+const SSE_RETRY_HINT_MS = 2_000;
+// The heartbeat is a real named event rather than an SSE comment so the client can watchdog it.
+// A connection that goes half-open through a proxy or a sleeping laptop simply stops delivering
+// bytes without ever firing an `error`, which is the other way this stream went permanently deaf.
+const SSE_HEARTBEAT_MS = 15_000;
 
 // The whiteboard frame bundle (Excalidraw + Mermaid converter + React) is
 // produced by `scripts/build.js` into dist/whiteboard. Packaged runs find it
@@ -165,14 +182,67 @@ export async function serve({
   const activePolls = new Map();
   const deliveredFeedback = new Set();
   const sseClients = new Set();
+  const stateRevisions = new Map();
+  // Instances are identified, never ordered. A clock cannot do this job: it can run backwards,
+  // two servers can start in the same millisecond, and a replacement with a lower timestamp would
+  // have its state rejected forever - the permanent deafness this whole change exists to remove.
+  // An opaque id only ever answers "same server or not", and the client re-bases when it differs.
+  const bootId = crypto.randomUUID();
   const whiteboardChannelSecret = crypto.randomBytes(32);
+
+  // Every browser-visible state change (chat, presence, ended) gets a monotonic revision, and the
+  // browser is only ever sent the WHOLE state under one. Deltas were the problem: a snapshot that
+  // overlapped a later delta applied the same reply twice, because syncChat followed by addChat is
+  // not idempotent. A full-state replace is, so overlap is harmless by construction.
+  const bumpRevision = (key) => {
+    const next = revisionOf(key) + 1;
+    stateRevisions.set(key, next);
+    return next;
+  };
+  const revisionOf = (key) => stateRevisions.get(key) || 0;
+
+  // Bumps the revision and tells every attached browser that its state is stale.
+  const noteStateChange = (key) => {
+    const revision = bumpRevision(key);
+    events.emit("session-state", key, revision);
+    return revision;
+  };
+  const emitStateChange = (name, key, ...args) => {
+    const revision = noteStateChange(key);
+    events.emit(name, key, ...args, revision);
+    return revision;
+  };
+  const emitPresence = (key, state) => emitStateChange("agent-presence", key, state);
+
+  // The caller fixes the revision label BEFORE calling this, so what comes back is never older
+  // than the label it will be stamped with. That single ordering rule is what makes "highest
+  // revision wins" safe: a payload that loses the comparison is guaranteed to be superseded by
+  // content that already includes its own change, so nothing can be dropped.
+  const readSessionState = async (key) => {
+    const session = await store.findByKey(key);
+    if (!session) return null;
+    return {
+      key: session.key,
+      status: session.status || "open",
+      ended: session.status === "ended",
+      presence: computePresence(key, activePolls, deliveredFeedback),
+      chat: session.chat || [],
+      pending_prompts: session.pending_prompts || 0,
+    };
+  };
+
   const verbose = debug || process.env.LAVISH_AXI_DEBUG === "1";
   const writeLog = typeof log === "function" ? log : (line) => process.stderr.write(`${line}\n`);
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
   let publicPort = port;
 
-  // Whiteboard sidecar files live next to state.json, keyed by session + diagram.
-  const whiteboardStateRoot = path.dirname(stateFile);
+  // Sidecar files (whiteboard scenes, the durable layout-warning log) live next to state.json.
+  // Derived from the passed-in `stateFile` rather than imported from `paths.js` so a test can
+  // point the whole server at a temp dir.
+  const stateRoot = path.dirname(stateFile);
+  const layoutWarningLog = createLayoutWarningRecorder(stateRoot, {
+    onError: (error) => writeLog(`[lavish] layout warning log write failed: ${error?.message || error}`),
+  });
 
   const defaultJsonParser = express.json({ limit: "2mb" });
   const whiteboardJsonParser = express.json({ limit: "20mb" });
@@ -214,8 +284,9 @@ export async function serve({
       const sessionUrl = `http://${hostForUrl(linkHostName)}:${publicPort}/session/${key}`;
       const url = shouldDisableLayoutGateOpen(req.body || {}) ? appendNoGateParam(sessionUrl) : sessionUrl;
       const session = await store.upsertSession(file, sessionUrl);
+      noteStateChange(key);
       if (existing?.status === "ended") {
-        clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
+        clearFeedbackDelivery(key, activePolls, deliveredFeedback, emitPresence);
       }
       logEvent?.(`session opened key=${key} file=${file}`);
       await watchSession(session, watchers, events, logEvent);
@@ -233,7 +304,8 @@ export async function serve({
         req.query.timeoutMs === undefined ? null : Math.max(0, Math.min(Number(req.query.timeoutMs || 0), 2147483647));
       const immediate = await store.takeFeedback(key);
       if (immediate.status !== "waiting") {
-        if (immediate.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
+        noteStateChange(key);
+        if (immediate.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, emitPresence);
         res.json(immediate);
         return;
       }
@@ -247,7 +319,7 @@ export async function serve({
         }, pollHeartbeatMs);
         heartbeat.unref?.();
       }
-      setPollActive(key, activePolls, deliveredFeedback, events, true);
+      setPollActive(key, activePolls, deliveredFeedback, emitPresence, true);
       refreshIdleTimer();
       const timer = timeoutMs === null ? null : setTimeout(() => respond().catch(handleRespondError), timeoutMs);
       let cleaned = false;
@@ -259,7 +331,7 @@ export async function serve({
         if (heartbeat) clearInterval(heartbeat);
         events.off("feedback", onFeedback);
         events.off("ended", onFeedback);
-        setPollActive(key, activePolls, deliveredFeedback, events, false);
+        setPollActive(key, activePolls, deliveredFeedback, emitPresence, false);
         refreshIdleTimer();
       };
       const respond = async () => {
@@ -267,7 +339,8 @@ export async function serve({
         responding = true;
         try {
           const result = await store.takeFeedback(key);
-          if (result.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
+          if (result.status !== "waiting") noteStateChange(key);
+          if (result.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, emitPresence);
           if (streamHeartbeat) {
             res.end(JSON.stringify(result));
           } else {
@@ -307,10 +380,41 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
-      if (shouldEndSession) clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
-      events.emit(shouldEndSession ? "ended" : "feedback", req.params.key);
+      // Feedback that lands while nothing is polling has not been delivered to anyone, so the
+      // session is not "working" on it - it is waiting for an agent to show up. Without this the
+      // presence latch survives forever once an agent takes delivery and never polls again.
+      if (shouldEndSession || !activePolls.has(req.params.key)) {
+        clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, emitPresence);
+      }
+      if (shouldEndSession) {
+        emitStateChange("ended", req.params.key);
+      } else {
+        // "feedback" only wakes pollers, but the chat did change, so the revision must move too
+        // or a resync would carry the new message under an already-applied revision.
+        noteStateChange(req.params.key);
+        events.emit("feedback", req.params.key);
+      }
       res.json({ status: "queued", pending_prompts: session.pending_prompts });
       if (shouldEndSession) await shutdownIfNoLiveSessions();
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Authoritative state on demand, in the same shape the stream pushes. The stream sends this
+  // unprompted on every (re)connect, so a reconnecting browser does not need to ask; this exists
+  // for a client that wants to re-check without waiting for an event, such as one deciding whether
+  // a "working" presence has actually gone stale.
+  app.get("/api/:key/state", async (req, res, next) => {
+    try {
+      // Label first, content second - see readSessionState.
+      const revision = revisionOf(req.params.key);
+      const state = await readSessionState(req.params.key);
+      if (!state) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      res.json({ ...state, revision, bootId });
     } catch (error) {
       next(error);
     }
@@ -323,6 +427,18 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
+      // Durable history. This is the right insertion point because the handler sees every report,
+      // including ones `takeFeedback` will later clear from the session. Deliberately not gated on
+      // `result.changed`: the store persists a warning before this runs, so a report it calls
+      // unchanged is exactly what follows a failed log write, and skipping those would lose the
+      // finding for good. The recorder dedupes on what it has actually written instead. It
+      // swallows its own errors, so logging can never fail the report; awaiting it keeps the line
+      // on disk before the browser gets its ack.
+      await layoutWarningLog.record({
+        key: req.params.key,
+        file: result.session.file,
+        warnings: result.session.layout_warnings || [],
+      });
       if (result.changed && result.hasWarnings) {
         events.emit("feedback", req.params.key);
       }
@@ -335,8 +451,8 @@ export async function serve({
   app.post("/api/:key/end", async (req, res, next) => {
     try {
       await store.endSession(req.params.key, "user");
-      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
-      events.emit("ended", req.params.key);
+      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, emitPresence);
+      emitStateChange("ended", req.params.key);
       res.json({ status: "ended" });
       await shutdownIfNoLiveSessions();
     } catch (error) {
@@ -352,7 +468,7 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
-      events.emit("agent-reply", req.params.key, text);
+      emitStateChange("agent-reply", req.params.key, text);
       res.json({ status: "sent" });
     } catch (error) {
       next(error);
@@ -436,8 +552,8 @@ export async function serve({
       const file = await canonicalFile(req.body.file);
       const key = sessionKey(file);
       await store.endSession(key, "agent");
-      clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
-      events.emit("ended", key);
+      clearFeedbackDelivery(key, activePolls, deliveredFeedback, emitPresence);
+      emitStateChange("ended", key);
       res.json({ status: "ended" });
       await shutdownIfNoLiveSessions();
     } catch (error) {
@@ -513,39 +629,86 @@ export async function serve({
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         connection: "keep-alive",
+        // Ask reverse proxies not to buffer the stream; a buffered SSE body looks identical to a
+        // hung agent from the browser.
+        "x-accel-buffering": "no",
       });
       sseClients.add(res);
       refreshIdleTimer();
-      const session = await store.findByKey(req.params.key);
+      // `id:` is a per-connection sequence, used for ordering and for spotting gaps in a capture.
+      // Lavish keeps no event log, so Last-Event-ID replay is deliberately NOT supported: every
+      // `state` event carries the whole state, so the newest one is always a complete recovery.
+      let eventId = 0;
+      const write = (event, data) => {
+        if (res.writableEnded) return;
+        eventId += 1;
+        res.write(`id: ${eventId}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      };
+      res.write(`retry: ${SSE_RETRY_HINT_MS}\n\n`);
+
+      // One combined `state` event carries chat, presence and ended together under a single
+      // revision. Sending them separately under the SAME revision is what made a client accept the
+      // chat and then reject the presence that shared its number.
+      //
+      // The pump serializes and coalesces: a change that lands while a read is in flight raises
+      // the pending revision instead of racing a second write, so writes are always in revision
+      // order and a burst collapses into one send.
+      let pendingRevision = null;
+      let pushing = false;
+      const pushState = async () => {
+        if (pushing) return;
+        pushing = true;
+        try {
+          while (pendingRevision !== null && !res.writableEnded) {
+            // The label is fixed before the read, never after, so content is never older than it.
+            const revision = pendingRevision;
+            pendingRevision = null;
+            let state = null;
+            try {
+              state = await readSessionState(req.params.key);
+            } catch {
+              // Fall through to the degraded push below.
+            }
+            // Presence lives in memory, so it stays trustworthy even when the store is unreadable
+            // or the session has gone. Omitting chat from a degraded push leaves whatever the
+            // browser already has rather than blanking the conversation.
+            const payload = state || { presence: computePresence(req.params.key, activePolls, deliveredFeedback) };
+            write("state", { ...payload, revision, bootId });
+          }
+        } finally {
+          pushing = false;
+        }
+      };
+      const queueState = (revision) => {
+        pendingRevision = pendingRevision === null ? revision : Math.max(pendingRevision, revision);
+        pushState();
+      };
+
+      // Subscribe BEFORE the first read, or anything that happens during it falls into a gap: too
+      // late for that read, too early for the stream. The pump then orders the initial state ahead
+      // of whatever arrived while it was being read.
       const sendReload = (key) => {
-        if (key === req.params.key) {
-          res.write("event: reload\ndata: {}\n\n");
-        }
+        if (key === req.params.key) write("reload", {});
       };
-      const sendAgentReply = (key, text) => {
-        if (key === req.params.key) {
-          res.write(`event: agent-reply\ndata: ${JSON.stringify({ text })}\n\n`);
-        }
+      const onStateChanged = (key, revision) => {
+        if (key === req.params.key) queueState(revision);
       };
-      const sendPresence = (key, state) => {
-        if (key === req.params.key) {
-          res.write(`event: agent-presence\ndata: ${JSON.stringify({ state })}\n\n`);
-        }
-      };
-      res.write(`event: chat-sync\ndata: ${JSON.stringify({ chat: session?.chat || [] })}\n\n`);
-      res.write(
-        `event: agent-presence\ndata: ${JSON.stringify({ state: computePresence(req.params.key, activePolls, deliveredFeedback) })}\n\n`,
-      );
       events.on("reload", sendReload);
-      events.on("agent-reply", sendAgentReply);
-      events.on("agent-presence", sendPresence);
+      events.on("session-state", onStateChanged);
+
+      // Registered alongside the subscriptions, not behind the first read, so a client that
+      // disconnects mid-read still unsubscribes.
+      const heartbeat = setInterval(() => write("heartbeat", {}), SSE_HEARTBEAT_MS);
+      heartbeat.unref?.();
       req.on("close", () => {
+        clearInterval(heartbeat);
         sseClients.delete(res);
         events.off("reload", sendReload);
-        events.off("agent-reply", sendAgentReply);
-        events.off("agent-presence", sendPresence);
+        events.off("session-state", onStateChanged);
         refreshIdleTimer();
       });
+
+      queueState(revisionOf(req.params.key));
     } catch (error) {
       next(error);
     }
@@ -673,7 +836,7 @@ export async function serve({
         res.status(404).json({ error: "whiteboard not found" });
         return;
       }
-      const whiteboard = await loadWhiteboard(whiteboardStateRoot, req.params.key, Number(req.params.index));
+      const whiteboard = await loadWhiteboard(stateRoot, req.params.key, Number(req.params.index));
       res.json({ whiteboard });
     } catch (error) {
       next(error);
@@ -717,7 +880,7 @@ export async function serve({
         return;
       }
       const body = req.body || {};
-      await saveWhiteboard(whiteboardStateRoot, req.params.key, Number(req.params.index), {
+      await saveWhiteboard(stateRoot, req.params.key, Number(req.params.index), {
         sourceHash: String(body.source_hash || body.sourceHash || ""),
         scene: body.scene ?? null,
         baseline: body.baseline ?? null,
@@ -744,7 +907,7 @@ export async function serve({
       }
       const body = req.body || {};
       const { scenePath, previewPath } = await writeWhiteboardFeedbackFiles(
-        whiteboardStateRoot,
+        stateRoot,
         req.params.key,
         Number(req.params.index),
         { scene: body.scene ?? null, pngDataUrl: String(body.pngDataUrl || body.png_data_url || "") },
@@ -1027,7 +1190,7 @@ export function hasLiveReloadRootOptIn(html) {
   return /<meta\b(?=[^>]*name=["']lavish-live-reload["'])(?=[^>]*content=["']root["'])[^>]*>/i.test(searchableHtml);
 }
 
-function setPollActive(key, activePolls, deliveredFeedback, events, active) {
+function setPollActive(key, activePolls, deliveredFeedback, emitPresence, active) {
   const previousPresence = computePresence(key, activePolls, deliveredFeedback);
   const count = activePolls.get(key) || 0;
   const nextCount = active ? count + 1 : Math.max(0, count - 1);
@@ -1039,24 +1202,24 @@ function setPollActive(key, activePolls, deliveredFeedback, events, active) {
     deliveredFeedback.delete(key);
   }
   const nextPresence = computePresence(key, activePolls, deliveredFeedback);
-  if (nextPresence !== previousPresence) events.emit("agent-presence", key, nextPresence);
+  if (nextPresence !== previousPresence) emitPresence(key, nextPresence);
 }
 
-function markFeedbackDelivered(key, activePolls, deliveredFeedback, events) {
+function markFeedbackDelivered(key, activePolls, deliveredFeedback, emitPresence) {
   const previousPresence = computePresence(key, activePolls, deliveredFeedback);
   deliveredFeedback.add(key);
   const nextPresence = computePresence(key, activePolls, deliveredFeedback);
   if (nextPresence !== previousPresence) {
-    events.emit("agent-presence", key, nextPresence);
+    emitPresence(key, nextPresence);
   }
 }
 
-function clearFeedbackDelivery(key, activePolls, deliveredFeedback, events) {
+function clearFeedbackDelivery(key, activePolls, deliveredFeedback, emitPresence) {
   const previousPresence = computePresence(key, activePolls, deliveredFeedback);
   deliveredFeedback.delete(key);
   const nextPresence = computePresence(key, activePolls, deliveredFeedback);
   if (nextPresence !== previousPresence) {
-    events.emit("agent-presence", key, nextPresence);
+    emitPresence(key, nextPresence);
   }
 }
 
@@ -1103,6 +1266,7 @@ const chromeIcons = {
     '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
     15,
   ),
+  chevronUp: chromeIcon('<polyline points="18 15 12 9 6 15"/>', 18),
 };
 
 // Display the path with the home directory shortened to "~", split so the directory part can
@@ -1228,7 +1392,7 @@ ${faviconTag}
 </head>
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe><div class="layout-issue-banner" id="layoutIssueBanner" hidden>This surface may have layout issues. Your agent has been notified.</div></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe><div class="layout-issue-banner" id="layoutIssueBanner" hidden>This surface may have layout issues. Your agent has been notified.</div></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="sheet-grip" aria-hidden="true"></span><h2>Conversation</h2><span class="sheet-count" id="sheetCount" hidden></span><button class="sheet-toggle" id="sheetToggle" type="button" aria-controls="panel" aria-expanded="false" aria-label="Expand conversation"><span class="sheet-chevron">${chromeIcons.chevronUp}</span></button></div><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="connection-banner" id="connectionBanner" role="status" hidden>Reconnecting to Lavish...</div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="composer-error" id="submitError" role="alert" hidden><span class="composer-error-text" id="submitErrorText"></span><button class="composer-error-retry" id="submitRetry" type="button">Retry</button></div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label>Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label>Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note">Keep the update key private. ht-ml.app returns it once and it is the only way to update or delete this page later.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p></div></div>
@@ -1272,7 +1436,11 @@ const MODE_TOGGLE_HOTKEY_KEY=${JSON.stringify(MODE_TOGGLE_HOTKEY_KEY)};
 const isModeToggleHotkeyEvent=${isModeToggleHotkeyEvent.toString()};
 const fragmentsSignificantlyOverlap=${fragmentsSignificantlyOverlap.toString()};
 const resolveVisibleSpillCandidates=${resolveVisibleSpillCandidates.toString()};
+const calculatePinchGesture=${calculatePinchGesture.toString()};
+const createTwoPointerTracker=${createTwoPointerTracker.toString()};
 const classifyHorizontalOverflow=${classifyHorizontalOverflow.toString()};
+const classifyScaledDownSvg=${classifyScaledDownSvg.toString()};
+const scaledDownDiagramSeverity=${scaledDownDiagramSeverity.toString()};
 const classifyVerticalOverflow=${classifyVerticalOverflow.toString()};
 const isSvgLayoutDescendant=${isSvgLayoutDescendant.toString()};
 ${mermaidHelperDecls}

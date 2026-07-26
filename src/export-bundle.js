@@ -2,6 +2,8 @@ import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { headInsertionIndex, injectArtifactBaseLayer } from "./html-transform.js";
+
 // Builds a portable copy of a Lavish artifact by inlining only its LOCAL assets - files on disk
 // the artifact references by relative path, fetchable file:// URL, or a trusted root-absolute
 // resolver - as inline <style>/<script> blocks and data URIs. Remote references (http(s) CDN/font URLs,
@@ -160,6 +162,10 @@ export async function buildSelfContainedHtml(html, options = {}) {
     canInjectImportMap: !hasExistingImportMap(html),
   };
   let out = await transform(html, ctx);
+  // Exports and shares carry the same viewport meta and containment layer the served artifact gets,
+  // so a copy handed to someone else - or opened on a phone - lays out exactly like the copy that
+  // was reviewed. The annotation SDK is still deliberately absent; this is layout, not tooling.
+  out = injectArtifactBaseLayer(out);
   out = injectDesignImportMap(out, ctx);
   return { html: out, warnings: ctx.warnings };
 }
@@ -168,8 +174,9 @@ function hasExistingImportMap(html) {
   return /<script\b[^>]*\btype\s*=\s*["']?\s*importmap\b/i.test(String(html || ""));
 }
 
-// Inject the accumulated module import map as the first child of <head> so it precedes every module
-// script in document order (a prerequisite for the browser to honor it). The map values are
+// Inject the accumulated module import map at the start of <head>, after the encoding declaration,
+// so it precedes every module script in document order without defeating the browser's 1024-byte
+// charset sniff. The map values are
 // `data:text/javascript;base64,...` URLs whose alphabet cannot contain `<`, but defensively split any
 // `</` so the JSON can never terminate the <script> element early.
 function injectDesignImportMap(out, ctx) {
@@ -179,7 +186,7 @@ function injectDesignImportMap(out, ctx) {
   const tag = `<script type="importmap">${json}</script>`;
   const headOpen = /<head\b[^>]*>/i.exec(out);
   if (headOpen) {
-    const at = headOpen.index + headOpen[0].length;
+    const at = headInsertionIndex(out);
     return `${out.slice(0, at)}${tag}${out.slice(at)}`;
   }
   const htmlOpen = /<html\b[^>]*>/i.exec(out);
@@ -187,7 +194,8 @@ function injectDesignImportMap(out, ctx) {
     const at = htmlOpen.index + htmlOpen[0].length;
     return `${out.slice(0, at)}${tag}${out.slice(at)}`;
   }
-  return `${tag}${out}`;
+  const at = headInsertionIndex(out);
+  return `${out.slice(0, at)}${tag}${out.slice(at)}`;
 }
 
 /** Derive a portable download name for an exported artifact (report.html -> report.export.html). */

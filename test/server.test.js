@@ -50,15 +50,20 @@ async function startPresenceStream(base, key) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let lastPresence = null;
 
   return {
     async next() {
       const deadline = Date.now() + 500;
       while (true) {
-        const match = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m);
+        const match = buffer.match(/^event: state\ndata: (.+)\n\n/m);
         if (match) {
           buffer = buffer.replace(match[0], "");
-          return JSON.parse(match[1]).state;
+          const presence = JSON.parse(match[1]).presence;
+          // Whole-state pushes repeat the current presence whenever anything else changes.
+          if (presence === lastPresence) continue;
+          lastPresence = presence;
+          return presence;
         }
         const remaining = Math.max(1, deadline - Date.now());
         const { value, done } = await Promise.race([
@@ -68,6 +73,37 @@ async function startPresenceStream(base, key) {
           ),
         ]);
         if (done) throw new Error("presence stream closed before an agent presence event");
+        buffer += decoder.decode(value, { stream: true });
+      }
+    },
+    async close() {
+      controller.abort();
+      await reader.cancel().catch(() => {});
+    },
+  };
+}
+
+// Raw view of the event stream, for the framing fields that startPresenceStream parses past.
+async function startRawEventStream(base, key) {
+  const controller = new AbortController();
+  const res = await fetch(`${base}/events/${key}`, { signal: controller.signal });
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  return {
+    async waitFor(pattern) {
+      const deadline = Date.now() + 1000;
+      while (true) {
+        if (pattern.test(buffer)) return buffer;
+        const remaining = Math.max(1, deadline - Date.now());
+        const { value, done } = await Promise.race([
+          reader.read(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`timed out waiting for ${pattern} in:\n${buffer}`)), remaining),
+          ),
+        ]);
+        if (done) throw new Error(`event stream closed before ${pattern}, saw:\n${buffer}`);
         buffer += decoder.decode(value, { stream: true });
       }
     },
@@ -383,7 +419,12 @@ test("chrome declares the Lavish design-system tokens", async () => {
   assert.match(css, /--ease:cubic-bezier\(.2,.6,.2,1\)/);
   assert.match(css, /--dur-slow:320ms/);
   assert.match(css, /--bar-h:56px/);
-  assert.match(css, /--panel-w:360px/);
+  // Fluid, not fixed: every pixel of panel comes off the artifact, so it only claims its full 360px
+  // once the window is wide enough to spare it. This shrinks - it cannot remove - the step at the
+  // 860px breakpoint where widening the window costs the artifact a whole column.
+  assert.match(css, /--panel-w:clamp\(288px,30vw,360px\)/);
+  assert.match(css, /--sheet-peek-h:52px/);
+  assert.match(css, /--sheet-half-h:min\(50dvh,420px\)/);
 });
 
 test("artifact SDK uses design-token aliases for annotation highlight and shadow UI", () => {
@@ -406,12 +447,89 @@ test("chrome uses the annotation outline as the keyboard focus outline", async (
   assert.match(css, /--annotate-offset:2px/);
 });
 
+// The panel used to be a permanently open `min(42vh, 360px)` row, which on a 390x844 phone left the
+// artifact ~433px - every artifact read through a letterbox. As a collapsible sheet the artifact
+// keeps everything above a 52px handle and the open states overlay it instead of resizing it.
 test("chrome keeps the editor usable on narrow screens", async () => {
   const css = await chromeCssSource();
 
   assert.match(css, /@media \(max-width:860px\)/);
   assert.match(css, /grid-template-columns:1fr/);
-  assert.match(css, /grid-template-rows:minmax\(0,1fr\) min\(42vh,360px\)/);
+  assert.match(css, /grid-template-rows:minmax\(0,1fr\) var\(--sheet-peek-h\)/);
+  assert.doesNotMatch(css, /grid-template-rows:minmax\(0,1fr\) min\(42vh,360px\)/);
+  assert.match(css, /\.panel\{position:fixed/);
+  assert.match(css, /body\[data-lavish-sheet="half"\] \.panel\{height:var\(--sheet-half-h\);\}/);
+  assert.match(css, /body\[data-lavish-sheet="expanded"\] \.panel\{height:var\(--sheet-full-h\);\}/);
+  assert.match(
+    css,
+    /body\[data-lavish-sheet="collapsed"\] \.panel-scroll,\s*body\[data-lavish-sheet="collapsed"\] \.composer\{display:none;\}/,
+  );
+});
+
+// `100vh` on a phone is the LARGE viewport, so with the URL bar showing the layout is taller than
+// the screen and the composer sits below the fold - then it jumps when the bar auto-hides.
+test("chrome sizes itself with dynamic viewport units, not 100vh", async () => {
+  const css = await chromeCssSource();
+
+  assert.match(css, /\.layout\{height:calc\(100dvh - var\(--bar-h\)\)/);
+  assert.match(css, /max-height:calc\(100dvh - var\(--bar-h\)\)/);
+  // A dialog is sized off the SMALL viewport so it fits in every URL-bar state.
+  assert.match(css, /max-height:min\(760px,calc\(100svh - 32px\)\)/);
+  assert.doesNotMatch(css, /:calc\(100vh/);
+  assert.doesNotMatch(css, /:min\([^)]*100vh/);
+});
+
+// `position: fixed` is anchored to the layout viewport, which iOS does not shrink for the soft
+// keyboard - so without this the sheet, and the composer inside it, ends up under the keyboard.
+test("the mobile sheet lifts clear of the soft keyboard", async () => {
+  const css = await chromeCssSource();
+  const js = await chromeClientSource();
+
+  assert.match(css, /bottom:var\(--sheet-keyboard-inset,0px\)/);
+  assert.match(js, /window\.visualViewport/);
+  assert.match(js, /--sheet-keyboard-inset/);
+});
+
+test("chrome renders the conversation sheet handle", async () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+
+  assert.match(html, /<div class="panel-head" id="panelHead">/);
+  assert.match(html, /<span class="sheet-grip" aria-hidden="true"><\/span>/);
+  assert.match(html, /<span class="sheet-count" id="sheetCount" hidden><\/span>/);
+  assert.match(html, /id="sheetToggle" type="button" aria-controls="panel" aria-expanded="false"/);
+  assert.match(html, /aria-label="Expand conversation"/);
+  // The heading is still a real heading - the button carries the semantics, not a clickable <h2>.
+  assert.match(html, /<h2>Conversation<\/h2>/);
+});
+
+// On a phone, dragging the native selection handles never synthesizes a `mouseup`, so selecting
+// text produced NO annotation at all - the feedback the user believed they had attached never
+// existed, which reads from the outside exactly like "Send to Agent doesn't work".
+test("artifact SDK builds text annotations from touch selections, not only mouse ones", () => {
+  const js = createSdkJs("abc");
+
+  assert.match(js, /addEventListener\(\s*"pointerup"/);
+  assert.match(js, /addEventListener\("selectionchange"/);
+  // A gesture the browser takes over ends in pointercancel; without it the down-flag would latch.
+  assert.match(js, /addEventListener\(\s*"pointercancel"/);
+  // Keeping mouseup as well would open the card twice - pointerup fires before the compat event.
+  assert.doesNotMatch(js, /addEventListener\(\s*"mouseup"/);
+  // The selectionchange path must not reopen over a card the user is already typing into, and its
+  // shadow-DOM textarea can never be matched by a document-level closest().
+  assert.match(js, /annotationCardOpen\(\)/);
+  assert.match(js, /getRootNode/);
+});
+
+// A 44px target is about fingers, not screen width, so this keys off pointer type - and only hit
+// areas grow, so nothing moves on a mouse-driven desktop.
+test("chrome meets 44px touch targets on coarse pointers", async () => {
+  const css = await chromeCssSource();
+
+  assert.match(css, /@media \(pointer:coarse\)/);
+  assert.match(css, /\.more-button\{width:44px;height:44px;\}/);
+  assert.match(css, /min-height:44px/);
+  // Small round icon buttons keep their drawn size and grow an invisible hit area instead.
+  assert.match(css, /\.pill-close::after[^}]*inset:-13px/);
 });
 
 test("chrome top bar follows the design mock wordmark and overflow menu treatment", async () => {
@@ -543,9 +661,19 @@ test("copy DOM snapshot requests a fresh snapshot and copies it to the clipboard
 
   assert.match(js, /const snapshotRequests = \[\]/);
   assert.match(js, /requestSnapshot\("copy"\)/);
-  assert.match(js, /const snapshotAction = snapshotRequests\.shift\(\) \|\| "submit"/);
+  assert.match(js, /const snapshotAction = request \? request\.action : ""/);
   assert.match(js, /if \(snapshotAction === "copy"\)/);
   assert.match(js, /copyText\(msg\.snapshot \|\| ""\)/);
+});
+
+test("the snapshot handshake is bounded so a silent artifact cannot swallow a send", async () => {
+  const js = await chromeClientSource();
+
+  assert.match(js, /const SNAPSHOT_TIMEOUT_MS = 2_500/);
+  assert.match(js, /setTimeout\(\(\) => handleSnapshotTimeout\(request\), SNAPSHOT_TIMEOUT_MS\)/);
+  assert.match(js, /function handleSnapshotTimeout\(request\)/);
+  // A degraded send beats no send at all when the artifact's own JS threw before the SDK loaded.
+  assert.match(js, /pendingSnapshot = "";\n {2}showComposerNotice/);
 });
 
 test("clipboard copy falls back when navigator clipboard rejects", async () => {
@@ -592,7 +720,9 @@ test("chrome includes a chat-like prompt composer and agent reply listener", asy
   assert.match(css, /\.chat:empty::before\{/);
   assert.match(css, /Agent hasn't sent a message yet/);
   assert.match(html, /id="chatInput"/);
-  assert.match(js, /agent-reply/);
+  // Agent replies reach the browser inside the combined state event, not as a chat delta.
+  assert.match(js, /stream\.addEventListener\("state"/);
+  assert.match(js, /function applyServerState\(payload, generation\)/);
 });
 
 test("chrome bootstraps persisted chat history so missed replies still appear", () => {
@@ -615,14 +745,16 @@ test("chrome client renders persisted chat history", async () => {
 test("chrome can sync persisted chat after the event stream reconnects", async () => {
   const js = await chromeClientSource();
 
-  assert.match(js, /chat-sync/);
+  assert.match(js, /stream\.addEventListener\("state"/);
   assert.match(js, /function syncChat/);
+  // Reconnecting is itself the recovery: the server opens every connection with a whole state.
+  assert.match(js, /if \(Array\.isArray\(payload\.chat\)\) syncChat\(payload\.chat\)/);
 });
 
 test("chrome shows agent working state when a previous poll has released", async () => {
   const js = await chromeClientSource();
 
-  assert.match(js, /agent-presence/);
+  assert.match(js, /setAgentPresence\(String\(payload\.presence \|\| "waiting"\)\)/);
   assert.match(js, /Working\.\.\./);
   assert.match(js, /spinner/);
 });
@@ -632,9 +764,22 @@ test("chrome disables sending only while working or ended", async () => {
 
   assert.match(js, /let agentPresence = "waiting"/);
   assert.match(js, /function updateSendState\(\)/);
-  assert.match(js, /sendButton\.disabled = ended \|\| agentPresence === "working"/);
-  assert.match(js, /sendAndEndButton\.disabled = sendButton\.disabled/);
+  assert.match(js, /sendButton\.disabled = ended \|\| \(agentPresence === "working" && !presenceStalled\)/);
+  assert.match(js, /sendAndEndButton\.disabled = ended \|\| agentPresence === "working"/);
   assert.doesNotMatch(js, /hasContent/);
+});
+
+test("a working presence that never resolves unlocks the composer instead of latching it", async () => {
+  const js = await chromeClientSource();
+
+  assert.match(js, /const PRESENCE_STALL_MS = 45_000/);
+  assert.match(js, /presenceStallTimer = setTimeout\(handlePresenceStall, PRESENCE_STALL_MS\)/);
+  assert.match(js, /function handlePresenceStall\(\)/);
+  assert.match(js, /presenceStalled = true/);
+  // The spinner has to stop claiming work is happening.
+  assert.match(js, /function markWorkingBubbleStalled\(\)/);
+  assert.match(js, /No word from your agent for a while/);
+  assert.match(js, /resyncState\(\)\.catch/);
 });
 
 test("sending with an empty composer nudges instead of blocking", async () => {
@@ -657,7 +802,7 @@ test("composer offers two always-visible top-level send actions", async () => {
   assert.match(html, /class="button button-danger" id="sendAndEnd"[^<]*>.*Send &amp; End</);
   assert.match(
     html,
-    /<div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.<\/div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">.*<button class="button" id="send">Send to Agent<\/button><\/div>/,
+    /<div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.<\/div><div class="composer-error" id="submitError" role="alert" hidden>.*<\/div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">.*<button class="button" id="send">Send to Agent<\/button><\/div>/,
   );
   assert.doesNotMatch(html, /id="sendCaret"/);
   assert.doesNotMatch(html, /id="sendMenu"/);
@@ -1088,6 +1233,134 @@ test("layout warnings wake the same long-poll feedback channel as human prompts"
   }
 });
 
+test("reported layout warnings are appended to a durable log that survives delivery", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const logFile = path.join(dir, "layout-warnings.jsonl");
+    const postWarnings = (layoutWarnings) =>
+      fetch(`${base}/api/${key}/layout-warnings`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ layout_warnings: layoutWarnings }),
+      });
+    const loggedLines = async () =>
+      (await readFile(logFile, "utf8"))
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line));
+
+    const reported = await postWarnings([
+      { selector: "main > .card", kind: "element-horizontal-overflow", overflowPx: 32, viewportWidth: 640 },
+    ]);
+    assert.equal(reported.status, 200);
+
+    const logged = await loggedLines();
+    assert.equal(logged.length, 1);
+    assert.match(logged[0].at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.deepEqual(
+      { ...logged[0], at: "" },
+      {
+        at: "",
+        key,
+        file: await canonicalFile(artifact),
+        selector: "main > .card",
+        kind: "element-horizontal-overflow",
+        overflowPx: 32,
+        viewportWidth: 640,
+        severity: "error",
+        persistent: false,
+      },
+    );
+
+    // A resize storm re-reports the same finding with different measurements - the log stays quiet.
+    await postWarnings([
+      { selector: "main > .card", kind: "element-horizontal-overflow", overflowPx: 48, viewportWidth: 600 },
+    ]);
+    assert.equal((await loggedLines()).length, 1);
+
+    // Delivery clears the warning off the session, but the durable record stays behind.
+    const delivered = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then((res) =>
+      res.json(),
+    );
+    assert.equal(delivered.layout_warnings.length, 1);
+    const state = JSON.parse(await readFile(path.join(dir, "state.json"), "utf8"));
+    assert.deepEqual(state.sessions[key].layout_warnings, []);
+    assert.equal((await loggedLines()).length, 1);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a layout warning whose log write failed still reaches the log on the store's next unchanged report", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const logFile = path.join(dir, "layout-warnings.jsonl");
+  // A directory where the log file belongs: appends fail with EISDIR, and nothing else about the
+  // server is disturbed - state.json still records the warning exactly as it always would.
+  await mkdir(logFile);
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    log: () => {},
+  });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const warning = {
+      selector: "main > .card",
+      kind: "element-horizontal-overflow",
+      overflowPx: 32,
+      viewportWidth: 640,
+    };
+    const postWarning = () =>
+      fetch(`${base}/api/${key}/layout-warnings`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ layout_warnings: [warning] }),
+      });
+
+    // The store persists the warning; the log write fails. The report itself must still succeed.
+    assert.equal((await postWarning()).status, 200);
+    const persisted = JSON.parse(await readFile(path.join(dir, "state.json"), "utf8"));
+    assert.equal(persisted.sessions[key].layout_warnings.length, 1);
+
+    await rm(logFile, { recursive: true });
+
+    // The browser re-reports the identical warning. `recordLayoutWarnings` compares it against
+    // what it already stored and reports `changed: false` - the exact path that used to strand
+    // the finding, because the element stays broken and no later report presents it as new.
+    assert.equal((await postWarning()).status, 200);
+    const logged = (await readFile(logFile, "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert.equal(logged.length, 1);
+    assert.equal(logged[0].selector, "main > .card");
+    assert.equal(logged[0].overflowPx, 32);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("long-poll sends heartbeat bytes before feedback arrives", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
@@ -1313,8 +1586,15 @@ test("export inlines the Mermaid module + its chunk graph as offline data: modul
   // precedes the CONSUMING module script in document order (required for the browser to honor it).
   const maps = out.match(/<script type="importmap">/g) || [];
   assert.equal(maps.length, 1, "exactly one import map");
-  // The import map is the first child of <head> ...
-  assert.match(out, /<head\b[^>]*>\s*<script type="importmap">/, "import map is the first head child");
+  // The charset stays first and inside the browser's sniff window; the import map follows it.
+  const charset = /<meta\b[^>]*\bcharset\s*=[^>]*>/i.exec(out);
+  assert.ok(charset, "export contains a charset declaration");
+  assert.ok(Buffer.byteLength(out.slice(0, charset.index)) < 1024, "charset is inside the sniff window");
+  assert.match(
+    out,
+    /<head\b[^>]*>\s*<meta\b[^>]*\bcharset\s*=[^>]*>\s*<script type="importmap">/,
+    "import map follows the charset",
+  );
   // ... and its closing tag ends strictly before the real module script that references the bare id.
   const mapStart = out.indexOf('<script type="importmap">');
   const mapEnd = out.indexOf("</script>", mapStart) + "</script>".length;
@@ -2131,12 +2411,13 @@ test("SSE agent-presence reflects waiting, listening, and working transitions", 
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         let lines;
-        while ((lines = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m))) {
+        while ((lines = buffer.match(/^event: state\ndata: (.+)\n\n/m))) {
           const data = JSON.parse(lines[1]);
-          presenceEvents.push(data.state);
           buffer = buffer.replace(lines[0], "");
+          if (data.presence === presenceEvents[presenceEvents.length - 1]) continue;
+          presenceEvents.push(data.presence);
           const waiter = presenceWaiters.shift();
-          if (waiter) waiter(data.state);
+          if (waiter) waiter(data.presence);
         }
       }
     });
@@ -2205,8 +2486,8 @@ test("SSE handshake reports waiting on a fresh session that never had a poll", a
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      const match = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m);
-      if (match) state = JSON.parse(match[1]).state;
+      const match = buffer.match(/^event: state\ndata: (.+)\n\n/m);
+      if (match) state = JSON.parse(match[1]).presence;
     }
     controller.abort();
     assert.equal(state, "waiting");
@@ -2359,12 +2640,13 @@ test("SSE agent-presence switches to working when poll immediately takes queued 
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         let lines;
-        while ((lines = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m))) {
+        while ((lines = buffer.match(/^event: state\ndata: (.+)\n\n/m))) {
           const data = JSON.parse(lines[1]);
-          presenceEvents.push(data.state);
           buffer = buffer.replace(lines[0], "");
+          if (data.presence === presenceEvents[presenceEvents.length - 1]) continue;
+          presenceEvents.push(data.presence);
           const waiter = presenceWaiters.shift();
-          if (waiter) waiter(data.state);
+          if (waiter) waiter(data.presence);
         }
       }
     });
@@ -2493,6 +2775,420 @@ test("SSE agent-presence stays working when resuming an open session", async () 
     await server.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("the event stream sends reconnect hints and event ids", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const stream = await startRawEventStream(base, key);
+    try {
+      const seen = await stream.waitFor(/^id: 1\nevent: state\n/m);
+      assert.match(seen, /^retry: 2000\n\n/);
+      // Ids are a per-connection sequence for ordering only; there is no replay log behind them.
+      assert.match(seen, /^id: 1\nevent: state\n/m);
+      // Chat and presence arrive together under one revision. Splitting them across two events
+      // that shared a revision is what made a client accept the chat and drop the presence.
+      const initial = JSON.parse(/^event: state\ndata: (.+)$/m.exec(seen)[1]);
+      assert.ok("chat" in initial && "presence" in initial && "ended" in initial);
+      assert.doesNotMatch(seen, /event: chat-sync/);
+      assert.doesNotMatch(seen, /event: agent-presence/);
+    } finally {
+      await stream.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the event stream tells the browser when the session ends", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  const other = path.join(dir, "other.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  await writeFile(other, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    // A second live session keeps the server up once the first one ends.
+    await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: other }),
+    });
+    const stream = await startRawEventStream(base, key);
+    try {
+      await stream.waitFor(/event: state\n/);
+      await fetch(`${base}/api/end`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file: artifact }),
+      });
+      await stream.waitFor(/"ended":true/);
+    } finally {
+      await stream.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET /api/:key/state answers with authoritative chat, presence and status", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  const other = path.join(dir, "other.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  await writeFile(other, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    // A second live session keeps the server up after this one ends.
+    await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: other }),
+    });
+
+    assert.equal((await fetch(`${base}/api/missing-key/state`)).status, 404);
+
+    const waiting = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.equal(waiting.presence, "waiting");
+    assert.equal(waiting.ended, false);
+    assert.deepEqual(waiting.chat, []);
+
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompts: [{ prompt: "tighten the spacing", tag: "message" }] }),
+    });
+    await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
+    await fetch(`${base}/api/${key}/agent-reply`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "on it" }),
+    });
+
+    const working = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.equal(working.presence, "working");
+    assert.deepEqual(
+      working.chat.map((item) => [item.role, item.text]),
+      [
+        ["user", "tighten the spacing"],
+        ["agent", "on it"],
+      ],
+    );
+
+    await fetch(`${base}/api/${key}/end`, { method: "POST" });
+    const ended = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.equal(ended.ended, true);
+    assert.equal(ended.status, "ended");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SSE agent-presence leaves working once feedback is queued with nothing polling", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const presence = await startPresenceStream(base, key);
+    try {
+      assert.equal(await presence.next(), "waiting");
+
+      // The agent takes delivery and then never polls again - the latch that used to strand the
+      // page on "Working..." forever.
+      await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
+      });
+      await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
+      assert.equal(await presence.next(), "working");
+
+      // Feedback that lands with nothing polling has been delivered to nobody.
+      await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompts: [{ prompt: "still there?", tag: "message" }] }),
+      });
+      assert.equal(await presence.next(), "waiting");
+    } finally {
+      await presence.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("chrome surfaces a reconnecting indicator and a failed-send retry", async () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  const css = await chromeCssSource();
+  const js = await chromeClientSource();
+
+  assert.match(
+    html,
+    /<div class="connection-banner" id="connectionBanner" role="status" hidden>Reconnecting to Lavish/,
+  );
+  assert.match(html, /id="submitError" role="alert" hidden/);
+  assert.match(html, /id="submitRetry" type="button">Retry<\/button>/);
+  // The codebase has no global [hidden] rule, so display-setting blocks need explicit ones.
+  assert.match(css, /\.connection-banner\[hidden\]\{display:none;?\}/);
+  assert.match(css, /\.composer-error\[hidden\]\{display:none;?\}/);
+  assert.match(css, /\.bubble\.agent-working\.agent-stalled \.spinner\{display:none;?\}/);
+  assert.match(js, /function setConnectionBanner\(visible\)/);
+  assert.match(js, /function showSubmitError\(message, retry\)/);
+});
+
+test("chrome reconnects the event stream itself with capped jittered backoff", async () => {
+  const js = await chromeClientSource();
+
+  assert.match(js, /const SSE_RECONNECT_BASE_MS = 1_000/);
+  assert.match(js, /const SSE_RECONNECT_MAX_MS = 15_000/);
+  assert.match(js, /function connectEventStream\(\)/);
+  assert.match(js, /stream\.addEventListener\("error", \(\) => \{/);
+  assert.match(js, /Math\.min\(SSE_RECONNECT_MAX_MS, SSE_RECONNECT_BASE_MS \* 2 \*\* eventStreamAttempt\)/);
+  assert.match(js, /Math\.round\(capped \* \(0\.5 \+ Math\.random\(\) \* 0\.5\)\)/);
+  assert.match(js, /eventStream\.close\?\.\(\)/);
+  // Heartbeat watchdog: a half-open stream never fires `error`.
+  assert.match(js, /const SSE_HEARTBEAT_TIMEOUT_MS = 50_000/);
+  assert.match(js, /function noteEventStreamActivity\(\)/);
+  // Obsolete connections cannot touch state, which is what keeps a stale instance from ending
+  // the session or rolling presence back after a newer one has been accepted.
+  assert.match(js, /if \(generation !== eventStreamGeneration\) return;/);
+  assert.match(js, /fetch\("\/api\/" \+ key \+ "\/state"/);
+});
+
+test("state snapshots and stream events share one monotonic revision", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+
+    const before = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.equal(typeof before.revision, "number");
+
+    const stream = await startRawEventStream(base, key);
+    try {
+      await stream.waitFor(/event: state\n/);
+      await fetch(`${base}/api/${key}/agent-reply`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "on it" }),
+      });
+      const seen = await stream.waitFor(/on it/);
+      const pushes = [...seen.matchAll(/^event: state\ndata: (.+)$/gm)].map((match) => JSON.parse(match[1]));
+      const withReply = pushes.find((push) => push.chat.some((item) => item.text === "on it"));
+      const replyRevision = withReply.revision;
+      // Whole states, never chat deltas - that is what makes an overlapping snapshot idempotent.
+      assert.doesNotMatch(seen, /event: agent-reply/);
+      assert.ok(replyRevision > before.revision, `${replyRevision} should exceed ${before.revision}`);
+
+      // A snapshot taken after the reply reports at least that revision, so a client can order
+      // the two against each other rather than guessing which is fresher.
+      const after = await (await fetch(`${base}/api/${key}/state`)).json();
+      assert.ok(after.revision >= replyRevision, `${after.revision} should be at least ${replyRevision}`);
+      assert.deepEqual(
+        after.chat.map((item) => item.text),
+        ["on it"],
+      );
+    } finally {
+      await stream.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("queued feedback moves the revision even though it only wakes pollers", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const before = await (await fetch(`${base}/api/${key}/state`)).json();
+
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompts: [{ prompt: "tighten the spacing", tag: "message" }] }),
+    });
+
+    // The user message is new chat. If the revision stood still, a resync would deliver it under
+    // an already-applied revision and the client would drop it.
+    const after = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.ok(after.revision > before.revision, `${after.revision} should exceed ${before.revision}`);
+    assert.deepEqual(
+      after.chat.map((item) => item.text),
+      ["tighten the spacing"],
+    );
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("every state payload carries the opaque server boot id", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+
+    // Revisions restart at zero when the server does, so they only mean anything paired with the
+    // instance that issued them. The id is opaque on purpose: a timestamp could order two
+    // instances wrongly and make a legitimate replacement look stale forever.
+    const state = await (await fetch(`${base}/api/${key}/state`)).json();
+    assert.equal(typeof state.bootId, "string");
+    assert.ok(state.bootId.length >= 16);
+    assert.doesNotMatch(state.bootId, /^\d+$/);
+
+    const stream = await startRawEventStream(base, key);
+    try {
+      const seen = await stream.waitFor(/event: state\n/);
+      const pushed = JSON.parse(/^event: state\ndata: (.+)$/m.exec(seen)[1]);
+      assert.equal(pushed.bootId, state.bootId);
+      assert.equal(typeof pushed.revision, "number");
+    } finally {
+      await stream.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the event stream subscribes before it reads, so nothing falls in the gap", async () => {
+  const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
+  const route = source.slice(source.indexOf('app.get("/events/:key"'));
+  const body = route.slice(0, route.indexOf("\n  });"));
+
+  const subscribeAt = body.indexOf('events.on("session-state", onStateChanged)');
+  const cleanupAt = body.indexOf('req.on("close"');
+  const firstPushAt = body.indexOf("queueState(revisionOf(");
+  assert.ok(subscribeAt !== -1 && cleanupAt !== -1 && firstPushAt !== -1);
+  assert.ok(subscribeAt < firstPushAt, "listeners must be registered before the first read is kicked off");
+  assert.ok(cleanupAt < firstPushAt, "close cleanup must not sit behind the first read");
+  // Registration is entirely synchronous now: the only await lives inside the serialized pump, so
+  // there is no window between subscribing and reading for a change to fall into.
+  const registration = body.slice(0, firstPushAt).replace(/const pushState[\s\S]*?\n {6}\};/, "");
+  assert.doesNotMatch(registration, /\bawait\b/);
+});
+
+test("changes racing the first read still reach the browser", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+
+    // Open the stream and immediately fire changes without waiting for its first state, so they
+    // land while that first read is still in flight.
+    const stream = await startRawEventStream(base, key);
+    try {
+      for (const text of ["one", "two", "three"]) {
+        await fetch(`${base}/api/${key}/agent-reply`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+      }
+      const seen = await stream.waitFor(/three/);
+      const pushes = [...seen.matchAll(/^event: state\ndata: (.+)$/gm)].map((match) => JSON.parse(match[1]));
+      const latest = pushes[pushes.length - 1];
+      assert.deepEqual(
+        latest.chat.map((item) => item.text),
+        ["one", "two", "three"],
+      );
+      // Revisions never go backwards across pushes on one connection.
+      const revisions = pushes.map((push) => push.revision);
+      assert.deepEqual(
+        revisions,
+        [...revisions].sort((a, b) => a - b),
+      );
+    } finally {
+      await stream.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("state payloads are labelled before their content is read", async () => {
+  const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
+
+  // Both producers fix the revision first and read the store second. Content newer than its label
+  // is harmless - a later push supersedes it, and application is a full replace - whereas a label
+  // newer than its content would make the client skip the very change it describes.
+  assert.match(source, /const revision = revisionOf\(req\.params\.key\);\n\s+const state = await readSessionState\(/);
+  assert.match(source, /const revision = pendingRevision;\n\s+pendingRevision = null;/);
+  // The seqlock retry is gone: it narrowed the window without closing it, because the store
+  // mutation lands before its revision bump no matter how many times the read is repeated.
+  assert.doesNotMatch(source, /readSessionSnapshot/);
 });
 
 test("hasLiveReloadRootOptIn detects the data attribute and meta opt-in", () => {

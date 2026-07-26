@@ -72,7 +72,8 @@ test("home output teaches agents when and how to use Lavish Editor", () => {
   assert.equal("use_cases" in output, false);
   assert.equal("example_use_cases" in output, false);
   assert.equal("artifact_guidance" in output, false);
-  assert.ok(output.visual_guidance.length <= 5);
+  // Terse by design; the long-form responsive rules live in their own section, not as more bullets.
+  assert.ok(output.visual_guidance.length <= 6);
   assert.ok(output.visual_guidance.some((item) => item.includes("visual hierarchy")));
   assert.ok(
     output.visual_guidance.some((item) => /screenshot/i.test(item) && /embed/i.test(item) && /prose/i.test(item)),
@@ -83,6 +84,18 @@ test("home output teaches agents when and how to use Lavish Editor", () => {
   assert.ok(output.visual_guidance.some((item) => /nested grid\/flex/i.test(item)));
   assert.ok(output.visual_guidance.some((item) => /pixel or monospace fonts/i.test(item)));
   assert.ok(!output.visual_guidance.some((item) => item.includes("test narrow viewports")));
+  // The artifact does not get the browser window, and nothing in the guidance used to say so. State
+  // the arithmetic where an agent that reads exactly one layout line will hit it.
+  assert.ok(output.visual_guidance.some((item) => /NOT rendering into the full browser window/.test(item)));
+  assert.ok(output.visual_guidance.some((item) => /window width - 360px/.test(item)));
+  assert.ok(output.visual_guidance.some((item) => /100dvh - 108px/.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /mobile-first/i.test(item) && /360px/.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /grid-cols-1 md:grid-cols-3/.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /overflow-x-auto/.test(item) && /table/i.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /clamp\(\)/.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /useMaxWidth: false/.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /44x44/.test(item)));
+  assert.ok(output.responsive_layout.some((item) => /width=device-width/.test(item)));
   assert.ok(output.playbooks.some((item) => item.id === "diagram"));
   assert.equal(
     output.playbooks.find((item) => item.id === "input")?.use_when,
@@ -177,7 +190,7 @@ test("design output prints copy-pasteable local /design URLs so agents can opt i
   assert.equal(output.playbook_router.playbooks.length, 7);
   assert.equal(
     output.playbook_router.playbooks.find((playbook) => playbook.id === "diagram")?.use_when,
-    "Map relationships, flows, state, and architecture",
+    "Map relationships, messages, state, data models, timelines, hierarchy, or architecture",
   );
   assert.ok(output.design.summary.includes(DESIGN_PRIORITY_RULE), "design summary embeds the single-sourced rule");
   assert.match(output.design.summary, /does not auto-inject/);
@@ -190,13 +203,19 @@ test("design output prints copy-pasteable local /design URLs so agents can opt i
   assert.match(output.design.layout_safety_snippet, /min-width: 0/);
   assert.match(output.design.layout_safety_snippet, /overflow-wrap: anywhere/);
   assert.match(output.design.layout_safety_snippet, /max-width: 100%/);
-  assert.match(output.design.layout_safety_note, /Optional copy-paste CSS/);
-  assert.match(output.design.layout_safety_note, /never auto-injects/);
+  // This CSS is no longer optional boilerplate an agent has to remember to paste - that was the
+  // root cause of recurring overflow. The note must say so and must document the opt-out.
+  assert.match(output.design.layout_safety_note, /AUTO-INJECTS/);
+  assert.match(output.design.layout_safety_note, /data-lavish-layout-safety="off"/);
+  assert.match(output.design.layout_safety_note, /@layer lavish-safety/);
+  assert.doesNotMatch(output.design.layout_safety_note, /never auto-injects/);
+  assert.match(output.responsive_layout.artifact_viewport, /NOT rendering into the full browser window/);
+  assert.ok(output.responsive_layout.rules.length >= 5);
   assert.equal(output.design.cdn_urls.daisyui, "/design/daisyui.css");
   assert.equal(output.design.cdn_urls.daisyuiThemes, "/design/daisyui-themes.css");
   assert.equal(output.design.cdn_urls.tailwind, "/design/tailwindcss-browser.js");
   assert.match(output.design.other_design_systems, /different design system|other design system/i);
-  assert.match(output.diagram_tooling.use_when, /flows \/ architecture \/ state \/ sequence diagrams/);
+  assert.match(output.diagram_tooling.use_when, /maps content shapes to specific diagram types/);
   assert.match(output.diagram_tooling.use_when, /hand-built div\/flexbox boxes/);
   assert.match(output.diagram_tooling.mermaid_cdn_snippet, /\/design\/mermaid\.esm\.min\.mjs/);
   assert.match(output.diagram_tooling.mermaid_cdn_snippet, /mermaid\.initialize/);
@@ -275,6 +294,71 @@ test("diagram playbook names the hand-built flow anti-pattern", () => {
   assert.ok(output.playbook.pitfalls.some((item) => /hand-build boxes-and-arrows/i.test(item)));
   assert.ok(output.playbook.pitfalls.some((item) => /div\/flexbox/i.test(item)));
   assert.ok(output.playbook.pitfalls.some((item) => /does not auto-route edges/i.test(item)));
+});
+
+test("diagram playbook selects diagram types and rejects diagram-shaped prose", () => {
+  const playbook = createPlaybookOutput(["diagram"]).playbook;
+  const guidance = Object.values(playbook).flat().join("\n");
+
+  assert.match(guidance, /branching or converging paths -> flowchart/);
+  assert.match(guidance, /messages between actors over time -> sequenceDiagram/);
+  assert.match(guidance, /N options by M criteria -> a TABLE, never a diagram/);
+  assert.match(guidance, /hard ceiling of 20/);
+  assert.match(guidance, /NEVER put <br\/> in labels/);
+  assert.match(guidance, /catchup\.html is the cautionary case/);
+  assert.match(guidance, /accTitle and accDescr/);
+  assert.match(guidance, /useMaxWidth:false/);
+  assert.match(guidance, /max-width:none/);
+  assert.match(guidance, /look: handDrawn/);
+  assert.match(guidance, /layout/);
+  assert.match(guidance, /%%\{init\}%% directive/);
+  assert.match(guidance, /registers dagre and cose-bilkent, not ELK/);
+  assert.doesNotMatch(guidance, /"layout":"elk"/);
+  assert.match(guidance, /EDITABLE Excalidraw shapes/);
+  assert.match(guidance, /11\.13\.0\+ degrades conversion/);
+  assert.match(guidance, /input\["Input"\]/);
+  assert.match(guidance, /radar-beta\\n {2}accTitle:/);
+  assert.match(guidance, /treemap-beta\\n {2}accTitle:/);
+  assert.match(guidance, /architecture-beta\\n {2}accTitle:/);
+  assert.match(guidance, /C4Context\\n {2}accDescr:/);
+  assert.match(guidance, /kanban parses but drops them/);
+  for (const type of [
+    "sequence",
+    "state",
+    "ER",
+    "class",
+    "timeline",
+    "gantt",
+    "quadrant",
+    "mindmap",
+    "journey",
+    "sankey",
+    "kanban",
+    "radar",
+    "treemap",
+    "block",
+    "architecture",
+    "C4",
+  ]) {
+    assert.match(guidance, new RegExp(`${type} —`));
+  }
+});
+
+test("Mermaid reaches only the known Node DOM boundary after parsing the block syntax example", async () => {
+  const playbook = createPlaybookOutput(["diagram"]).playbook;
+  const entry = playbook.syntax_examples.find((item) => item.startsWith("block —"));
+  const source = entry.match(/`([\s\S]*?)`/)?.[1].replaceAll("\\n", "\n");
+  assert.ok(source, "block example has an extractable Mermaid source");
+
+  const mermaid = (await import("mermaid")).default;
+  await assert.rejects(mermaid.parse(source), (error) => {
+    const message = String(error);
+    assert.doesNotMatch(message, /Lexical error|Parse error/);
+    assert.match(message, /DOMPurify\.addHook is not a function/);
+    return true;
+  });
+  const formerlyBroken = source.replaceAll('["Input"]', "[Input]").replaceAll('["Transform"]', "[Transform]");
+  await assert.rejects(mermaid.parse(formerlyBroken), /Lexical error/);
 });
 
 test("diagram playbook tells agents to keep Mermaid theming in sync with the page theme", () => {

@@ -53,6 +53,13 @@ const layoutGateCopy = /** @type {HTMLParagraphElement} */ (document.getElementB
 const layoutGateAction = /** @type {HTMLButtonElement} */ (document.getElementById("layoutGateAction"));
 const layoutIssueBanner = /** @type {HTMLDivElement} */ (document.getElementById("layoutIssueBanner"));
 const sendHint = /** @type {HTMLDivElement} */ (document.getElementById("sendHint"));
+const panelHead = /** @type {HTMLDivElement} */ (document.getElementById("panelHead"));
+const sheetToggle = /** @type {HTMLButtonElement} */ (document.getElementById("sheetToggle"));
+const sheetCount = /** @type {HTMLSpanElement} */ (document.getElementById("sheetCount"));
+const connectionBanner = /** @type {HTMLDivElement} */ (document.getElementById("connectionBanner"));
+const submitError = /** @type {HTMLDivElement} */ (document.getElementById("submitError"));
+const submitErrorText = /** @type {HTMLSpanElement} */ (document.getElementById("submitErrorText"));
+const submitRetryButton = /** @type {HTMLButtonElement} */ (document.getElementById("submitRetry"));
 const whiteboardOverlay = /** @type {HTMLDivElement} */ (document.getElementById("whiteboardOverlay"));
 const whiteboardFrame = /** @type {HTMLIFrameElement} */ (document.getElementById("whiteboardFrame"));
 const whiteboardCloseButton = /** @type {HTMLButtonElement} */ (document.getElementById("whiteboardClose"));
@@ -77,6 +84,7 @@ let layoutGateCycle = 0;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let layoutGateTimer;
 const snapshotRequests = [];
+let snapshotRequestSeq = 0;
 let endAfterSubmit = false;
 let workingBubble = null;
 let submitQueuedPromise = null;
@@ -86,6 +94,73 @@ let lastScroll = { x: 0, y: 0 };
 let copyHintTimer;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendHintTimer;
+
+const DEFAULT_SEND_HINT_TEXT = "Write a message or annotate an element first.";
+// The artifact answers snapshot requests over postMessage. If its own JS threw before the SDK
+// registered that listener the answer never arrives, so every request is bounded and falls back to
+// sending without a snapshot instead of leaving the click with no effect at all.
+const SNAPSHOT_TIMEOUT_MS = 2_500;
+// How long an unchanged "working" presence is trusted before the composer unlocks itself. The
+// server latches presence at "working" as soon as an agent takes delivery and stops polling, and
+// that latch outlives a page reload, so the escape hatch has to live here.
+const PRESENCE_STALL_MS = 45_000;
+const SSE_RECONNECT_BASE_MS = 1_000;
+const SSE_RECONNECT_MAX_MS = 15_000;
+// The server heartbeats every 15s. Missing three in a row means the stream is dead even when
+// EventSource never fired an error, which is exactly how a half-open proxied connection behaves.
+const SSE_HEARTBEAT_TIMEOUT_MS = 50_000;
+// A stream that opens with HTTP 200 and is dropped immediately would otherwise reset the backoff
+// on every `open`, pinning every retry to the first-attempt window. The backoff only resets once
+// the connection has proven itself: a heartbeat received, or this long without failing.
+const SSE_HEALTHY_AFTER_MS = 20_000;
+
+/** @type {EventSource | null} */
+let eventStream = null;
+let eventStreamConnected = false;
+// Bumped for every connection attempt. Anything that arrives tagged with an older generation -
+// a stream we have already replaced, or a /state response from a server that has since restarted -
+// is stale by construction and must not touch state.
+let eventStreamGeneration = 0;
+let eventStreamAttempt = 0;
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let eventStreamReconnectTimer;
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let eventStreamWatchdogTimer;
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let eventStreamHealthyTimer;
+/** @type {Promise<void> | null} */
+let resyncPromise = null;
+// Highest server revision whose state has been applied, and the server instance it belongs to.
+// Revisions live in the server's memory and restart at zero, so they only mean anything paired
+// with the boot id that issued them.
+let appliedStateRevision = -1;
+let appliedStateBootId = "";
+let presenceStalled = false;
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let presenceStallTimer;
+let pendingComposerPrompt = null;
+let pendingComposerText = "";
+let pendingUserBubble = null;
+let lastSendEndAfter = false;
+/** @type {(() => void) | null} */
+let submitRetryAction = null;
+
+// ---------------------------------------------------------------------------
+// Mobile conversation sheet.
+//
+// Below the chrome's narrow breakpoint the Conversation panel is a bottom sheet instead of a
+// permanently open row: chrome.css sizes it from `data-lavish-sheet` on <body>, this owns the
+// state. It starts collapsed so the artifact gets the screen, and opens itself whenever there is
+// something in it worth reading - the reviewer should never have to discover that the agent replied.
+// Every entry point is a no-op on desktop, where the panel is a plain always-visible column.
+// ---------------------------------------------------------------------------
+const SHEET_BREAKPOINT_QUERY = "(max-width: 860px)";
+const SHEET_STATES = ["collapsed", "half", "expanded"];
+// Below this a header drag is a tap, not a swipe - fingers are never perfectly still.
+const SHEET_SWIPE_THRESHOLD_PX = 24;
+const mobileSheetQuery = typeof window.matchMedia === "function" ? window.matchMedia(SHEET_BREAKPOINT_QUERY) : null;
+let sheetState = "collapsed";
+let sheetDragStartY = null;
 
 function escapeHtml(value) {
   return String(value).replace(
@@ -123,50 +198,215 @@ function persistQueuedPrompts() {
 }
 
 function render() {
-  annotationPills.innerHTML = queued
-    .map(
-      (prompt, index) =>
-        '<div class="pill-wrap"><div class="pill"><span class="pill-preview">' +
-        escapeHtml(prompt.prompt) +
-        '</span><button class="pill-close" type="button" aria-label="Remove queued prompt" data-index="' +
-        index +
-        '"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><div class="pill-tooltip">' +
-        (prompt.selector
-          ? '<div class="tooltip-label">Target</div><div class="pill-tooltip-target">' +
-            escapeHtml(prompt.selector) +
-            "</div>"
-          : "") +
-        '<div class="tooltip-label">Prompt</div><div class="pill-tooltip-prompt">' +
-        escapeHtml(prompt.prompt) +
-        "</div></div></div>",
-    )
-    .join("");
+  annotationPills.innerHTML = queued.map(renderQueuedPill).join("");
 
   for (const button of annotationPills.querySelectorAll(".pill-close")) {
     const closeButton = /** @type {HTMLButtonElement} */ (button);
     closeButton.addEventListener("click", (event) => removeQueuedPrompt(Number(closeButton.dataset.index), event));
   }
   updateSendState();
+  updateSheetCount();
   scrollPanelToBottom();
 }
 
-function updateSendState() {
-  sendButton.disabled = ended || agentPresence === "working";
-  sendAndEndButton.disabled = sendButton.disabled;
+// Keeps the pill index aligned with `queued` even for entries that render as nothing.
+function renderQueuedPill(prompt, index) {
+  // The freeform message behind an in-flight send still sits in the composer until the POST
+  // succeeds, so rendering it as a pill too would show the same text three times over.
+  if (prompt === pendingComposerPrompt) return "";
+  return (
+    '<div class="pill-wrap"><div class="pill"><span class="pill-preview">' +
+    escapeHtml(prompt.prompt) +
+    '</span><button class="pill-close" type="button" aria-label="Remove queued prompt" data-index="' +
+    index +
+    '"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><div class="pill-tooltip">' +
+    (prompt.selector
+      ? '<div class="tooltip-label">Target</div><div class="pill-tooltip-target">' +
+        escapeHtml(prompt.selector) +
+        "</div>"
+      : "") +
+    '<div class="tooltip-label">Prompt</div><div class="pill-tooltip-prompt">' +
+    escapeHtml(prompt.prompt) +
+    "</div></div></div>"
+  );
 }
 
-function showSendHint() {
+function updateSendState() {
+  // `presenceStalled` is the escape hatch: server presence can stay latched at "working" forever
+  // once an agent takes delivery and never polls again, and that must not mute the composer.
+  sendButton.disabled = ended || (agentPresence === "working" && !presenceStalled);
+  // Send & End is deliberately not unlocked by the stall. Ordinary Send is safe either way - the
+  // feedback stays queued and the server drops presence to waiting once nothing is polling - but
+  // ending would tear down a session underneath an agent that really is still working. It comes
+  // back as soon as the server itself says the agent is gone.
+  sendAndEndButton.disabled = ended || agentPresence === "working";
+}
+
+function setSendHint(text) {
+  sendHint.textContent = text;
   sendHint.hidden = false;
   clearTimeout(sendHintTimer);
   sendHintTimer = setTimeout(() => {
     sendHint.hidden = true;
   }, 2600);
+}
+
+function showSendHint() {
+  setSendHint(DEFAULT_SEND_HINT_TEXT);
   chatInput.focus();
+}
+
+// Transient notice in the composer for a degraded-but-completed action, as opposed to the
+// failure box, which sticks around and offers a retry.
+function showComposerNotice(message) {
+  setSendHint(message);
+}
+
+function showSubmitError(message, retry) {
+  submitErrorText.textContent = message;
+  submitRetryButton.hidden = !retry;
+  submitRetryAction = retry || null;
+  submitError.hidden = false;
+}
+
+function hideSubmitError() {
+  submitError.hidden = true;
+  submitRetryAction = null;
+}
+
+function setConnectionBanner(visible) {
+  connectionBanner.hidden = !visible || ended;
+}
+
+// Applies a whole server state - chat, presence and ended together - if it is newer than what is
+// already on screen. They move as one because applying them separately is what let the initial
+// presence be dropped behind the chat that shared its revision.
+function applyServerState(payload, generation) {
+  if (!payload || typeof payload !== "object") return false;
+  // Never trust a connection we have already given up on. This is what keeps a stale instance from
+  // ending the session, or rolling presence back, after a newer one has been accepted.
+  if (generation !== eventStreamGeneration) return false;
+
+  const bootId = typeof payload.bootId === "string" ? payload.bootId : "";
+  if (bootId && bootId !== appliedStateBootId) {
+    // Boot ids are compared for identity, never for order - a different server is simply a
+    // different server, and its revision counter starts fresh, so the watermark re-bases. Ordering
+    // them would mean a replacement could be judged "older" and ignored forever.
+    appliedStateBootId = bootId;
+    appliedStateRevision = -1;
+  }
+
+  const revision = Number(payload.revision);
+  if (Number.isFinite(revision)) {
+    if (revision <= appliedStateRevision) return false;
+    appliedStateRevision = revision;
+  }
+
+  // Chat is optional: a degraded push from a server whose store is unreadable still carries
+  // trustworthy in-memory presence, and must leave the conversation alone rather than blank it.
+  const agentMessagesBefore = renderedAgentMessageCount();
+  if (Array.isArray(payload.chat)) syncChat(payload.chat);
+
+  // What "an agent reply landed" means now that there is no agent-reply delta: the state we have
+  // just ACCEPTED shows the reviewer an agent message they did not have before. Everything above
+  // this line is the gate - a payload from a connection generation we have replaced, or one that
+  // loses the revision comparison, has already returned false - so a stale or superseded payload
+  // can never raise the sheet. Keep this call below the gate: raising first and validating after
+  // would let a dead server's leftover push pop the sheet open over a live session.
+  //
+  // Measured against the rendered log rather than against the payload, so every route into the
+  // conversation counts as "already seen": the chat rendered at page load, an earlier accepted
+  // state, and the /state re-check all leave their messages on screen. A whole-state push that
+  // merely repeats what is already there therefore does not re-open a sheet the reviewer collapsed,
+  // which is what makes idempotent re-application safe for the sheet as well as for the bubbles.
+  if (renderedAgentMessageCount() > agentMessagesBefore) openSheetAtLeast("half");
+
+  setAgentPresence(String(payload.presence || "waiting"));
+  // Applied last, and after the sheet: a final reply that shares its state with the ending is still
+  // a reply worth showing, and openSheetAtLeast is deliberately inert once `ended` is set.
+  if (payload.ended) markSessionEnded();
+  return true;
 }
 
 function hideSendHint() {
   clearTimeout(sendHintTimer);
   sendHint.hidden = true;
+}
+
+function isMobileSheet() {
+  return Boolean(mobileSheetQuery && mobileSheetQuery.matches);
+}
+
+function setSheetState(next) {
+  sheetState = SHEET_STATES.includes(next) ? next : "collapsed";
+  document.body.dataset.lavishSheet = sheetState;
+  const expanded = sheetState !== "collapsed";
+  sheetToggle.setAttribute("aria-expanded", String(expanded));
+  sheetToggle.setAttribute("aria-label", expanded ? "Collapse conversation" : "Expand conversation");
+}
+
+// Auto-OPEN only, never auto-close. A collapse is a decision the reviewer made about their own
+// screen and nothing here may undo it; a message they have not seen yet, on the other hand, must
+// not sit silently behind a 52px handle.
+function openSheetAtLeast(state) {
+  if (!isMobileSheet() || ended) return;
+  if (SHEET_STATES.indexOf(sheetState) >= SHEET_STATES.indexOf(state)) return;
+  setSheetState(state);
+}
+
+function cycleSheetState() {
+  setSheetState(SHEET_STATES[(SHEET_STATES.indexOf(sheetState) + 1) % SHEET_STATES.length]);
+}
+
+function stepSheetState(direction) {
+  const index = SHEET_STATES.indexOf(sheetState) + direction;
+  if (index < 0 || index >= SHEET_STATES.length) return;
+  setSheetState(SHEET_STATES[index]);
+}
+
+// Queued annotations live inside the sheet, so a collapsed sheet has to carry the count or feedback
+// piles up somewhere the reviewer cannot see it.
+function updateSheetCount() {
+  sheetCount.textContent = String(queued.length);
+  sheetCount.hidden = queued.length === 0;
+}
+
+// A drag on the handle steps one state per swipe; anything shorter than the threshold was a tap,
+// which cycles. The toggle button is excluded so its own click handler stays the single driver
+// there - otherwise a tap on it would both step and cycle.
+function handleSheetPointerDown(event) {
+  // Cleared on every press, not only presses on the handle: a drag that ends inside the artifact
+  // iframe never delivers its pointerup to the chrome, and a start point left over from it would
+  // be read as a swipe by whatever release comes next.
+  sheetDragStartY = null;
+  if (!isMobileSheet() || event.button) return;
+  const target = /** @type {Node} */ (event.target);
+  if (!panelHead.contains(target) || sheetToggle.contains(target)) return;
+  sheetDragStartY = Number(event.clientY) || 0;
+}
+
+function handleSheetPointerUp(event) {
+  if (sheetDragStartY === null) return;
+  const travel = sheetDragStartY - (Number(event.clientY) || 0);
+  sheetDragStartY = null;
+  if (!isMobileSheet()) return;
+  if (Math.abs(travel) < SHEET_SWIPE_THRESHOLD_PX) cycleSheetState();
+  else stepSheetState(travel > 0 ? 1 : -1);
+}
+
+// `position: fixed` is anchored to the LAYOUT viewport, which iOS does not shrink when the soft
+// keyboard opens - so the sheet, and with it the composer the user is typing into, ends up beneath
+// the keyboard. visualViewport is the only surface that reports the keyboard at all. Reading it
+// only while the composer has focus keeps a pinch-zoom (which also shrinks the visual viewport)
+// from shoving the sheet around.
+function syncKeyboardInset() {
+  const viewport = window.visualViewport;
+  if (!viewport || typeof document.body.style?.setProperty !== "function") return;
+  const inset =
+    document.activeElement === chatInput
+      ? Math.max(0, Math.round(window.innerHeight - viewport.height - viewport.offsetTop))
+      : 0;
+  document.body.style.setProperty("--sheet-keyboard-inset", `${inset}px`);
 }
 
 function setMenuOpen(button, menu, open) {
@@ -222,6 +462,12 @@ function syncChat(chat) {
 
   let lastChatBubble = null;
   for (const item of chat) lastChatBubble = addChat(item.role, item.text, false) || lastChatBubble;
+  // The optimistic bubble for an in-flight send is not in the server's chat yet. Re-append it so a
+  // sync landing mid-submit does not make the user's own message vanish before it is even sent.
+  if (pendingUserBubble) {
+    chatLog.appendChild(pendingUserBubble);
+    lastChatBubble = pendingUserBubble;
+  }
   if (workingBubble) {
     chatLog.appendChild(workingBubble);
     scrollElementIntoView(workingBubble);
@@ -230,8 +476,24 @@ function syncChat(chat) {
   }
 }
 
+// How many agent messages the reviewer can actually see. The transient "Working..." bubble is not
+// one of them, and neither is an agent entry with no text, which addChat declines to render.
+function renderedAgentMessageCount() {
+  return chatLog.querySelectorAll(".bubble.agent:not(.agent-working)").length;
+}
+
 function setAgentPresence(state) {
-  agentPresence = state === "listening" || state === "working" ? state : "waiting";
+  const next = state === "listening" || state === "working" ? state : "waiting";
+  const changed = next !== agentPresence;
+  agentPresence = next;
+
+  if (agentPresence !== "working") {
+    clearPresenceStall();
+  } else if (changed) {
+    // A fresh transition into "working" is real news from the server, so trust it again.
+    armPresenceStall();
+  }
+
   updateSendState();
   if (presenceBanner) presenceBanner.hidden = ended || agentPresence !== "waiting";
 
@@ -246,8 +508,42 @@ function setAgentPresence(state) {
     workingBubble.className = "bubble agent agent-working";
     workingBubble.innerHTML = '<span class="spinner"></span><span>Working...</span>';
     chatLog.appendChild(workingBubble);
+    if (presenceStalled) markWorkingBubbleStalled();
   }
   scrollElementIntoView(workingBubble);
+}
+
+function armPresenceStall() {
+  clearTimeout(presenceStallTimer);
+  presenceStalled = false;
+  presenceStallTimer = setTimeout(handlePresenceStall, PRESENCE_STALL_MS);
+}
+
+function clearPresenceStall() {
+  clearTimeout(presenceStallTimer);
+  presenceStallTimer = undefined;
+  presenceStalled = false;
+}
+
+function handlePresenceStall() {
+  presenceStallTimer = undefined;
+  if (ended || agentPresence !== "working") return;
+  presenceStalled = true;
+  markWorkingBubbleStalled();
+  updateSendState();
+  // Ask the server before settling on the pessimistic story - the stall may just be a stream that
+  // dropped the presence event that would have cleared it.
+  resyncState().catch(() => {});
+}
+
+// A stalled agent must never keep showing the same spinner as a working one.
+function markWorkingBubbleStalled() {
+  if (!workingBubble) return;
+  workingBubble.classList.add("agent-stalled");
+  // Kept short on purpose: the phone panel gives the chat only a few lines, and an explanation
+  // that scrolls out of view explains nothing.
+  workingBubble.innerHTML =
+    '<span class="spinner"></span><span>No word from your agent for a while. You can send again - nothing is lost.</span>';
 }
 
 function scrollPanelToBottom() {
@@ -286,6 +582,8 @@ function enqueuePrompt(prompt) {
 
   persistQueuedPrompts();
   render();
+  // The reviewer just queued feedback from the artifact; Send to Agent lives in the sheet.
+  openSheetAtLeast("half");
 }
 
 function stripInternalPromptFields(prompt) {
@@ -300,20 +598,59 @@ function postToFrame(message) {
 }
 
 function requestSnapshot(action) {
-  snapshotRequests.push(action);
-  postToFrame({ type: "lavish:requestSnapshot" });
+  snapshotRequestSeq += 1;
+  const request = { id: "lavish-snapshot-" + snapshotRequestSeq, action, settled: false, timer: undefined };
+  request.timer = setTimeout(() => handleSnapshotTimeout(request), SNAPSHOT_TIMEOUT_MS);
+  snapshotRequests.push(request);
+  postToFrame({ type: "lavish:requestSnapshot", requestId: request.id });
+}
+
+// Resolved strictly by id. Matching positionally would let a late answer to a request that already
+// timed out satisfy the next one, submitting it with a stale DOM snapshot - or under the wrong
+// action entirely, since a copy and a send look identical once the queue has shifted.
+function takeSnapshotRequest(requestId) {
+  const index = snapshotRequests.findIndex((request) => request.id === requestId);
+  if (index === -1) return null;
+  const [request] = snapshotRequests.splice(index, 1);
+  request.settled = true;
+  clearTimeout(request.timer);
+  return request;
+}
+
+function handleSnapshotTimeout(request) {
+  if (request.settled) return;
+  request.settled = true;
+  const index = snapshotRequests.indexOf(request);
+  if (index !== -1) snapshotRequests.splice(index, 1);
+
+  if (request.action === "copy") {
+    showComposerNotice("The artifact did not answer with a DOM snapshot. Reload the artifact and try again.");
+    return;
+  }
+  // Degraded send: the agent gets the feedback without a DOM snapshot, which beats a Send button
+  // that silently does nothing because the artifact's own JS threw before the SDK loaded.
+  pendingSnapshot = "";
+  showComposerNotice("The artifact did not respond, so this was sent without a page snapshot.");
+  submitQueued().catch(() => {});
 }
 
 function sendQueued(endAfter) {
-  if (ended || agentPresence === "working") return;
+  if (ended) return;
+  // Same asymmetry as updateSendState, for the paths that bypass the buttons.
+  if (agentPresence === "working" && (endAfter || !presenceStalled)) return;
   closeMenus();
+  hideSubmitError();
 
-  const text = chatInput.value.trim();
+  // While a composer send is already in flight its text stays in the box, so re-reading it here
+  // would queue the same message twice.
+  const text = pendingComposerPrompt ? "" : chatInput.value.trim();
   if (text) {
-    queued.push({ uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" });
+    pendingComposerText = text;
+    pendingComposerPrompt = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" };
+    queued.push(pendingComposerPrompt);
     persistQueuedPrompts();
-    addChat("user", text);
-    chatInput.value = "";
+    pendingUserBubble = addChat("user", text) || null;
+    if (pendingUserBubble) pendingUserBubble.classList.add("pending");
     render();
   }
   if (!queued.length) {
@@ -322,8 +659,45 @@ function sendQueued(endAfter) {
   }
   hideSendHint();
 
+  lastSendEndAfter = Boolean(endAfter);
   if (endAfter) endAfterSubmit = true;
   requestSnapshot("submit");
+}
+
+// The composer only loses the user's text once the server has it.
+function commitPendingComposer() {
+  if (!pendingComposerPrompt) return;
+  if (chatInput.value.trim() === pendingComposerText) chatInput.value = "";
+  if (pendingUserBubble) pendingUserBubble.classList.remove("pending");
+  pendingComposerPrompt = null;
+  pendingComposerText = "";
+  pendingUserBubble = null;
+}
+
+// ...and gets it back, along with its bubble, if the send failed.
+function rollbackPendingComposer() {
+  if (pendingComposerPrompt) {
+    const index = queued.indexOf(pendingComposerPrompt);
+    if (index !== -1) queued.splice(index, 1);
+    persistQueuedPrompts();
+  }
+  if (pendingUserBubble) pendingUserBubble.remove();
+  if (pendingComposerText && !chatInput.value.trim()) chatInput.value = pendingComposerText;
+  pendingComposerPrompt = null;
+  pendingComposerText = "";
+  pendingUserBubble = null;
+  render();
+}
+
+function handleSubmitFailure() {
+  rollbackPendingComposer();
+  showSubmitError("Could not reach Lavish, so nothing was sent.", () => sendQueued(lastSendEndAfter));
+}
+
+function handleEndSessionFailure() {
+  showSubmitError("Could not reach Lavish to end this session.", () => {
+    endSession().catch(handleEndSessionFailure);
+  });
 }
 
 async function submitQueued() {
@@ -344,12 +718,13 @@ async function submitQueued() {
     submitQueuedAgain = false;
     if (!succeeded) {
       endAfterSubmit = false;
+      handleSubmitFailure();
     } else if (!ended && shouldSubmitAgain) {
       if (queued.length) {
-        submitQueued();
+        submitQueued().catch(() => {});
       } else if (endAfterSubmit) {
         endAfterSubmit = false;
-        endSession();
+        endSession().catch(handleEndSessionFailure);
       }
     }
   }
@@ -371,6 +746,8 @@ async function submitQueuedOnce() {
     if (index !== -1) queued.splice(index, 1);
   }
   persistQueuedPrompts();
+  commitPendingComposer();
+  hideSubmitError();
   render();
   if (shouldEndSession) {
     endAfterSubmit = false;
@@ -506,6 +883,10 @@ async function endSession() {
 function markSessionEnded() {
   if (ended) return;
   ended = true;
+  clearPresenceStall();
+  hideSubmitError();
+  stopEventStream();
+  setConnectionBanner(false);
   closeMenus();
   closeWhiteboard();
   annotationSwitch.disabled = true;
@@ -1189,12 +1570,15 @@ window.addEventListener("message", (event) => {
     enqueuePrompt(msg.prompt);
   }
   if (msg.type === "lavish:snapshot") {
-    const snapshotAction = snapshotRequests.shift() || "submit";
+    const request = takeSnapshotRequest(msg.requestId);
+    // A snapshot whose request already timed out no longer matches any id, and acting on it would
+    // submit the queue a second time - or hand the next request someone else's stale DOM.
+    const snapshotAction = request ? request.action : "";
     if (snapshotAction === "copy") {
       copyText(msg.snapshot || "");
-    } else {
+    } else if (snapshotAction === "submit") {
       pendingSnapshot = msg.snapshot || "";
-      submitQueued();
+      submitQueued().catch(() => {});
     }
   }
   if (msg.type === "lavish:scroll") {
@@ -1205,7 +1589,7 @@ window.addEventListener("message", (event) => {
     submitLayoutWarnings(msg.layout_warnings).catch(() => {});
   }
   if (msg.type === "lavish:sendQueuedPrompts") sendQueued();
-  if (msg.type === "lavish:endSession") endSession();
+  if (msg.type === "lavish:endSession") endSession().catch(handleEndSessionFailure);
   if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();
 });
 
@@ -1230,6 +1614,18 @@ chatInput.addEventListener("keydown", (event) => {
   }
 });
 chatInput.addEventListener("input", hideSendHint);
+chatInput.addEventListener("focus", () => {
+  openSheetAtLeast("half");
+  syncKeyboardInset();
+});
+chatInput.addEventListener("blur", syncKeyboardInset);
+sheetToggle.onclick = cycleSheetState;
+// Capture phase, on the document rather than the handle, so the start point is reset by every
+// press before the handle gets a chance to record a new one.
+document.addEventListener("pointerdown", handleSheetPointerDown, true);
+document.addEventListener("pointerup", handleSheetPointerUp);
+window.visualViewport?.addEventListener("resize", syncKeyboardInset);
+window.visualViewport?.addEventListener("scroll", syncKeyboardInset);
 copyPathButton.onclick = copyFilePath;
 reloadArtifactButton.onclick = reloadArtifact;
 copySnapshotButton.onclick = copyDomSnapshot;
@@ -1245,7 +1641,12 @@ copyShareUrlButton.onclick = () => copyToButton(shareUrlInput.value, copyShareUr
 copyUpdateKeyButton.onclick = () => copyToButton(shareUpdateKeyInput.value, copyUpdateKeyButton, "Copy key");
 endButton.onclick = () => {
   closeMenus();
-  endSession();
+  endSession().catch(handleEndSessionFailure);
+};
+submitRetryButton.onclick = () => {
+  const retry = submitRetryAction;
+  hideSubmitError();
+  if (retry) retry();
 };
 document.addEventListener("mousedown", (event) => {
   const target = /** @type {Node} */ (event.target);
@@ -1258,6 +1659,9 @@ document.addEventListener("keydown", (event) => {
       closeWhiteboard();
     } else if (!shareDialog.hidden) {
       closeShareDialog();
+    } else if (moreMenu.hidden && isMobileSheet() && sheetState !== "collapsed") {
+      // Innermost thing first: an open menu still outranks the sheet it is sitting over.
+      setSheetState("collapsed");
     } else {
       closeMenus();
     }
@@ -1286,17 +1690,145 @@ frame.addEventListener("load", () => {
 
 initializeLayoutGate();
 
-const events = new EventSource("/events/" + key);
-events.addEventListener("reload", () => {
-  resetFrame().then((reloaded) => {
-    if (reloaded) refreshWhiteboardSource();
-  });
-});
-events.addEventListener("chrome-reload", () => reloadAfterServerRestart());
-events.addEventListener("agent-reply", (event) => addChat("agent", JSON.parse(event.data).text));
-events.addEventListener("chat-sync", (event) => syncChat(JSON.parse(event.data).chat || []));
-events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse(event.data).state));
+// The browser's own EventSource retry cannot be relied on here. Through `tailscale serve` a dead
+// backend answers 502, and the WHATWG processing model fails a stream on any non-200 permanently -
+// no reconnect, ever. The only recovery path Lavish had (the chrome-reload event) rode that same
+// dead stream, so an outage left the page silently deaf until someone reloaded it by hand.
+function connectEventStream() {
+  clearTimeout(eventStreamReconnectTimer);
+  eventStreamReconnectTimer = undefined;
+  if (ended) return;
 
+  closeEventStream();
+  eventStreamGeneration += 1;
+  const generation = eventStreamGeneration;
+  const stream = new EventSource("/events/" + key);
+  eventStream = stream;
+
+  stream.addEventListener("open", () => {
+    if (generation !== eventStreamGeneration) return;
+    eventStreamConnected = true;
+    clearTimeout(eventStreamHealthyTimer);
+    eventStreamHealthyTimer = setTimeout(markEventStreamHealthy, SSE_HEALTHY_AFTER_MS);
+    setConnectionBanner(false);
+    noteEventStreamActivity();
+    // No separate resync is needed: the server opens every connection by pushing the whole state,
+    // so reconnecting is itself the recovery.
+  });
+  stream.addEventListener("error", () => {
+    if (generation !== eventStreamGeneration) return;
+    handleEventStreamFailure();
+  });
+  stream.addEventListener("heartbeat", () => {
+    // A heartbeat is proof the server is really talking to us, not just accepting sockets.
+    markEventStreamHealthy();
+    noteEventStreamActivity();
+  });
+  stream.addEventListener("reload", () => {
+    noteEventStreamActivity();
+    resetFrame().then((reloaded) => {
+      if (reloaded) refreshWhiteboardSource();
+    });
+  });
+  stream.addEventListener("chrome-reload", () => reloadAfterServerRestart());
+  // The server sends whole states, never chat deltas, so re-applying an overlapping one is a
+  // no-op rather than a duplicated bubble. It arrives unprompted on every connect, which is what
+  // makes reconnecting a complete recovery without a separate fetch.
+  stream.addEventListener("state", (event) => {
+    if (generation !== eventStreamGeneration) return;
+    noteEventStreamActivity();
+    applyServerState(JSON.parse(event?.data || "{}"), generation);
+  });
+}
+
+function closeEventStream() {
+  if (!eventStream) return;
+  eventStream.close?.();
+  eventStream = null;
+}
+
+function stopEventStream() {
+  clearTimeout(eventStreamReconnectTimer);
+  eventStreamReconnectTimer = undefined;
+  clearTimeout(eventStreamWatchdogTimer);
+  eventStreamWatchdogTimer = undefined;
+  clearTimeout(eventStreamHealthyTimer);
+  eventStreamHealthyTimer = undefined;
+  eventStreamConnected = false;
+  closeEventStream();
+}
+
+function markEventStreamHealthy() {
+  eventStreamHealthyTimer = undefined;
+  eventStreamAttempt = 0;
+}
+
+function handleEventStreamFailure() {
+  clearTimeout(eventStreamWatchdogTimer);
+  eventStreamWatchdogTimer = undefined;
+  clearTimeout(eventStreamHealthyTimer);
+  eventStreamHealthyTimer = undefined;
+  eventStreamConnected = false;
+  closeEventStream();
+  if (ended) return;
+  setConnectionBanner(true);
+  scheduleEventStreamReconnect();
+}
+
+function scheduleEventStreamReconnect() {
+  clearTimeout(eventStreamReconnectTimer);
+  const capped = Math.min(SSE_RECONNECT_MAX_MS, SSE_RECONNECT_BASE_MS * 2 ** eventStreamAttempt);
+  eventStreamAttempt += 1;
+  // Jitter across the capped window so every tab that lost the same server does not come back in
+  // lockstep the moment it returns.
+  const delay = Math.round(capped * (0.5 + Math.random() * 0.5));
+  eventStreamReconnectTimer = setTimeout(connectEventStream, delay);
+}
+
+// A connection that goes half-open - a proxy dropping the path, a laptop suspending - keeps
+// delivering nothing without ever firing `error`. Server heartbeats turn that silence into a
+// detectable failure.
+function noteEventStreamActivity() {
+  clearTimeout(eventStreamWatchdogTimer);
+  eventStreamWatchdogTimer = setTimeout(handleEventStreamFailure, SSE_HEARTBEAT_TIMEOUT_MS);
+}
+
+function reconnectEventStreamNow() {
+  if (ended || eventStreamConnected) return;
+  eventStreamAttempt = 0;
+  connectEventStream();
+}
+
+async function resyncState() {
+  if (resyncPromise) return resyncPromise;
+  resyncPromise = resyncStateOnce();
+  try {
+    return await resyncPromise;
+  } finally {
+    resyncPromise = null;
+  }
+}
+
+async function resyncStateOnce() {
+  // Tagged with the connection it was asked on: if the stream has been replaced by the time this
+  // lands, the answer describes a server we are no longer talking to. `ended` goes through the
+  // same check - a stale terminal response must not be able to close the session.
+  const generation = eventStreamGeneration;
+  const response = await fetch("/api/" + key + "/state", { cache: "no-store" });
+  if (!response.ok) throw new Error("failed to resync session state");
+  applyServerState(await response.json(), generation);
+}
+
+window.addEventListener("online", reconnectEventStreamNow);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "hidden") reconnectEventStreamNow();
+});
+
+connectEventStream();
+
+// Collapsed is the load-time default on narrow screens: the artifact is what the reviewer opened
+// Lavish to look at, and the sheet opens itself the moment it has something to say.
+setSheetState("collapsed");
 render();
 initialChat.forEach((item) => addChat(item.role, item.text));
 setAgentPresence("waiting");

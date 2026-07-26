@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -12,6 +13,194 @@ function feedbackResult(result) {
     result
   );
 }
+
+test("concurrent prompt and layout-warning writes do not lose prompts", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const firstStore = new SessionStore(stateFile);
+    const alternateStateFile = `${dir}/./state.json`;
+    assert.notEqual(alternateStateFile, stateFile);
+    const secondStore = new SessionStore(alternateStateFile);
+    const session = await firstStore.upsertSession(artifact, "http://localhost:4387/session/test");
+    const writes = [];
+    for (let index = 0; index < 50; index += 1) {
+      writes.push(
+        firstStore.queuePrompts(session.key, {
+          prompts: [
+            {
+              uid: String(index),
+              prompt: `Prompt ${index}`,
+              selector: "h1",
+              tag: "h1",
+              text: "Hello",
+            },
+          ],
+        }),
+        secondStore.recordLayoutWarnings(session.key, {
+          layout_warnings: [
+            {
+              selector: `h1:nth-child(${index + 1})`,
+              kind: "overlapping-text",
+              overflowPx: index,
+              viewportWidth: 720,
+              severity: "error",
+            },
+          ],
+        }),
+      );
+    }
+
+    await Promise.all(writes);
+
+    const updated = await firstStore.findByKey(session.key);
+    assert.equal(updated.prompts.length, 50);
+    assert.deepEqual(
+      updated.prompts.map((prompt) => prompt.uid).sort((a, b) => Number(a) - Number(b)),
+      Array.from({ length: 50 }, (_, index) => String(index)),
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("state remains parseable while large updates are written", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  let reader;
+  let readerExit;
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const stopFile = path.join(dir, "stop");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const readerScript = `
+      import { access, readFile } from "node:fs/promises";
+      const [stateFile, stopFile] = process.argv.slice(1);
+      let clean = 0;
+      let torn = 0;
+      process.stdout.write("ready\\n");
+      while (true) {
+        try {
+          JSON.parse(await readFile(stateFile, "utf8"));
+          clean += 1;
+        } catch (error) {
+          if (error instanceof SyntaxError) torn += 1;
+          else if (error.code !== "ENOENT") throw error;
+        }
+        try {
+          await access(stopFile);
+          break;
+        } catch {}
+      }
+      process.stdout.write(JSON.stringify({ clean, torn }));
+    `;
+    reader = spawn(process.execPath, ["--input-type=module", "-e", readerScript, stateFile, stopFile], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    readerExit = new Promise((resolve, reject) => {
+      reader.once("error", reject);
+      reader.once("exit", resolve);
+    });
+    let stdout = "";
+    let stderr = "";
+    reader.stdout.setEncoding("utf8");
+    reader.stderr.setEncoding("utf8");
+    reader.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    reader.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    await new Promise((resolve, reject) => {
+      const onData = () => {
+        if (stdout.includes("\n")) {
+          reader.stdout.off("data", onData);
+          resolve();
+        }
+      };
+      reader.stdout.on("data", onData);
+      reader.once("error", reject);
+      reader.once("exit", (code) => {
+        if (!stdout.includes("\n")) reject(new Error(`state reader exited early (${code}): ${stderr}`));
+      });
+    });
+
+    const largeSnapshot = "x".repeat(200_000);
+    for (let index = 0; index < 100; index += 1) {
+      await store.queuePrompts(session.key, {
+        prompts: [{ uid: String(index), prompt: `Prompt ${index}` }],
+        dom_snapshot: `${index}:${largeSnapshot}`,
+      });
+      await store.takeFeedback(session.key);
+    }
+    await writeFile(stopFile, "");
+
+    const exitCode = await readerExit;
+    assert.equal(exitCode, 0, stderr);
+    const counts = JSON.parse(stdout.slice(stdout.indexOf("\n") + 1));
+    if (process.env.LAVISH_AXI_REPORT_ATOMIC_COUNTS) {
+      console.log(`state reader counts: ${JSON.stringify(counts)}`);
+    }
+    assert.ok(counts.clean >= 100, `reader observed only ${counts.clean} clean state reads`);
+    assert.equal(counts.torn, 0, `reader observed ${counts.torn} torn state writes`);
+  } finally {
+    if (reader && reader.exitCode === null) reader.kill();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("no-op mutations neither create nor replace state", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const emptyStore = new SessionStore(stateFile);
+    assert.deepEqual(await emptyStore.takeFeedback("missing"), { status: "missing" });
+    await assert.rejects(stat(stateFile), { code: "ENOENT" });
+
+    const session = await emptyStore.upsertSession(artifact, "http://localhost:4387/session/test");
+    const before = await stat(stateFile);
+    assert.deepEqual(await emptyStore.takeFeedback(session.key), { status: "waiting" });
+    assert.equal((await emptyStore.recordLayoutWarnings(session.key, {})).changed, false);
+    assert.equal(await emptyStore.queuePrompts("missing", {}), null);
+    assert.equal(await emptyStore.endSession("missing"), null);
+    assert.equal(await emptyStore.addAgentReply("missing", "ignored"), null);
+    const after = await stat(stateFile);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.mtimeMs, before.mtimeMs);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test(
+  "atomic replacement preserves an existing state file mode",
+  { skip: process.platform === "win32" && "POSIX file modes only" },
+  async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+    try {
+      const stateFile = path.join(dir, "state.json");
+      const artifact = path.join(dir, "artifact.html");
+      await writeFile(artifact, "<h1>Hello</h1>");
+
+      const store = new SessionStore(stateFile);
+      const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+      await chmod(stateFile, 0o600);
+      await store.addAgentReply(session.key, "Working on it");
+      assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("queued prompts are returned with DOM snapshot context and then cleared", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
@@ -240,6 +429,52 @@ test("a warning re-reported after the agent already received it is marked persis
     await store.recordLayoutWarnings(session.key, { layout_warnings: [warning] });
     const second = feedbackResult(await store.takeFeedback(session.key));
     assert.equal(second.layout_warnings[0].persistent, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// Two elements deep in the DOM can share a display selector, so `persistent` has to key on the
+// browser's full identity. Keying on the selector alone told the agent it had already seen a
+// finding it had never been shown.
+test("findings sharing a display selector track persistence independently", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const shared = {
+      selector: "div > div > div > div > pre",
+      kind: "element-scroll-overflow",
+      overflowPx: 24,
+      viewportWidth: 720,
+      severity: "error",
+    };
+    const first = { ...shared, identity: "html > body > div:nth-of-type(1) > div > div > div > div > pre" };
+    const second = { ...shared, identity: "html > body > div:nth-of-type(2) > div > div > div > div > pre" };
+
+    await store.recordLayoutWarnings(session.key, { layout_warnings: [first] });
+    const delivered = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(delivered.layout_warnings.length, 1);
+    assert.equal(delivered.layout_warnings[0].persistent, false);
+
+    // Only the first element was ever shown to the agent. The second renders as the same
+    // selector but is a different element the agent has never been told about.
+    await store.recordLayoutWarnings(session.key, { layout_warnings: [first, second] });
+    const repeat = feedbackResult(await store.takeFeedback(session.key));
+    assert.deepEqual(
+      repeat.layout_warnings.map((warning) => warning.persistent),
+      [true, false],
+      "the re-reported finding is persistent; its selector twin is still a fresh sighting",
+    );
+    assert.deepEqual(
+      repeat.layout_warnings.map((warning) => warning.identity),
+      [first.identity, second.identity],
+      "identity reaches the agent intact, so it can tell the two apart too",
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
