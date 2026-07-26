@@ -278,3 +278,38 @@ test("the whiteboard frame page is served with the sandboxed chrome overlay poin
     await ctx.close();
   }
 });
+
+test("same-origin guards trust x-forwarded-proto from a loopback reverse proxy", async () => {
+  const ctx = await startWhiteboardServer();
+  try {
+    const frame = await fetch(`${ctx.base}/whiteboard-frame`).then((res) => res.text());
+    const token = /__lavishWhiteboardChannelToken="([^"]+)"/.exec(frame)?.[1] || "";
+    assert.ok(token);
+
+    // tailscale serve (or any loopback TLS proxy) forwards plain HTTP with
+    // x-forwarded-proto: https while the browser's Origin stays https.
+    const proxied = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard-channel`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: ctx.base.replace(/^http:/, "https:"),
+        "x-forwarded-proto": "https",
+      },
+      body: JSON.stringify({ token }),
+    });
+    assert.equal(proxied.status, 200);
+
+    const crossOrigin = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard-channel`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "https://evil.example",
+        "x-forwarded-proto": "https",
+      },
+      body: JSON.stringify({ token }),
+    });
+    assert.equal(crossOrigin.status, 403);
+  } finally {
+    await ctx.close();
+  }
+});

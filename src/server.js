@@ -176,6 +176,11 @@ export async function serve({
   whiteboardAssetsDir = defaultWhiteboardAssetsDir(),
 }) {
   const app = express();
+  // Loopback reverse proxies (tailscale serve, an ssh-tunneled nginx) terminate
+  // TLS and forward plain HTTP. Without trusting their x-forwarded-proto,
+  // req.protocol stays "http" and every isSameOriginRequest guard rejects the
+  // proxied browser's https Origin on scheme alone.
+  app.set("trust proxy", "loopback");
   const store = new SessionStore(stateFile);
   const events = new EventEmitter();
   const watchers = new Map();
