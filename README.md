@@ -176,6 +176,9 @@ pnpm link
   The agent updates the artifact's Mermaid source, which remains authoritative.
   Flowchart, sequence, class, ER, and state diagrams convert to editable shapes; other diagram types are images that reviewers can draw and annotate.
   Lavish changes only the browser view, so saved, standalone, and exported artifacts still render plain Mermaid.
+- **Agent sketches** - Agents can also draw free-form: a `.lavish-sketch` block carrying Excalidraw scene JSON (in a `script[type="application/lavish-sketch+json"]` child) becomes the same embedded editable whiteboard - mockups, wireframes, and arbitrary shapes rather than converted diagram text.
+  Sketches share the Mermaid whiteboards' behavior end to end: click to edit, Fullscreen, local autosave, staleness detection, and **Queue feedback** with an edit summary diffed against the agent's authored elements.
+  The block's non-script content is the fallback that standalone and exported copies show, and it stays visible if the editor cannot boot.
 - **Server cleanup** - The detached server stops after the last session ends when nothing is connected, or after `LAVISH_AXI_IDLE_TIMEOUT_MS` (default 30 minutes) with no browser or poll connections.
   Set `LAVISH_AXI_IDLE_TIMEOUT_MS=0` or `off` to disable idle self-shutdown.
 - **Local-first state** - Session state stays under `~/.lavish-axi/` by default, or `LAVISH_AXI_STATE_DIR` when set.

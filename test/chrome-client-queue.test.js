@@ -1133,6 +1133,63 @@ test("an initialized inline whiteboard tells the artifact frame to swap the diag
   assert.equal(activation.diagramIndex, 0);
 });
 
+test("sketch sources initialize the inline whiteboard with kind sketch", async () => {
+  const sketchSource = '{"elements":[{"id":"r1","type":"rectangle","x":0,"y":0,"width":120,"height":60}]}';
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (url.includes("/mermaid-sources")) {
+        return {
+          ok: true,
+          json: async () => ({ sources: [{ index: 0, kind: "sketch", source: sketchSource, hash: "sh" }] }),
+        };
+      }
+      return whiteboardFetch(url);
+    },
+  });
+  const whiteboard = await initializeInlineWhiteboard(chrome);
+
+  const init = whiteboard.posted.at(-1);
+  assert.equal(init.type, "lavish-whiteboard:init");
+  assert.equal(init.kind, "sketch");
+  assert.equal(init.source, sketchSource);
+  assert.ok(chrome.postedToFrame.some((message) => message.type === "lavish:whiteboardActive"));
+});
+
+test("mermaid sources without a kind initialize the whiteboard as kind mermaid", async () => {
+  const chrome = await createChromeHarness({ fetchImpl: async (url) => whiteboardFetch(url) });
+  const whiteboard = await initializeInlineWhiteboard(chrome);
+
+  const init = whiteboard.posted.at(-1);
+  assert.equal(init.type, "lavish-whiteboard:init");
+  assert.equal(init.kind, "mermaid");
+});
+
+test("a convert failure report falls back to the plain content and closes the channel", async () => {
+  const chrome = await createChromeHarness({ fetchImpl: async (url) => whiteboardFetch(url) });
+  const whiteboard = await initializeInlineWhiteboard(chrome);
+  const postedBefore = whiteboard.posted.length;
+
+  chrome.sendInlineWhiteboardMessage(whiteboard, {
+    type: "lavish-whiteboard:convertFailed",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+  });
+  await flushPromises();
+
+  const fallback = chrome.postedToFrame.find((message) => message.type === "lavish:whiteboardUnavailable");
+  assert.ok(fallback, "the artifact frame is told to restore the plain content");
+  assert.equal(fallback.diagramIndex, 0);
+
+  chrome.sendInlineWhiteboardMessage(whiteboard, {
+    type: "lavish-whiteboard:save",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+    scene: { elements: [] },
+  });
+  await flushPromises();
+  assert.equal(whiteboard.posted.length, postedBefore, "a closed channel accepts no further messages");
+});
+
 test("a rejected whiteboard channel tells the artifact frame to keep the plain diagram", async () => {
   const chrome = await createChromeHarness({ fetchImpl: async () => ({ ok: false }) });
   const whiteboard = chrome.createInlineWhiteboard();

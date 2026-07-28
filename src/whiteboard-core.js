@@ -41,6 +41,38 @@ export function sanitizeSceneLink(url) {
 // unsupported diagram type, or a parser error caught in-library): the scene is
 // one or more image elements and nothing else. The whiteboard stays usable -
 // the user draws on top - but edits can't be tied to diagram node identity.
+export const SKETCH_MAX_ELEMENTS = 1000;
+
+// Parse an agent-authored sketch block's scene JSON into an Excalidraw element
+// skeleton array (the input of convertToExcalidrawElements). Validation stays
+// structural - unknown fields pass through so the skeleton format can grow -
+// while non-arrays, empty scenes, and unbounded payloads fail with messages the
+// whiteboard frame surfaces verbatim.
+export function parseSketchSource(source) {
+  let parsed;
+  try {
+    parsed = JSON.parse(String(source || ""));
+  } catch {
+    throw new Error("the sketch scene JSON does not parse");
+  }
+  const skeletons = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === "object" && Array.isArray(parsed.elements)
+      ? parsed.elements
+      : null;
+  if (!skeletons) throw new Error("the sketch scene must be an array of elements or { elements: [...] }");
+  if (skeletons.length === 0) throw new Error("the sketch scene has no elements");
+  if (skeletons.length > SKETCH_MAX_ELEMENTS) {
+    throw new Error(`the sketch scene exceeds ${SKETCH_MAX_ELEMENTS} elements`);
+  }
+  for (const element of skeletons) {
+    if (!element || typeof element !== "object" || Array.isArray(element) || typeof element.type !== "string") {
+      throw new Error("every sketch element needs a string type");
+    }
+  }
+  return skeletons;
+}
+
 export function sceneIsImageFallback(elements) {
   const list = Array.isArray(elements) ? elements.filter((el) => el && !el.isDeleted) : [];
   if (list.length === 0) return false;
@@ -215,6 +247,7 @@ export function normalizeExcalidrawSceneTarget(target) {
   const stats = target.stats && typeof target.stats === "object" && !Array.isArray(target.stats) ? target.stats : {};
   return {
     type: EXCALIDRAW_SCENE_TARGET_TYPE,
+    kind: target.kind === "sketch" ? "sketch" : "mermaid",
     diagramIndex: boundedInt(target.diagramIndex, 999),
     diagramId: String(target.diagramId || ""),
     sourceHash: String(target.sourceHash || ""),

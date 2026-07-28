@@ -26,7 +26,7 @@ import {
   scaledDownDiagramSeverity,
 } from "./artifact-sdk.js";
 import * as mermaidNode from "./mermaid-node.js";
-import { extractMermaidSources, mermaidSourceHash } from "./mermaid-source.js";
+import { extractWhiteboardSources, mermaidSourceHash } from "./mermaid-source.js";
 import {
   isValidDiagramIndex,
   isValidWhiteboardKey,
@@ -823,8 +823,9 @@ export async function serve({
         return;
       }
       const html = await readFile(session.file, "utf8").catch(() => "");
-      const sources = extractMermaidSources(html).map(({ index, source }) => ({
+      const sources = extractWhiteboardSources(html).map(({ index, kind, source }) => ({
         index,
+        kind,
         source,
         hash: mermaidSourceHash(source),
       }));

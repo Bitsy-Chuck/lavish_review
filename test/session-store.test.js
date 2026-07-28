@@ -346,6 +346,7 @@ test("queued whiteboard prompts normalize the excalidraw-scene target to its fix
     assert.equal(result.prompts[0].tag, "whiteboard");
     assert.deepEqual(result.prompts[0].target, {
       type: "excalidraw-scene",
+      kind: "mermaid",
       diagramIndex: 1,
       diagramId: "mermaid-2",
       sourceHash: "abc123def4567890",

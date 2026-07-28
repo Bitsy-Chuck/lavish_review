@@ -24,6 +24,7 @@ import "./whiteboard-frame.css";
 
 import {
   findDuplicateElementIds,
+  parseSketchSource,
   sanitizeSceneLink,
   sanitizeWhiteboardAppState,
   sceneIsImageFallback,
@@ -36,6 +37,9 @@ const state = {
   mode: "overlay",
   diagramIndex: 0,
   diagramId: "",
+  // "mermaid" converts diagram text; "sketch" loads agent-authored Excalidraw
+  // skeleton JSON straight from the artifact's sketch block.
+  kind: "mermaid",
   // Hash of the Mermaid source this scene was converted from. Stays at the old
   // value when the user keeps editing a saved scene after the diagram changed
   // underneath, so feedback honestly reports which source the edits refer to.
@@ -374,7 +378,17 @@ function mountEditor({ elements, appState, files, theme }) {
   );
 }
 
-async function convertSource(source) {
+async function convertSource(source, kind) {
+  if (kind === "sketch") {
+    // Sketch blocks are already Excalidraw element skeletons; ids the agent
+    // authored are kept so edit summaries can name what changed.
+    const skeletons = parseSketchSource(source);
+    let elements = convertToExcalidrawElements(skeletons, { regenerateIds: false });
+    if (findDuplicateElementIds(elements).length > 0) {
+      elements = convertToExcalidrawElements(skeletons, { regenerateIds: true });
+    }
+    return { elements, files: {}, imageFallback: false };
+  }
   const { elements: skeletons, files } = await parseMermaidToExcalidraw(source, {
     themeVariables: { fontSize: "16px" },
   });
@@ -399,7 +413,7 @@ function defaultAppState() {
 }
 
 async function startFromConversion(init) {
-  const { elements, files, imageFallback } = await convertSource(init.source);
+  const { elements, files, imageFallback } = await convertSource(init.source, state.kind);
   state.baselineElements = JSON.parse(JSON.stringify(elements));
   state.files = files;
   state.imageFallback = imageFallback;
@@ -434,7 +448,9 @@ function startFromSavedScene(init) {
     ? JSON.parse(JSON.stringify(saved.baseline.elements))
     : JSON.parse(JSON.stringify(restored.elements));
   state.files = restored.files || saved.scene?.files || {};
-  state.imageFallback = sceneIsImageFallback(restored.elements);
+  // The image-fallback banner explains inconvertible Mermaid types; a sketch
+  // scene that happens to contain only images is still a real editor.
+  state.imageFallback = state.kind === "sketch" ? false : sceneIsImageFallback(restored.elements);
   state.sceneSourceHash = saved.source_hash || init.sourceHash;
   if (state.imageFallback) {
     setBanner(
@@ -533,10 +549,12 @@ async function handleInit(init) {
   state.mode = init.mode === "inline" ? "inline" : "overlay";
   state.diagramIndex = Number(init.diagramIndex) || 0;
   state.diagramId = String(init.diagramId || "");
+  state.kind = init.kind === "sketch" ? "sketch" : "mermaid";
   state.currentSource = String(init.source || "");
   state.currentSourceHash = String(init.sourceHash || "");
   const theme = init.theme === "dark" ? "dark" : "light";
-  document.getElementById("wbTitle").textContent = `Whiteboard · diagram ${state.diagramIndex + 1}`;
+  const label = state.kind === "sketch" ? "sketch" : "diagram";
+  document.getElementById("wbTitle").textContent = `Whiteboard · ${label} ${state.diagramIndex + 1}`;
 
   const saved = init.saved && typeof init.saved === "object" && init.saved.scene ? init.saved : null;
   try {
@@ -555,7 +573,13 @@ async function handleInit(init) {
       await startFromConversion({ ...init, theme });
     }
   } catch (error) {
-    showStatus(`Could not open this diagram as a whiteboard: ${describeError(error)}`, { transient: false });
+    showStatus(
+      `Could not open this ${state.kind === "sketch" ? "sketch" : "diagram"} as a whiteboard: ${describeError(error)}`,
+      { transient: false },
+    );
+    // Tell the chrome so inline placements can restore the plain artifact
+    // content instead of leaving a broken editor shell on the page.
+    post({ type: "lavish-whiteboard:convertFailed" });
   }
 }
 

@@ -22,6 +22,7 @@ const ARTIFACT_HTML = `<!doctype html><html><body>
   A[Start] --&gt; B{Ready?}</pre>
 <pre class="mermaid">sequenceDiagram
   CLI-&gt;&gt;Server: poll</pre>
+<div class="lavish-sketch"><script type="application/lavish-sketch+json">{"elements":[{"id":"r1","type":"rectangle","x":0,"y":0,"width":120,"height":60,"label":{"text":"A && B"}}]}</script><p>Sketch fallback</p></div>
 </body></html>`;
 
 const PNG_DATA_URL =
@@ -106,11 +107,26 @@ test("GET /api/:key/mermaid-sources extracts ordered, entity-decoded sources wit
   const ctx = await startWhiteboardServer();
   try {
     const data = await fetch(`${ctx.base}/api/${ctx.key}/mermaid-sources`).then((res) => res.json());
-    assert.equal(data.sources.length, 2);
+    assert.equal(data.sources.length, 3);
     assert.equal(data.sources[0].index, 0);
+    assert.equal(data.sources[0].kind, "mermaid");
     assert.equal(data.sources[0].source, "flowchart TD\n  A[Start] --> B{Ready?}");
     assert.equal(data.sources[0].hash, mermaidSourceHash("flowchart TD\n  A[Start] --> B{Ready?}"));
     assert.equal(data.sources[1].source, "sequenceDiagram\n  CLI->>Server: poll");
+  } finally {
+    await ctx.close();
+  }
+});
+
+test("GET /api/:key/mermaid-sources returns sketch blocks with raw JSON in the same index space", async () => {
+  const ctx = await startWhiteboardServer();
+  try {
+    const data = await fetch(`${ctx.base}/api/${ctx.key}/mermaid-sources`).then((res) => res.json());
+    const sketch = data.sources[2];
+    assert.equal(sketch.index, 2);
+    assert.equal(sketch.kind, "sketch");
+    assert.equal(JSON.parse(sketch.source).elements[0].label.text, "A && B");
+    assert.equal(sketch.hash, mermaidSourceHash(sketch.source));
   } finally {
     await ctx.close();
   }
