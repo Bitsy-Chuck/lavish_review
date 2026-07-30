@@ -539,18 +539,25 @@ export function createArtifactSdk(
   }
 
   // Inline whiteboard embedding. Each rendered diagram inside a `.mermaid`
-  // container is replaced, at view time only, by a nested sandboxed iframe
-  // hosting the Excalidraw whiteboard frame - the artifact file keeps its
-  // Mermaid source and still renders plain diagrams when opened standalone or
-  // exported. The index of the container among `.mermaid` elements in document
-  // order is the diagram's identity; the server recovers the matching source
-  // from the artifact file. This SDK owns their lifecycle during fullscreen
+  // container - and each `.lavish-sketch` block carrying agent-authored
+  // Excalidraw scene JSON - is replaced, at view time only, by a nested
+  // sandboxed iframe hosting the Excalidraw whiteboard frame. The artifact
+  // file keeps its sources authoritative: standalone and exported copies
+  // render plain Mermaid and a sketch block's fallback content. The index of
+  // the container among `.mermaid, .lavish-sketch` elements in document order
+  // is the whiteboard's identity; the server recovers the matching source from
+  // the artifact file. This SDK owns their lifecycle during fullscreen
   // transitions.
-  const whiteboardEmbeds = new Map(); // container -> { iframe, index }
+  // Embedding is a visible-until-proven handshake: the frame boots hidden next
+  // to the still-visible diagram, and only the chrome's lavish:whiteboardActive
+  // swaps them. If any part of the boot chain fails (or never reports back),
+  // the reader keeps a plain diagram instead of a blank frame.
+  const whiteboardEmbeds = new Map(); // container -> { container, iframe, index, active }
+  const failedWhiteboardContainers = new WeakSet(); // containers whose editor failed to boot
   const mermaidMeasurements = new WeakMap(); // hidden container -> geometry captured before replacement
 
-  function mermaidContainerIndex(container) {
-    return [...document.querySelectorAll(".mermaid")].indexOf(container);
+  function whiteboardContainerIndex(container) {
+    return [...document.querySelectorAll(".mermaid, .lavish-sketch")].indexOf(container);
   }
 
   function whiteboardEmbedHeightPx(svgRect) {
@@ -560,15 +567,29 @@ export function createArtifactSdk(
     return Math.max(min, Math.min(Math.round(svgRect.height) + headerPx, max));
   }
 
+  function createWhiteboardEmbedFrame(index, diagramId, heightPx) {
+    const iframe = document.createElement("iframe");
+    iframe.setAttribute("data-lavish-ui", "whiteboard-inline");
+    iframe.setAttribute("title", "Excalidraw whiteboard");
+    // Stricter than (and independent of) this artifact frame's own sandbox.
+    iframe.setAttribute("sandbox", "allow-scripts allow-popups");
+    iframe.src = whiteboardFrameSrc({ index, diagramId });
+    iframe.style.cssText =
+      `display:none;box-sizing:border-box;width:100%;height:${heightPx}px;border:1px solid rgba(128,128,128,.35);` +
+      "border-radius:12px;background:transparent";
+    return iframe;
+  }
+
   function embedWhiteboard(svg) {
     const container = svg.closest(".mermaid");
     if (!container) return;
+    if (failedWhiteboardContainers.has(container)) return;
     const existing = whiteboardEmbeds.get(container);
     if (existing && existing.iframe.isConnected) {
-      existing.index = mermaidContainerIndex(container);
+      existing.index = whiteboardContainerIndex(container);
       return;
     }
-    const index = mermaidContainerIndex(container);
+    const index = whiteboardContainerIndex(container);
     if (index < 0) return;
     const rect = svg.getBoundingClientRect();
     // Mermaid renders asynchronously; a zero-ish rect means this svg has not
@@ -583,21 +604,70 @@ export function createArtifactSdk(
     if (rect.width > 0 && intrinsicMaxWidth > 0) {
       mermaidMeasurements.set(container, { intrinsicMaxWidth });
     }
-    const iframe = document.createElement("iframe");
-    iframe.setAttribute("data-lavish-ui", "whiteboard-inline");
-    iframe.setAttribute("title", "Excalidraw whiteboard");
-    // Stricter than (and independent of) this artifact frame's own sandbox.
-    iframe.setAttribute("sandbox", "allow-scripts allow-popups");
-    iframe.src = whiteboardFrameSrc({ index, diagramId: svg.id || "" });
-    iframe.style.cssText =
-      `display:block;box-sizing:border-box;width:100%;height:${whiteboardEmbedHeightPx(rect)}px;border:1px solid rgba(128,128,128,.35);` +
-      "border-radius:12px;background:transparent";
+    const iframe = createWhiteboardEmbedFrame(index, svg.id || "", whiteboardEmbedHeightPx(rect));
+    container.insertAdjacentElement("afterend", iframe);
+    whiteboardEmbeds.set(container, { container, iframe, index, diagramId: svg.id || "", active: false });
+  }
+
+  function sketchEmbedHeightPx(container) {
+    const requested = Number.parseInt(container.getAttribute("data-lavish-sketch-height") || "", 10);
+    const max = Math.max(360, Math.round((window.innerHeight || 800) * 0.8));
+    const height = Number.isFinite(requested) && requested > 0 ? requested : 360;
+    return Math.max(240, Math.min(height, max));
+  }
+
+  // Sketch blocks - `.lavish-sketch` containers carrying agent-authored scene
+  // JSON in a `script[type="application/lavish-sketch+json"]` child - get the
+  // same hidden-until-proven whiteboard embedding as rendered Mermaid
+  // diagrams. The container's non-script content is the fallback that
+  // standalone, exported, and failed-boot views keep showing.
+  function embedSketchWhiteboards() {
+    for (const container of document.querySelectorAll(".lavish-sketch")) {
+      if (failedWhiteboardContainers.has(container)) continue;
+      // Dual-class containers belong to the Mermaid path.
+      if (
+        String(container.className || "")
+          .split(/\s+/)
+          .includes("mermaid")
+      )
+        continue;
+      const existing = whiteboardEmbeds.get(container);
+      if (existing && existing.iframe.isConnected) {
+        existing.index = whiteboardContainerIndex(container);
+        continue;
+      }
+      const script = container.querySelector('script[type="application/lavish-sketch+json"]');
+      if (!script || !String(script.textContent || "").trim()) continue;
+      const index = whiteboardContainerIndex(container);
+      if (index < 0) continue;
+      const iframe = createWhiteboardEmbedFrame(index, container.id || "", sketchEmbedHeightPx(container));
+      container.insertAdjacentElement("afterend", iframe);
+      whiteboardEmbeds.set(container, { container, iframe, index, diagramId: container.id || "", active: false });
+    }
+  }
+
+  function activateWhiteboard(entry) {
+    entry.active = true;
+    entry.iframe.style.display = "block";
     // The design snippet re-renders Mermaid inside the container on theme
     // changes, so the frame lives as a sibling: re-renders stay harmless
     // inside the hidden container instead of destroying the editor.
-    container.style.display = "none";
-    container.insertAdjacentElement("afterend", iframe);
-    whiteboardEmbeds.set(container, { iframe, index, diagramId: svg.id || "" });
+    entry.container.style.display = "none";
+  }
+
+  function discardWhiteboard(entry) {
+    failedWhiteboardContainers.add(entry.container);
+    whiteboardEmbeds.delete(entry.container);
+    mermaidMeasurements.delete(entry.container);
+    entry.iframe.remove();
+    entry.container.style.display = "";
+  }
+
+  function handleWhiteboardControl(msg) {
+    const target = whiteboardEntryByIndex(msg.diagramIndex);
+    if (!target) return;
+    if (msg.type === "lavish:whiteboardActive") activateWhiteboard(target);
+    if (msg.type === "lavish:whiteboardUnavailable") discardWhiteboard(target);
   }
 
   function whiteboardEmbedEntries() {
@@ -630,6 +700,9 @@ export function createArtifactSdk(
       const target = whiteboardEntryByIndex(msg.diagramIndex);
       if (target) target.iframe.src = whiteboardFrameSrc(target);
     }
+    if (msg.type === "lavish:whiteboardActive" || msg.type === "lavish:whiteboardUnavailable") {
+      handleWhiteboardControl(msg);
+    }
   });
 
   function enhanceMermaid() {
@@ -642,6 +715,7 @@ export function createArtifactSdk(
         mermaidViewports.set(svg, viewport);
       }
     }
+    embedSketchWhiteboards();
   }
 
   let mermaidEnhanceScheduled = false;
@@ -1364,6 +1438,7 @@ export function createArtifactSdk(
     testHooks.enhanceMermaid = enhanceMermaid;
     testHooks.auditLayout = auditLayout;
     testHooks.setMermaidFrozen = setMermaidFrozen;
+    testHooks.handleWhiteboardControl = handleWhiteboardControl;
     return;
   }
 

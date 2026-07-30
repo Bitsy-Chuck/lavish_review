@@ -2,15 +2,18 @@ import crypto from "node:crypto";
 
 import { parse } from "parse5";
 
-// Server-side extraction of Mermaid diagram sources from raw artifact HTML.
+// Server-side extraction of whiteboard sources from raw artifact HTML: Mermaid
+// diagram text from `.mermaid` elements and agent-authored Excalidraw sketch
+// JSON from `.lavish-sketch` blocks.
 //
 // The design snippet (`lavish-axi design`) renders diagrams from elements with
 // class="mermaid" via `mermaid.run(...)`, replacing each element's text content
 // with a rendered SVG in the live DOM. The artifact file on disk still holds
 // the original sources, so the server - which already reads the file for every
-// artifact route - is the authoritative place to recover them. Diagrams are
-// identified by their position among `.mermaid` elements in document order,
-// matching `document.querySelectorAll(".mermaid")` in the browser.
+// artifact route - is the authoritative place to recover them. Whiteboards are
+// identified by their position among `.mermaid, .lavish-sketch` elements in
+// document order, matching `document.querySelectorAll(".mermaid, .lavish-sketch")`
+// in the browser.
 
 // Decode the entity forms that matter for Mermaid syntax (`--&gt;`, `&quot;...`).
 // Numeric references are included so authored `&#39;` quotes survive.
@@ -30,15 +33,16 @@ function safeFromCodePoint(code) {
   return Number.isInteger(code) && code >= 0 && code <= 0x10ffff ? String.fromCodePoint(code) : "";
 }
 
-function hasMermaidClass(value) {
-  return value.split(/[\t\n\f\r ]+/).includes("mermaid");
+export const SKETCH_SCRIPT_TYPE = "application/lavish-sketch+json";
+
+function attributeValue(node, name) {
+  const attribute = Array.isArray(node.attrs) ? node.attrs.find((entry) => entry.name.toLowerCase() === name) : null;
+  return attribute ? attribute.value : null;
 }
 
-function elementHasMermaidClass(node) {
-  const classAttribute = Array.isArray(node.attrs)
-    ? node.attrs.find((attribute) => attribute.name.toLowerCase() === "class")
-    : null;
-  return Boolean(classAttribute && hasMermaidClass(classAttribute.value));
+function elementHasClassToken(node, token) {
+  const classValue = attributeValue(node, "class");
+  return Boolean(classValue && classValue.split(/[\t\n\f\r ]+/).includes(token));
 }
 
 function textContent(node) {
@@ -46,19 +50,45 @@ function textContent(node) {
   return Array.isArray(node.childNodes) ? node.childNodes.map(textContent).join("") : "";
 }
 
-// Extract Mermaid sources from raw artifact HTML in document order. Returns
-// `[{ index, source }]` where `index` matches the element's position among
-// `.mermaid` elements (the browser-side `diagramIndex`).
-export function extractMermaidSources(html) {
+// A sketch block's scene JSON lives in a `script[type="application/lavish-sketch+json"]`
+// descendant. Script elements are raw text in both parse5 and browsers, so the
+// JSON comes back byte-exact with no entity decoding.
+function sketchScriptText(node) {
+  if (!Array.isArray(node.childNodes)) return "";
+  for (const child of node.childNodes) {
+    if (child.tagName === "script" && attributeValue(child, "type") === SKETCH_SCRIPT_TYPE) {
+      return textContent(child);
+    }
+    const nested = sketchScriptText(child);
+    if (nested) return nested;
+  }
+  return "";
+}
+
+// Extract whiteboard sources - Mermaid diagrams and Lavish sketch blocks -
+// from raw artifact HTML in document order. Returns `[{ index, kind, source }]`
+// where `index` matches the element's position among `.mermaid, .lavish-sketch`
+// elements (the browser-side `diagramIndex`). An element carrying both classes
+// counts once, as a Mermaid diagram; a sketch container without its scene
+// script keeps its index with an empty source so browser and server never
+// disagree about numbering.
+export function extractWhiteboardSources(html) {
   const sources = [];
 
   function visit(node) {
     if (!Array.isArray(node.childNodes)) return;
     for (const child of node.childNodes) {
-      if (child.tagName && elementHasMermaidClass(child)) {
+      if (child.tagName && elementHasClassToken(child, "mermaid")) {
         sources.push({
           index: sources.length,
+          kind: "mermaid",
           source: normalizeMermaidSource(textContent(child)),
+        });
+      } else if (child.tagName && elementHasClassToken(child, "lavish-sketch")) {
+        sources.push({
+          index: sources.length,
+          kind: "sketch",
+          source: normalizeMermaidSource(sketchScriptText(child)),
         });
       }
       visit(child);

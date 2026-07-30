@@ -43,7 +43,6 @@ import {
   shouldRestartServer,
   startPollWaitReporter,
   stopCommand,
-  telemetryCommandName,
   VERSION,
 } from "../src/cli.js";
 import { DESIGN_PRIORITY_RULE, DESIGN_SYSTEM_HINT } from "../src/design-reference.js";
@@ -165,7 +164,7 @@ test("top-level help renders static home output without dynamic sessions", async
     );
 
     assert.equal(result.status, 0, result.stderr || result.stdout);
-    assert.match(result.stdout, /playbooks\[7\]/);
+    assert.match(result.stdout, /playbooks\[8\]/);
     assert.match(result.stdout, /lavish-axi playbook <playbook_id>/);
     assert.match(result.stdout, /reference other filesystem assets/);
     assert.match(result.stdout, /same directory as the HTML file/);
@@ -187,7 +186,7 @@ test("design output prints copy-pasteable local /design URLs so agents can opt i
   const output = createDesignOutput();
 
   assert.match(output.playbook_router.instruction, /MUST open each matching playbook before writing HTML/);
-  assert.equal(output.playbook_router.playbooks.length, 7);
+  assert.equal(output.playbook_router.playbooks.length, 8);
   assert.equal(
     output.playbook_router.playbooks.find((playbook) => playbook.id === "diagram")?.use_when,
     "Map relationships, messages, state, data models, timelines, hierarchy, or architecture",
@@ -268,10 +267,10 @@ test("design output recommends luxury as the default theme and warns against @ap
 test("playbook index output lists known playbooks with concise descriptions", () => {
   const output = createPlaybookOutput([]);
 
-  assert.equal(output.playbooks.length, 7);
+  assert.equal(output.playbooks.length, 8);
   assert.deepEqual(
     output.playbooks.map((playbook) => playbook.id),
-    ["diagram", "table", "comparison", "plan", "code", "input", "slides"],
+    ["diagram", "sketch", "table", "comparison", "plan", "code", "input", "slides"],
   );
   assert.equal(
     output.playbooks.find((playbook) => playbook.id === "plan")?.use_when,
@@ -1104,7 +1103,8 @@ test("whiteboard feedback tells agents to read the summary, inspect files when n
   assert.match(output.next_step, /read the edit summary in the prompt text first/);
   assert.match(output.next_step, /scenePath/);
   assert.match(output.next_step, /previewPath/);
-  assert.match(output.next_step, /Mermaid source stays authoritative/);
+  assert.match(output.next_step, /source stays authoritative/);
+  assert.match(output.next_step, /kind "sketch"/);
   assert.match(output.next_step, /never try to write the \.excalidraw scene back/);
 });
 
@@ -1547,15 +1547,6 @@ test("setup hooks exits with an error when hook installation fails", async () =>
     await rm(stateDir, { force: true, recursive: true });
     await rm(homeDir, { force: true, recursive: true });
   }
-});
-
-test("telemetry command names are anonymous and do not include file paths", () => {
-  assert.equal(telemetryCommandName(["report.html"]), "open");
-  assert.equal(telemetryCommandName(["poll", "/tmp/secret/report.html"]), "poll");
-  assert.equal(telemetryCommandName(["end", "/tmp/secret/report.html"]), "end");
-  assert.equal(telemetryCommandName(["playbook", "diagram"]), "playbook");
-  assert.equal(telemetryCommandName(["design"]), "design");
-  assert.equal(telemetryCommandName([]), "home");
 });
 
 test("server spawn options detach without inheriting invalid streams", () => {

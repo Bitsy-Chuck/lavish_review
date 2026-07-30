@@ -1,44 +1,46 @@
 # Contributing
 
-Thanks for wanting to contribute.
-One rule up front:
+This checkout is **local-only**. There is no upstream contribution process to follow here, and
+nothing in it is published.
 
-**Human-authored pull requests targeting `main` must be raised through [`no-mistakes`](https://github.com/kunchenguid/no-mistakes).**
-We require this to reduce the maintainer's burden of reviewing and merging contributions.
+## Ground rules
 
-`no-mistakes` puts a local git proxy in front of your real remote.
-Pushing through it runs an AI-driven review/test/lint pipeline in an isolated worktree, forwards the push upstream only after every check passes, and opens a clean PR automatically.
+- Work directly on local `main`, or on a local branch you merge into it. Nothing is pushed.
+- The package is `private: true` and has no publish workflow. Do not add one, and do not install
+  or invoke `lavish-axi` through `npx` - the registry package is a separate upstream lineage that
+  does not contain this repository's work.
+- `lavish-axi` on your PATH must resolve to this checkout's `dist/cli.mjs` (via `npm link`).
+  Verify with `readlink -f "$(which lavish-axi)"`.
 
-A GitHub Actions check (`Require no-mistakes`) runs on PRs targeting `main` and fails if the body is missing the deterministic signature that no-mistakes writes.
-The release and dependency bots are exempt so their automation keeps working, but regular contributor PRs without the signature will not be reviewed or merged.
+## Before you commit
 
-## Workflow
+```sh
+pnpm run check
+```
 
-Fork routing requires `no-mistakes` v1.30.1 or newer.
+That runs build, lint, format check, typecheck, tests, and the skill freshness check. Keep it
+green - it is the only gate, since no CI runs on your work.
 
-1. Fork the repo, then clone the parent repo or set your local `origin` back to the parent repo (`git@github.com:kunchenguid/lavish-axi.git`).
-2. Create a branch and make your changes.
-3. Initialize or refresh the gate with your fork as the push target: `no-mistakes init --fork-url git@github.com:<you>/lavish-axi.git`.
-4. Commit your changes.
-5. Push through the gate instead of pushing to `origin`:
+Use TDD for bug fixes and new features: write the failing test first, then the fix.
 
-   ```sh
-   git push no-mistakes
-   ```
+## After changing agent-facing guidance
 
-6. Run `no-mistakes` to attach to the pipeline, watch findings, and auto-fix or review as needed.
-7. Once the pipeline passes, it pushes the branch to your fork and opens the PR against this parent repo for you.
+Guidance strings in `src/cli.js`, `src/design-reference.js`, and `src/playbooks.js` feed the
+generated skill. When you change them:
 
-See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/start-here/quick-start/) for the full first-run walkthrough.
+```sh
+pnpm run build:skill
+cp skills/lavish/SKILL.md ~/.claude/skills/lavish/SKILL.md
+cp skills/lavish/SKILL.md ~/.agents/skills/lavish/SKILL.md
+```
 
-## Repo Conventions
+Otherwise the installed skill silently drifts from the build.
+
+## Repo conventions
 
 - Node 22+, ESM-only JavaScript, and TypeScript `checkJs` validation.
-- Run `pnpm run check` before pushing.
 - Do not reformat repo-provided `.agents/` skill content; `.prettierignore` excludes it intentionally.
-- Do not hand-edit `CHANGELOG.md` or `.release-please-manifest.json`.
-- User-facing telemetry docs should stay minimal: anonymous usage telemetry, no sensitive content, and `LAVISH_AXI_TELEMETRY=0` opt-out.
-
-## Questions
-
-Open an issue, or talk to me on [Discord](https://discord.gg/Wsy2NpnZDu).
+- `CHANGELOG.md` is frozen history from when release automation still ran here. Leave it as-is
+  rather than extending it.
+- There is no telemetry. The upstream Umami client was deleted, and a test fails if any analytics
+  or usage reporting reappears under `src/`, `scripts/`, or `bin/`. Do not add one back.

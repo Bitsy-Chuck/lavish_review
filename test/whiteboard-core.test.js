@@ -4,11 +4,34 @@ import test from "node:test";
 import {
   findDuplicateElementIds,
   normalizeExcalidrawSceneTarget,
+  parseSketchSource,
   sanitizeSceneLink,
   sceneIsImageFallback,
   summarizeSceneEdits,
   SUMMARY_MAX_LINE_CHARS,
 } from "../src/whiteboard-core.js";
+
+test("parseSketchSource accepts an element array or an { elements } object", () => {
+  const skeleton = [{ id: "r1", type: "rectangle", x: 0, y: 0, width: 100, height: 40 }];
+  assert.deepEqual(parseSketchSource(JSON.stringify(skeleton)), skeleton);
+  assert.deepEqual(parseSketchSource(JSON.stringify({ elements: skeleton })), skeleton);
+});
+
+test("parseSketchSource rejects malformed payloads with descriptive errors", () => {
+  assert.throws(() => parseSketchSource("not json"), /does not parse/);
+  assert.throws(() => parseSketchSource('{"shapes":[]}'), /array of elements/);
+  assert.throws(() => parseSketchSource("[]"), /no elements/);
+  assert.throws(() => parseSketchSource('[{"x":1}]'), /string type/);
+  assert.throws(() => parseSketchSource('[["rectangle"]]'), /string type/);
+  const oversized = JSON.stringify(Array.from({ length: 1001 }, () => ({ type: "rectangle" })));
+  assert.throws(() => parseSketchSource(oversized), /1000/);
+});
+
+test("normalizeExcalidrawSceneTarget carries the whiteboard kind with a mermaid default", () => {
+  assert.equal(normalizeExcalidrawSceneTarget({ kind: "sketch" }).kind, "sketch");
+  assert.equal(normalizeExcalidrawSceneTarget({ kind: "weird" }).kind, "mermaid");
+  assert.equal(normalizeExcalidrawSceneTarget({}).kind, "mermaid");
+});
 
 function rect(id, opts = {}) {
   return { id, type: "rectangle", x: 0, y: 0, width: 100, height: 40, ...opts };
@@ -180,6 +203,7 @@ test("normalizeExcalidrawSceneTarget strips to the fixed shape", () => {
   });
   assert.deepEqual(out, {
     type: "excalidraw-scene",
+    kind: "mermaid",
     diagramIndex: 2,
     diagramId: "mermaid-3",
     sourceHash: "abc123",

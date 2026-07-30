@@ -11,7 +11,7 @@ export const PLAYBOOKS = [
     choose: [
       "Choose from the content shape before choosing a renderer: branching or converging paths -> flowchart; messages between actors over time -> sequenceDiagram; modes, transitions, or guards -> stateDiagram-v2; tables, keys, or cardinality -> erDiagram; types, fields, or inheritance -> classDiagram.",
       "For other shapes: dated milestones -> timeline; durations and dependencies -> gantt; two-axis positioning -> quadrantChart; hierarchy or taxonomy -> mindmap; user experience stages -> journey; flow with magnitude -> sankey-beta; work by status -> kanban; multivariate profiles -> radar-beta; nested part-to-whole -> treemap-beta; compositional wiring -> block-beta; deployed services and boundaries -> architecture-beta; software context/container views -> C4Context.",
-      "N options by M criteria -> a TABLE, never a diagram. Quantities or trends -> a chart, not Mermaid. If no row in this rubric matches, use a table, a list, or SVG.",
+      "N options by M criteria -> a TABLE, never a diagram. Quantities or trends -> a chart, not Mermaid. If no row in this rubric matches, use a table, a list, or SVG. For free-form spatial composition - UI mockups, wireframes, positioned annotations - open the sketch playbook instead.",
       "After choosing a diagram type, use Mermaid when automatic placement and edge routing fit it. Use hand-authored SVG for a bespoke spatial figure; do not build boxes-and-arrows from div/flexbox.",
     ],
     structure: [
@@ -61,6 +61,42 @@ export const PLAYBOOKS = [
       "architecture — `architecture-beta\\n  accTitle: Cloud services\\n  accDescr: The API reads and writes the data service inside one cloud boundary.\\n  group cloud(cloud)[Cloud]\\n  service api(server)[API] in cloud\\n  service db(database)[Data] in cloud\\n  api:R --> L:db`",
       'C4 — `C4Context\\n  accDescr: A user reviews artifacts that Lavish reads from a repository.\\n  title System context\\n  Person(user, "User", "Reviews work")\\n  System(app, "Lavish", "Shows artifacts")\\n  System_Ext(repo, "Repository", "Stores source")\\n  Rel(user, app, "Reviews")\\n  Rel(app, repo, "Reads")` (C4Context honors accDescr but not accTitle; keep the visible title and adjacent plain-text fallback)',
       "plain-text fallback — `Fallback: Request → cache check; a hit returns immediately, while a miss calls origin; both paths return a response.` Place it immediately after every diagram, visually compact but available to assistive technology.",
+    ],
+  },
+  {
+    id: "sketch",
+    use_when:
+      "Free-draw visuals no graph DSL expresses: UI mockups, wireframes, spatial layouts, annotated shape drawings the reviewer should edit",
+    choose: [
+      "Reach for a sketch block only when the diagram playbook's rubric has no matching row. Relationships, sequences, states, and data models belong to Mermaid, which auto-routes edges; sketches are for deliberate spatial composition - a screen mockup, a wireframe, a positioned annotation over a layout.",
+      'A sketch block is a `.lavish-sketch` container holding Excalidraw scene JSON in a `script[type="application/lavish-sketch+json"]` child plus visible fallback content. In the Lavish browser it becomes a fully editable Excalidraw whiteboard; standalone and exported copies show only the fallback, so the fallback must carry the same information as HTML or prose.',
+    ],
+    structure: [
+      'Block shape: `<div class="lavish-sketch" data-lavish-sketch-height="420"><script type="application/lavish-sketch+json">{"elements":[...]}</script><p>fallback</p></div>`. The optional height attribute is the embed height in px (default 360, clamped to 240 through 80% of the viewport).',
+      'Scene JSON is an Excalidraw element-skeleton array (or `{"elements": [...]}`), at most 1000 elements. Element types: rectangle, ellipse, diamond, text, arrow, line, frame, image.',
+      "Give every element a stable string `id`. Edit summaries and whiteboard feedback anchor to those ids; without them a small user edit reads back as an add/delete blur.",
+      "Position explicitly: `x`/`y` grow right/down; plan on a coarse grid (multiples of 20 keep alignment clean); size shapes with `width`/`height`; leave breathing room so text never touches shape borders.",
+      'Text that belongs inside a shape goes in the shape\'s `label: {"text": "..."}`, not a separate text element. Standalone `text` elements need `text`, and readable `fontSize` (14+).',
+      'Bind arrows with `start`/`end` of `{"id": "<element id>"}` so they stay attached when the reviewer drags shapes; add an arrow `label` only where the reader would otherwise guess wrong.',
+    ],
+    design_rules: [
+      'Style sparingly with `strokeColor`, `backgroundColor`, `fillStyle` ("solid" | "hachure" | "cross-hatch"), `strokeWidth`, `strokeStyle` ("solid" | "dashed" | "dotted"), `roughness` (0-2), `fontSize`, and `fontFamily` (1 hand-drawn, 2 normal, 3 code). The hand-drawn default IS the aesthetic - heavy color coding fights it.',
+      "The whiteboard canvas is light paper in both page themes, so pick stroke and fill colors that read on white; never derive sketch colors from a dark artifact theme.",
+      "Keep one sketch to one idea and roughly 8-40 elements. A mockup that needs zooming to parse should be several sketches, each with its own caption stating the conclusion.",
+    ],
+    pitfalls: [
+      "Do not sketch anything Mermaid can express: hand-positioned boxes-and-arrows go stale the moment the structure changes, and auto-layout beats manual routing.",
+      "Do not put `</script>` inside scene JSON strings - it terminates the block. The JSON is read raw from the artifact file, so HTML entities inside it are NOT decoded; write plain characters.",
+      "Malformed scene JSON never blanks the page (Lavish keeps the fallback visible), but the editor silently stays away - validate that the JSON parses before shipping.",
+      "The fallback content is not decoration: exported and standalone copies show only it.",
+    ],
+    lavish_notes: [
+      'Reviewers edit sketches exactly like converted Mermaid whiteboards: scenes autosave locally, and Queue feedback returns a tag "whiteboard" prompt whose edit summary is diffed against your authored elements by id, plus scenePath/previewPath files.',
+      "Apply whiteboard feedback by updating the sketch block's scene JSON in the artifact (Lavish live-reloads it); never write the .excalidraw scene file back.",
+      "Sketch blocks and `.mermaid` diagrams share one whiteboard index space in document order.",
+    ],
+    syntax_examples: [
+      'login mockup — `<div class="lavish-sketch" data-lavish-sketch-height="400"><script type="application/lavish-sketch+json">{"elements":[{"id":"phone","type":"rectangle","x":0,"y":0,"width":260,"height":340},{"id":"title","type":"text","x":40,"y":28,"text":"Acme","fontSize":28},{"id":"email","type":"rectangle","x":30,"y":90,"width":200,"height":36,"label":{"text":"email"}},{"id":"pass","type":"rectangle","x":30,"y":140,"width":200,"height":36,"label":{"text":"password"}},{"id":"cta","type":"rectangle","x":30,"y":200,"width":200,"height":40,"backgroundColor":"#ffec99","fillStyle":"solid","label":{"text":"Sign in"}},{"id":"flow","type":"arrow","x":240,"y":220,"width":110,"height":0,"start":{"id":"cta"},"label":{"text":"POST /login"}}]}</script><p>Fallback: phone frame titled Acme with email and password fields and a Sign in button; the button posts to /login.</p></div>`',
     ],
   },
   {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import test from "node:test";
 
 test("check script runs all verification commands", async () => {
@@ -52,12 +52,25 @@ test("build copies local design assets for published artifact injection", async 
   assert.match(buildScript, /tailwindcss-browser\.js/);
 });
 
-test("package metadata matches the GitHub repository used for npm provenance", async () => {
+// This checkout is local-only and is never published. The npm registry carries an unrelated
+// lineage of `lavish-axi` that does not contain this repository's work, so anything that could
+// publish from here - or pull that package back in - has to stay gone rather than merely unused.
+test("the package cannot be published to the npm registry", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 
-  assert.equal(packageJson.repository.url, "git+https://github.com/kunchenguid/lavish-axi.git");
-  assert.equal(packageJson.bugs.url, "https://github.com/kunchenguid/lavish-axi/issues");
-  assert.equal(packageJson.homepage, "https://github.com/kunchenguid/lavish-axi#readme");
+  // `private: true` alone is NOT sufficient: npm 11 still walks a `npm publish --dry-run` on a
+  // private package through to a successful pack. The prepublishOnly script is the guard that
+  // actually fails the command, so it is the one that has to stay.
+  assert.match(packageJson.scripts.prepublishOnly, /process\.exit\(1\)/, "publishing must fail loudly");
+  assert.equal(packageJson.private, true, "private: true is the declarative half of the same intent");
+  assert.equal(packageJson.publishConfig, undefined, "publishConfig only means something when publishing");
+});
+
+test("package metadata points at this fork and nothing upstream", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+
+  assert.equal(packageJson.repository.url, "git+https://github.com/Bitsy-Chuck/lavish_review.git");
+  assert.equal(JSON.stringify(packageJson).includes("kunchenguid"), false, "no upstream URL survives in the manifest");
 });
 
 test("pnpm lock root importer matches the publish manifest", async () => {
@@ -72,20 +85,30 @@ test("pnpm lock root importer matches the publish manifest", async () => {
   }
 });
 
-test("release workflow publishes from the release tag checkout", async () => {
-  const workflow = await readFile(new URL("../.github/workflows/release-please.yml", import.meta.url), "utf8");
+test("no workflow can publish the package or reach an upstream service", async () => {
+  const dir = new URL("../.github/workflows/", import.meta.url);
 
-  assert.match(
-    workflow,
-    /uses: actions\/checkout@v6\n\s+if: \$\{\{ steps\.release\.outputs\.release_created \}\}\n\s+with:\n\s+ref: \$\{\{ steps\.release\.outputs\.tag_name \}\}/,
-  );
+  for (const name of await readdir(dir)) {
+    const workflow = await readFile(new URL(name, dir), "utf8");
+    assert.equal(workflow.includes("npm publish"), false, `${name} must not publish`);
+    assert.equal(workflow.includes("kunchenguid"), false, `${name} must not reference upstream`);
+  }
 });
 
-test("release workflow keeps telemetry env during npm publish prepack", async () => {
-  const workflow = await readFile(new URL("../.github/workflows/release-please.yml", import.meta.url), "utf8");
+// The CLI used to ship an Umami analytics client that reported every invocation to the upstream
+// author's server. It is gone, not merely disabled - so this asserts absence across the whole
+// source tree rather than trusting one config value to stay falsy.
+test("no telemetry or analytics client survives anywhere in the source", async () => {
+  const roots = ["../src/", "../scripts/", "../bin/"];
 
-  assert.match(
-    workflow,
-    /run: npm publish --access public --provenance\n\s+if: \$\{\{ steps\.release\.outputs\.release_created \}\}\n\s+env:\n\s+LAVISH_AXI_UMAMI_HOST: https:\/\/a\.kunchenguid\.com\n\s+LAVISH_AXI_UMAMI_WEBSITE_ID: \$\{\{ vars\.LAVISH_AXI_UMAMI_WEBSITE_ID \}\}/,
-  );
+  for (const root of roots) {
+    const dir = new URL(root, import.meta.url);
+    for (const name of await readdir(dir)) {
+      if (!name.endsWith(".js")) continue;
+      const source = await readFile(new URL(name, dir), "utf8");
+      for (const forbidden of ["umami", "UMAMI", "telemetry", "Telemetry", "kunchenguid"]) {
+        assert.equal(source.includes(forbidden), false, `${root}${name} must not mention ${forbidden}`);
+      }
+    }
+  }
 });

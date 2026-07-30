@@ -1075,7 +1075,7 @@ function resetFrame() {
 // one sidecar.
 // ---------------------------------------------------------------------------
 
-/** @type {Map<number, { diagramId: string, source: string, sourceHash: string }>} */
+/** @type {Map<number, { diagramId: string, source: string, sourceHash: string, kind: "mermaid" | "sketch" }>} */
 const whiteboards = new Map();
 /** @type {number | null} */
 let overlayIndex = null;
@@ -1118,12 +1118,16 @@ async function fetchMermaidSources() {
 }
 
 async function authenticateWhiteboardChannel(token) {
-  const response = await fetch("/api/" + key + "/whiteboard-channel", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ token }),
-  });
-  return response.ok;
+  try {
+    const response = await fetch("/api/" + key + "/whiteboard-channel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 function showWhiteboardError(text) {
@@ -1135,7 +1139,7 @@ function showWhiteboardError(text) {
 function whiteboardRecord(index) {
   let record = whiteboards.get(index);
   if (!record) {
-    record = { diagramId: "", source: "", sourceHash: "" };
+    record = { diagramId: "", source: "", sourceHash: "", kind: "mermaid" };
     whiteboards.set(index, record);
   }
   return record;
@@ -1151,12 +1155,14 @@ async function handleWhiteboardReady(index, mode, isCurrent) {
     const record = whiteboardRecord(index);
     record.source = String(source.source || "");
     record.sourceHash = String(source.hash || "");
+    record.kind = source.kind === "sketch" ? "sketch" : "mermaid";
     if (!isCurrent()) return false;
     postToWhiteboard(index, mode, {
       type: "lavish-whiteboard:init",
       mode,
       diagramIndex: index,
       diagramId: record.diagramId,
+      kind: record.kind,
       source: record.source,
       sourceHash: record.sourceHash,
       saved,
@@ -1365,7 +1371,9 @@ function whiteboardSummaryText(summaryLines) {
 }
 
 async function queueWhiteboardFeedback(index, message, mode) {
-  const diagramId = whiteboardRecord(index).diagramId;
+  const record = whiteboardRecord(index);
+  const diagramId = record.diagramId;
+  const label = record.kind === "sketch" ? "sketch" : "diagram";
   try {
     // Persist the exact reviewed state before queueing, so the paths in the
     // prompt point at what the user actually saw.
@@ -1381,7 +1389,9 @@ async function queueWhiteboardFeedback(index, message, mode) {
     const summary = whiteboardSummaryText(message.summaryLines);
     const promptText =
       (note ? note + "\n\n" : "") +
-      "Whiteboard edits to diagram " +
+      "Whiteboard edits to " +
+      label +
+      " " +
       (index + 1) +
       (diagramId ? " (" + diagramId + ")" : "") +
       ":\n" +
@@ -1394,9 +1404,10 @@ async function queueWhiteboardFeedback(index, message, mode) {
       prompt: promptText,
       selector: "",
       tag: "whiteboard",
-      text: "Whiteboard: diagram " + (index + 1),
+      text: "Whiteboard: " + label + " " + (index + 1),
       target: {
         type: "excalidraw-scene",
+        kind: record.kind,
         diagramIndex: index,
         diagramId,
         sourceHash: String(message.sourceHash || ""),
@@ -1435,6 +1446,7 @@ async function refreshWhiteboardSource() {
     if (nextHash !== record.sourceHash) {
       record.source = source ? String(source.source || "") : "";
       record.sourceHash = nextHash;
+      record.kind = source && source.kind === "sketch" ? "sketch" : "mermaid";
       postToWhiteboardOverlay({
         type: "lavish-whiteboard:sourceChanged",
         source: record.source,
@@ -1451,8 +1463,22 @@ function validWhiteboardIndex(value) {
   return Number.isInteger(index) && index >= 0 && index <= 999 ? index : null;
 }
 
+// The frame reports a source that could not become an editable scene (bad
+// sketch JSON, unparseable Mermaid). Inline placements downgrade to the plain
+// artifact content through the same unavailable path as every other boot
+// failure; the overlay shows its error surface instead.
+function failWhiteboardBoot(index, mode) {
+  if (mode === "inline") {
+    inlineWhiteboardChannels.delete(index);
+    postToFrame({ type: "lavish:whiteboardUnavailable", diagramIndex: index });
+    return;
+  }
+  showWhiteboardError("Could not open the whiteboard: the source could not be converted into an editable scene.");
+}
+
 function handleAuthenticatedWhiteboardMessage(index, message, mode) {
   if (message.type === "lavish-whiteboard:save") handleWhiteboardSave(index, message, mode);
+  if (message.type === "lavish-whiteboard:convertFailed") failWhiteboardBoot(index, mode);
   if (message.type === "lavish-whiteboard:queueFeedback") queueWhiteboardFeedback(index, message, mode);
   if (message.type === "lavish-whiteboard:maximize" && mode === "inline") openWhiteboardOverlay(index);
   if (message.type === "lavish-whiteboard:close" && mode === "overlay") closeWhiteboard();
@@ -1470,13 +1496,28 @@ function handleInlineWhiteboardMessage(event, message) {
     const channelId = String(message.channelToken || "");
     if (!channelId) return;
     authenticateWhiteboardChannel(channelId).then((authenticated) => {
-      if (!authenticated || ended || inlineWhiteboardChannels.has(index)) return;
+      if (ended || inlineWhiteboardChannels.has(index)) return;
+      // The artifact SDK keeps the plain diagram visible until the editor is
+      // confirmed working, so every boot outcome must be reported: active swaps
+      // the whiteboard in, unavailable restores the diagram instead of leaving
+      // a silently blank frame.
+      if (!authenticated) {
+        postToFrame({ type: "lavish:whiteboardUnavailable", diagramIndex: index });
+        return;
+      }
       const channel = { window: event.source, channelId, initialized: false };
       inlineWhiteboardChannels.set(index, channel);
       whiteboardRecord(index).diagramId = String(message.diagramId || "");
       handleWhiteboardReady(index, "inline", () => inlineWhiteboardChannels.get(index) === channel).then(
         (initialized) => {
-          if (inlineWhiteboardChannels.get(index) === channel) channel.initialized = initialized;
+          if (inlineWhiteboardChannels.get(index) !== channel) return;
+          channel.initialized = initialized;
+          if (initialized) {
+            postToFrame({ type: "lavish:whiteboardActive", diagramIndex: index });
+            return;
+          }
+          inlineWhiteboardChannels.delete(index);
+          postToFrame({ type: "lavish:whiteboardUnavailable", diagramIndex: index });
         },
       );
     });
@@ -1500,7 +1541,12 @@ function handleOverlayWhiteboardMessage(event, message) {
       const isCurrent = () =>
         overlayIndex === index && overlayChannelId === channelId && event.source === whiteboardFrame.contentWindow;
       if (!authenticated) {
-        if (isCurrent()) overlayChannelId = "";
+        if (isCurrent()) {
+          overlayChannelId = "";
+          showWhiteboardError(
+            "Could not open the whiteboard: the editor frame could not authenticate with the local server.",
+          );
+        }
         return;
       }
       if (!isCurrent()) return;

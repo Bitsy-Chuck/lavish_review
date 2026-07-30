@@ -160,6 +160,30 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
     shortSvg.scrollWidth = shortSvg.clientWidth = 390;
     shortSvg.scrollHeight = shortSvg.clientHeight = 22;
 
+    const sketchScript = node("script");
+    sketchScript.textContent = '{"elements":[{"id":"m1","type":"rectangle","x":0,"y":0,"width":120,"height":60}]}';
+    // Distinct tags keep the audit's nth-of-type selector expectations for the
+    // pre-existing div scroller untouched.
+    const sketchContainer = append(body, node("section", { class: "lavish-sketch" }));
+    sketchContainer.className = "lavish-sketch";
+    sketchContainer.style = {};
+    sketchContainer.querySelector = (sel) =>
+      sel === 'script[type="application/lavish-sketch+json"]' ? sketchScript : null;
+    sketchContainer.insertAdjacentElement = (_position, child) => append(body, child);
+    sketchContainer.getBoundingClientRect = () => rect(500, 120);
+    sketchContainer.getClientRects = () => [];
+    sketchContainer.scrollWidth = sketchContainer.clientWidth = 500;
+    sketchContainer.scrollHeight = sketchContainer.clientHeight = 120;
+
+    const emptySketch = append(body, node("aside", { class: "lavish-sketch" }));
+    emptySketch.className = "lavish-sketch";
+    emptySketch.style = {};
+    emptySketch.querySelector = () => null;
+    emptySketch.getBoundingClientRect = () => rect(500, 30);
+    emptySketch.getClientRects = () => [];
+    emptySketch.scrollWidth = emptySketch.clientWidth = 500;
+    emptySketch.scrollHeight = emptySketch.clientHeight = 30;
+
     const documentElement = node("html", {}, [body]);
     documentElement.style = {};
     documentElement.scrollWidth = 500;
@@ -188,15 +212,23 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
       querySelectorAll(selector) {
         if (selector === "svg") return [svg, shortSvg];
         if (selector === ".mermaid") return [container, shortContainer];
+        if (selector === ".lavish-sketch") return [sketchContainer, emptySketch];
+        if (selector === ".mermaid, .lavish-sketch") return [container, shortContainer, sketchContainer, emptySketch];
         return [];
       },
       createElement(tag) {
         const el = node(tag);
         el.style = {};
+        el.isConnected = true;
         el.setAttribute = (name, value) => {
           attrsFor(el)[name] = String(value);
         };
         el.getBoundingClientRect = () => rect(iframeWidth, 456);
+        el.remove = () => {
+          el.isConnected = false;
+          const siblings = el.parentElement?.children;
+          if (siblings) siblings.splice(siblings.indexOf(el), 1);
+        };
         return el;
       },
       elementFromPoint() {
@@ -211,10 +243,34 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
     const hooks = {};
     createArtifactSdk(() => "", undefined, undefined, hooks);
     hooks.enhanceMermaid();
-    assert.equal(container.style.display, "none");
     const embeddedIframe = body.children.find((child) => child.tagName === "IFRAME");
     assert.match(embeddedIframe.style.cssText, /box-sizing:border-box/);
+    assert.match(embeddedIframe.style.cssText, /display:none/);
+    assert.notEqual(container.style.display, "none", "the diagram stays visible until the whiteboard confirms boot");
+    hooks.handleWhiteboardControl({ type: "lavish:whiteboardActive", diagramIndex: 0 });
+    assert.equal(container.style.display, "none");
+    assert.equal(embeddedIframe.style.display, "block");
     assert.equal(shortContainer.style.display, undefined, "a short live diagram is not whiteboard-embedded");
+
+    const sketchIframe = body.children.find(
+      (child) => child.tagName === "IFRAME" && String(child.src || "").includes("diagramIndex=2"),
+    );
+    assert.ok(sketchIframe, "a sketch container boots a hidden whiteboard frame under the unified index");
+    assert.match(sketchIframe.style.cssText, /display:none/);
+    assert.match(sketchIframe.style.cssText, /height:360px/);
+    assert.notEqual(
+      sketchContainer.style.display,
+      "none",
+      "sketch fallback stays visible until the editor confirms boot",
+    );
+    assert.equal(
+      body.children.some((child) => child.tagName === "IFRAME" && String(child.src || "").includes("diagramIndex=3")),
+      false,
+      "a sketch container without scene JSON is not embedded",
+    );
+    hooks.handleWhiteboardControl({ type: "lavish:whiteboardActive", diagramIndex: 2 });
+    assert.equal(sketchContainer.style.display, "none");
+    assert.equal(sketchIframe.style.display, "block");
     assert.equal(svg.style.touchAction, "pan-y");
     hooks.setMermaidFrozen(false);
     assert.equal(svg.style.touchAction, "none");
@@ -259,6 +315,7 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
 
     shortDiagramHeight = 80;
     hooks.enhanceMermaid();
+    hooks.handleWhiteboardControl({ type: "lavish:whiteboardActive", diagramIndex: 1 });
     assert.equal(shortContainer.style.display, "none");
     assert.equal(
       hooks.auditLayout().find((finding) => finding.kind === "scaled-down-diagram" && finding.selector.includes("div"))
@@ -280,6 +337,17 @@ test("Mermaid enhancement snapshots geometry before whiteboard hiding and the la
         severity: "warning",
       },
       "embedded audits use the iframe's current width after a resize",
+    );
+
+    const scrollerIframe = scroller.children.find((child) => child.tagName === "IFRAME");
+    hooks.handleWhiteboardControl({ type: "lavish:whiteboardUnavailable", diagramIndex: 1 });
+    assert.equal(scroller.children.includes(scrollerIframe), false, "a failed whiteboard's frame is removed");
+    assert.equal(shortContainer.style.display, "", "the plain diagram is restored when the whiteboard fails");
+    hooks.enhanceMermaid();
+    assert.equal(
+      scroller.children.some((child) => child.tagName === "IFRAME"),
+      false,
+      "a failed container is not re-embedded into a retry loop",
     );
   } finally {
     for (const [key, value] of Object.entries(saved)) {

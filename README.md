@@ -1,24 +1,12 @@
 <h1 align="center">lavish-axi</h1>
 <p align="center">
-  <a href="https://github.com/kunchenguid/lavish-axi/actions/workflows/ci.yml"
-    ><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/kunchenguid/lavish-axi/ci.yml?style=flat-square&label=ci"
-  /></a>
-  <a href="https://github.com/kunchenguid/lavish-axi/actions/workflows/release-please.yml"
-    ><img alt="Release" src="https://img.shields.io/github/actions/workflow/status/kunchenguid/lavish-axi/release-please.yml?style=flat-square&label=release"
-  /></a>
-  <a href="https://www.npmjs.com/package/lavish-axi"
-    ><img alt="npm" src="https://img.shields.io/npm/v/lavish-axi?style=flat-square"
-  /></a>
-  <a href="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue?style=flat-square"
-    ><img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue?style=flat-square"
-  /></a>
-  <a href="https://x.com/kunchenguid"
-    ><img alt="X" src="https://img.shields.io/badge/X-@kunchenguid-black?style=flat-square"
-  /></a>
-  <a href="https://discord.gg/Wsy2NpnZDu"
-    ><img alt="Discord" src="https://img.shields.io/discord/1439901831038763092?style=flat-square&label=discord"
-  /></a>
+  <img alt="Local only" src="https://img.shields.io/badge/build-local%20only-informational?style=flat-square" />
+  <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue?style=flat-square" />
 </p>
+
+> **This is a local-only fork.** It is never published, and the `lavish-axi` package on the
+> npm registry is a separate upstream lineage that does **not** contain this repository's work.
+> Never install or run it with `npx` - build here and use the linked local binary.
 
 <h3 align="center">For when a rich editor is not rich enough.</h3>
 
@@ -45,17 +33,21 @@ Lavish Editor is an [AXI](https://axi.md), which means -
 
 ## Quick Start
 
-Install the Lavish skill in the [Agent Skills](https://agentskills.io) format with [`npx skills`](https://github.com/vercel-labs/skills):
+Build the CLI and put it on your PATH, then install the skill from this checkout:
 
 ```sh
-npx skills add kunchenguid/lavish-axi --skill lavish
+npm install          # once
+npm run build        # produces dist/cli.mjs
+npm link             # puts `lavish-axi` on your PATH, pointing at this checkout
+
+npm run build:skill  # regenerates skills/lavish/SKILL.md
+cp skills/lavish/SKILL.md ~/.claude/skills/lavish/SKILL.md
+cp skills/lavish/SKILL.md ~/.agents/skills/lavish/SKILL.md
 ```
 
-That is the entire setup - no npm install needed.
-The skill teaches your agent to run Lavish through `npx -y lavish-axi`, so the CLI comes along on demand.
-Its frontmatter also includes Hermes Agent metadata, so Hermes-compatible harnesses can categorize and surface it as a first-class productivity skill.
-This installs the public `lavish` skill.
-The repository also contains an internal `lavish-design` brand skill for maintainers; default `npx skills add ... --list` and skills.sh discovery hide it unless `INSTALL_INTERNAL_SKILLS=1` is set.
+Re-run the last three lines whenever the guidance in `src/` changes, so the installed skill does not drift from the build.
+The skill's frontmatter includes Hermes Agent metadata, so Hermes-compatible harnesses can categorize and surface it as a first-class productivity skill.
+The repository also contains an internal `lavish-design` brand skill for maintainers, marked `metadata.internal: true` so skill listings hide it unless `INSTALL_INTERNAL_SKILLS=1` is set.
 
 Then, in agents that expose skills as slash commands (Claude Code, for example), invoke it directly:
 
@@ -65,28 +57,29 @@ Then, in agents that expose skills as slash commands (Claude Code, for example),
 
 Or just ask for anything that is easier to grasp visually - a plan, comparison, diagram, table, code view, or report - and the agent loads the skill on its own when it recognizes the task.
 
-By default the skill lands in the current project's skills directory (`.claude/skills/`, for example); add `-g` to install it for all projects (`~/.claude/skills/`).
+Copying to `~/.claude/skills/` installs it for all projects; drop it in a project's own `.claude/skills/` to scope it to that project.
 
 ## Other Ways to Use Lavish
 
 The skill is the recommended path, but it is not the only one.
 
-### Zero setup
+### No install at all
 
-Lavish is an AXI, so any capable agent can run the CLI directly with nothing installed at all.
-Just tell your agent:
+Run the built CLI straight out of this checkout, without linking it:
 
 ```
-Use `npx lavish-axi` to write a product or technical plan for what we discussed.
+Use `node /path/to/lavish-axi/dist/cli.mjs` to write a product or technical plan for what we discussed.
 ```
+
+There is deliberately no `npx` form. The registry package of that name is a different upstream lineage and would not run this code.
 
 ### Session hook
 
 Want Lavish's ambient context - including your live open sessions - fed into every agent session instead of loading on demand?
-Install the CLI globally and opt into the hook:
+Link the CLI and opt into the hook:
 
 ```sh
-npm install -g lavish-axi
+npm link          # from this checkout
 lavish-axi setup hooks
 ```
 
@@ -97,8 +90,7 @@ Unlike the skill, the hook also shows your live open sessions, so a fresh agent 
 ### From source
 
 ```sh
-git clone https://github.com/kunchenguid/lavish-axi.git
-cd lavish-axi
+cd /path/to/lavish-axi
 pnpm install --frozen-lockfile
 pnpm run build
 pnpm link
@@ -184,11 +176,14 @@ pnpm link
   The agent updates the artifact's Mermaid source, which remains authoritative.
   Flowchart, sequence, class, ER, and state diagrams convert to editable shapes; other diagram types are images that reviewers can draw and annotate.
   Lavish changes only the browser view, so saved, standalone, and exported artifacts still render plain Mermaid.
+- **Agent sketches** - Agents can also draw free-form: a `.lavish-sketch` block carrying Excalidraw scene JSON (in a `script[type="application/lavish-sketch+json"]` child) becomes the same embedded editable whiteboard - mockups, wireframes, and arbitrary shapes rather than converted diagram text.
+  Sketches share the Mermaid whiteboards' behavior end to end: click to edit, Fullscreen, local autosave, staleness detection, and **Queue feedback** with an edit summary diffed against the agent's authored elements.
+  The block's non-script content is the fallback that standalone and exported copies show, and it stays visible if the editor cannot boot.
 - **Server cleanup** - The detached server stops after the last session ends when nothing is connected, or after `LAVISH_AXI_IDLE_TIMEOUT_MS` (default 30 minutes) with no browser or poll connections.
   Set `LAVISH_AXI_IDLE_TIMEOUT_MS=0` or `off` to disable idle self-shutdown.
 - **Local-first state** - Session state stays under `~/.lavish-axi/` by default, or `LAVISH_AXI_STATE_DIR` when set.
 - **Server port** - Set `LAVISH_AXI_PORT` to choose the server port; it defaults to `4387`.
-- **Network binding** - The server binds to loopback (`127.0.0.1`) by default. Set `LAVISH_AXI_HOST` to bind elsewhere; a wildcard (`0.0.0.0` or `::`) binds every interface. Binding beyond loopback exposes an unauthenticated server that can read and serve arbitrary local files to anything that can reach it, so only do so on a trusted network. Set `LAVISH_AXI_LINK_HOST` to control the hostname written into generated session links (defaults to the bind address, or loopback when bound to a wildcard).
+- **Network binding** - The server binds to loopback (`127.0.0.1`) by default. Set `LAVISH_AXI_HOST` to bind elsewhere; a wildcard (`0.0.0.0` or `::`) binds every interface. Binding beyond loopback exposes an unauthenticated server that can read and serve arbitrary local files to anything that can reach it, so only do so on a trusted network. Set `LAVISH_AXI_LINK_HOST` to control the hostname written into generated session links (defaults to the bind address, or loopback when bound to a wildcard). Reverse proxies running on loopback that terminate TLS (such as `tailscale serve`) are trusted for `X-Forwarded-Proto`, so same-origin-guarded actions (whiteboard editing, publishing) keep working when the page is reached over HTTPS through them.
 - **Browser opening** - Set `LAVISH_AXI_NO_OPEN=1`, equivalent to `--no-open`, to create or resume a session without launching a browser window.
 
 ## CLI Reference

@@ -26,7 +26,7 @@ import {
   scaledDownDiagramSeverity,
 } from "./artifact-sdk.js";
 import * as mermaidNode from "./mermaid-node.js";
-import { extractMermaidSources, mermaidSourceHash } from "./mermaid-source.js";
+import { extractWhiteboardSources, mermaidSourceHash } from "./mermaid-source.js";
 import {
   isValidDiagramIndex,
   isValidWhiteboardKey,
@@ -176,6 +176,11 @@ export async function serve({
   whiteboardAssetsDir = defaultWhiteboardAssetsDir(),
 }) {
   const app = express();
+  // Loopback reverse proxies (tailscale serve, an ssh-tunneled nginx) terminate
+  // TLS and forward plain HTTP. Without trusting their x-forwarded-proto,
+  // req.protocol stays "http" and every isSameOriginRequest guard rejects the
+  // proxied browser's https Origin on scheme alone.
+  app.set("trust proxy", "loopback");
   const store = new SessionStore(stateFile);
   const events = new EventEmitter();
   const watchers = new Map();
@@ -818,8 +823,9 @@ export async function serve({
         return;
       }
       const html = await readFile(session.file, "utf8").catch(() => "");
-      const sources = extractMermaidSources(html).map(({ index, source }) => ({
+      const sources = extractWhiteboardSources(html).map(({ index, kind, source }) => ({
         index,
+        kind,
         source,
         hash: mermaidSourceHash(source),
       }));
