@@ -43,7 +43,7 @@ import {
 import { publishToHtmlApp } from "./html-app.js";
 import { injectLavishSdk } from "./html-transform.js";
 import { createLayoutWarningRecorder } from "./layout-log.js";
-import { bindHost, hostForUrl, linkHost } from "./paths.js";
+import { bindHost, hostForUrl, linkHost, publicOrigin } from "./paths.js";
 import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
 
 const chromeClientUrl = new URL("./chrome-client.js", import.meta.url);
@@ -173,6 +173,7 @@ export async function serve({
   idleTimeoutMs = resolveIdleTimeoutMs(),
   host = bindHost(),
   linkHost: linkHostName = linkHost(),
+  publicOrigin: publicOriginValue = publicOrigin(),
   whiteboardAssetsDir = defaultWhiteboardAssetsDir(),
 }) {
   const app = express();
@@ -286,7 +287,11 @@ export async function serve({
         res.json({ key, file, url: existing.url, status: "user-ended" });
         return;
       }
-      const sessionUrl = `http://${hostForUrl(linkHostName)}:${publicPort}/session/${key}`;
+      // Behind a reverse proxy the bound port is not reachable, so an explicit public
+      // origin wins over the host:port form. See publicOrigin() in paths.js.
+      const sessionUrl = publicOriginValue
+        ? `${publicOriginValue}/session/${key}`
+        : `http://${hostForUrl(linkHostName)}:${publicPort}/session/${key}`;
       const url = shouldDisableLayoutGateOpen(req.body || {}) ? appendNoGateParam(sessionUrl) : sessionUrl;
       const session = await store.upsertSession(file, sessionUrl);
       noteStateChange(key);

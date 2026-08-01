@@ -33,6 +33,26 @@ export function linkHost(env = process.env) {
   return env.LAVISH_AXI_LINK_HOST?.trim() || clientHost(env);
 }
 
+// Absolute origin to build session links from (LAVISH_AXI_PUBLIC_ORIGIN), for when the
+// server sits behind a reverse proxy on another scheme, host, or port - e.g. Caddy
+// terminating TLS at https://lavish.example in front of loopback:4387. Without it the
+// generated link hardcodes http:// and the real bound port, which is unreachable through
+// such a proxy. Returns null when unset or unusable so the caller keeps the port-based URL:
+// a bad value should degrade to the working local link, never to a broken public one.
+// Only http/https are accepted, and the value is normalized to a bare origin (no path, no
+// trailing slash) because "/session/<key>" is always appended to it.
+export function publicOrigin(env = process.env) {
+  const raw = env.LAVISH_AXI_PUBLIC_ORIGIN?.trim();
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
 // Brackets an IPv6 literal so it can be safely interpolated into a URL authority.
 // IPv4 addresses and hostnames pass through unchanged.
 export function hostForUrl(host) {

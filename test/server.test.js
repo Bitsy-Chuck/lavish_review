@@ -1096,6 +1096,42 @@ test("session URLs use the configured linkHost while binding to loopback", async
   }
 });
 
+test("publicOrigin overrides the host:port session URL and is what gets persisted", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  const stateFile = path.join(dir, "state.json");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({
+    port: 0,
+    stateFile,
+    version: "9.9.9-test",
+    host: "127.0.0.1",
+    linkHost: "host.example",
+    publicOrigin: "https://lavish.example",
+  });
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.port}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const body = await res.json();
+    const key = sessionKey(await canonicalFile(artifact));
+
+    assert.equal(body.url, `https://lavish.example/session/${key}`);
+    // The ephemeral bound port must not leak into a proxied link.
+    assert.ok(!body.url.includes(String(server.port)));
+    // The stored URL is what `lavish-axi` with no args later shows the agent, so the
+    // reachable link has to be the one that is persisted, not just the one returned here.
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    const stored = Object.values(state.sessions ?? state).find((s) => s?.url);
+    assert.equal(stored.url, `https://lavish.example/session/${key}`);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("session URLs can disable the layout gate for one open", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
