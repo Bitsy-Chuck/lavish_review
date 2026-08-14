@@ -243,6 +243,20 @@ export const RESPONSIVE_LAYOUT_RULES = [
   'Write `<meta name="viewport" content="width=device-width, initial-scale=1">` into the artifact head yourself. Lavish injects one when it is missing so a phone never lays the artifact out at the ~980px desktop fallback, but the saved file should stand on its own when opened straight from disk.',
 ];
 
+// Prose rules for the copy inside artifacts, with the same weight as RESPONSIVE_LAYOUT_RULES:
+// an artifact is a review surface, so its text must read fast and unambiguously. This is
+// ASD-STE100 (Simplified Technical English) plus the Google developer documentation style
+// guide, compressed to the rules that matter for artifact copy. They apply to every artifact,
+// always - not only when a user asks for them.
+export const WRITING_STYLE_RULES = [
+  "Write every artifact's prose in Simplified Technical English (ASD-STE100) with Google developer documentation style; the rules below are the working set and they always apply",
+  "Keep sentences short - at most 20 words for an instruction, 25 for a description - give one instruction per sentence, and start instructions with the verb",
+  "Use active voice and present tense, and name the actor: `the server rejects stale keys`, not `stale keys are rejected`",
+  "Use one term for one thing across the whole artifact, never rotate synonyms, and spell out an acronym at first use",
+  "Prefer simple words (use, start, stop, show - not utilize, initiate, terminate, demonstrate), address the reader as you, do not write please, and avoid Latin abbreviations such as e.g. and i.e.",
+  'Use sentence case for headings, numbered lists for steps, at most 6 sentences per paragraph, and a plain dash "-", never an em dash',
+];
+
 // Single source for how agents choose an artifact's design direction. It flows into the
 // no-args home output, top-level --help, the generated skill (all via DESIGN_SYSTEM_HINT),
 // the `lavish-axi design` summary, and the design command help. Edit the rule here only;
@@ -304,6 +318,11 @@ export function createDesignOutput() {
         "Requirements, not suggestions - an artifact that ignores them is unreadable on the phone the reviewer is holding.",
       artifact_viewport: ARTIFACT_VIEWPORT_BUDGET,
       rules: RESPONSIVE_LAYOUT_RULES,
+    },
+    writing_style: {
+      instruction:
+        "Requirements with the same weight as the layout rules: artifact prose always follows Simplified Technical English (ASD-STE100) plus the Google developer documentation style guide.",
+      rules: WRITING_STYLE_RULES,
     },
     design: {
       summary:

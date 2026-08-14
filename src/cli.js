@@ -13,6 +13,7 @@ import {
   DESIGN_PRIORITY_RULE,
   DESIGN_SYSTEM_HINT,
   RESPONSIVE_LAYOUT_RULES,
+  WRITING_STYLE_RULES,
 } from "./design-reference.js";
 import {
   buildSelfContainedHtml,
@@ -118,6 +119,8 @@ export function createHomeOutput({ bin, sessions, includeSessions = true }) {
     // Its own section rather than more visual_guidance bullets: this list is long enough to drown
     // that one out, and reviewers open artifacts on phones often enough that it needs a heading.
     responsive_layout: RESPONSIVE_LAYOUT_RULES,
+    // Prose is reviewed as hard as layout, so the writing rules ride along with the same weight.
+    writing_style: WRITING_STYLE_RULES,
     playbooks: listPlaybooks(),
     help: [
       "Run `lavish-axi <html-file>` to open or resume a Lavish Editor session. If the user explicitly ended the session from the browser, this refuses to reopen it and explains why instead of reopening uninvited - pass `--reopen` only when the user asks for further review or something important needs their visual attention",

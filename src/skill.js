@@ -76,6 +76,12 @@ Requirements, not suggestions - artifacts get reviewed on a phone as often as on
 
 ${bullets(home.responsive_layout)}
 
+## Writing style
+
+Requirements for every artifact's prose, always in force - the same weight as the layout rules above.
+
+${bullets(home.writing_style)}
+
 ## Playbooks
 
 Run \`lavish-axi playbook <id>\` for focused, detailed guidance on any of these.

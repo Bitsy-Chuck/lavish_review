@@ -93,6 +93,13 @@ test("home output teaches agents when and how to use Lavish Editor", () => {
   assert.ok(output.responsive_layout.some((item) => /overflow-x-auto/.test(item) && /table/i.test(item)));
   assert.ok(output.responsive_layout.some((item) => /clamp\(\)/.test(item)));
   assert.ok(output.responsive_layout.some((item) => /useMaxWidth: false/.test(item)));
+  // Prose is a review surface too: artifact copy must follow ASD-STE100 plus Google developer
+  // style, always - so the rules ride in the same output that carries the layout rules.
+  assert.ok(Array.isArray(output.writing_style) && output.writing_style.length <= 6);
+  assert.ok(output.writing_style.some((item) => item.includes("ASD-STE100")));
+  assert.ok(output.writing_style.some((item) => /active voice/.test(item) && /present tense/.test(item)));
+  assert.ok(output.writing_style.some((item) => /one term/i.test(item)));
+  assert.ok(output.writing_style.some((item) => /em dash/i.test(item)));
   assert.ok(output.responsive_layout.some((item) => /44x44/.test(item)));
   assert.ok(output.responsive_layout.some((item) => /width=device-width/.test(item)));
   assert.ok(output.playbooks.some((item) => item.id === "diagram"));
@@ -194,6 +201,10 @@ test("design output prints copy-pasteable local /design URLs so agents can opt i
   assert.ok(output.design.summary.includes(DESIGN_PRIORITY_RULE), "design summary embeds the single-sourced rule");
   assert.match(output.design.summary, /does not auto-inject/);
   assert.match(output.design.summary, /^Use this .*fallback only if/i);
+  assert.ok(
+    output.writing_style.rules.some((item) => item.includes("ASD-STE100")),
+    "the design command carries the writing rules alongside the layout rules",
+  );
   assert.match(output.design.summary, /no design direction/i);
   assert.match(output.design.summary, /check first/i);
   assert.match(output.design.cdn_snippet, /\/design\/daisyui\.css/);

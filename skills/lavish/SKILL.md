@@ -59,6 +59,17 @@ Requirements, not suggestions - artifacts get reviewed on a phone as often as on
 - Every interactive control needs a touch target of at least 44x44 CSS pixels on a phone - buttons, links in button rows, close controls, tabs, and anything with `data-lavish-action`. Small icon-only controls should grow their hit area (padding, or an inset `::after` overlay) rather than shrink to the icon.
 - Write `<meta name="viewport" content="width=device-width, initial-scale=1">` into the artifact head yourself. Lavish injects one when it is missing so a phone never lays the artifact out at the ~980px desktop fallback, but the saved file should stand on its own when opened straight from disk.
 
+## Writing style
+
+Requirements for every artifact's prose, always in force - the same weight as the layout rules above.
+
+- Write every artifact's prose in Simplified Technical English (ASD-STE100) with Google developer documentation style; the rules below are the working set and they always apply
+- Keep sentences short - at most 20 words for an instruction, 25 for a description - give one instruction per sentence, and start instructions with the verb
+- Use active voice and present tense, and name the actor: `the server rejects stale keys`, not `stale keys are rejected`
+- Use one term for one thing across the whole artifact, never rotate synonyms, and spell out an acronym at first use
+- Prefer simple words (use, start, stop, show - not utilize, initiate, terminate, demonstrate), address the reader as you, do not write please, and avoid Latin abbreviations such as e.g. and i.e.
+- Use sentence case for headings, numbered lists for steps, at most 6 sentences per paragraph, and a plain dash "-", never an em dash
+
 ## Playbooks
 
 Run `lavish-axi playbook <id>` for focused, detailed guidance on any of these.

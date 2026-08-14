@@ -43,6 +43,11 @@ test("createSkillMarkdown mirrors the no-args home output", () => {
     assert.ok(md.includes(item), `includes visual guidance: ${item.slice(0, 32)}...`);
   }
 
+  assert.ok(md.includes("## Writing style"), "the skill carries the writing rules as their own section");
+  for (const item of home.writing_style) {
+    assert.ok(md.includes(item), `includes writing style: ${item.slice(0, 32)}...`);
+  }
+
   for (const playbook of home.playbooks) {
     assert.ok(md.includes(playbook.id), `includes playbook id: ${playbook.id}`);
     assert.ok(md.includes(playbook.use_when), `includes playbook use_when: ${playbook.id}`);

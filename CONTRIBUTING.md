@@ -23,6 +23,9 @@ green - it is the only gate, since no CI runs on your work.
 
 Use TDD for bug fixes and new features: write the failing test first, then the fix.
 
+Write the commit message per the standard in AGENTS.md: tpope + cbea.ms seven rules, with this
+repo's `type:` prefix and a 72-column body that says what and why.
+
 ## After changing agent-facing guidance
 
 Guidance strings in `src/cli.js`, `src/design-reference.js`, and `src/playbooks.js` feed the
