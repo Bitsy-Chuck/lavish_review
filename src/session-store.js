@@ -262,7 +262,11 @@ function normalizeLayoutWarnings(layoutWarnings, deliveredKeys = new Set()) {
     .map((warning) => {
       const selector = String(warning.selector || "");
       const kind = String(warning.kind || "layout-warning");
-      const identity = String(warning.identity || "");
+      // Kept only when it says something `selector` does not, so a client that sends identity
+      // unconditionally cannot change the record shape for findings that were never truncated.
+      // The key is the same string either way, so this is shape hygiene, not a behavior change.
+      const rawIdentity = String(warning.identity || "");
+      const identity = rawIdentity !== selector ? rawIdentity : "";
       return {
         selector,
         kind,

@@ -588,6 +588,60 @@ test("Mermaid descendant identity survives a regenerated svg id", () => {
   );
 });
 
+test("the display selector never anchors to a minted Mermaid id", () => {
+  withLayoutAudit(
+    (body) => {
+      const container = append(body, auditNode("div", { attrs: { "data-lavish-mermaid": "" } }));
+      const svg = append(container, auditNode("svg", { attrs: { id: "mermaid-1785021297984" } }));
+      const svgChild = (tag, attrs = {}) => auditNode(tag, { attrs, ownerSVGElement: svg });
+      const nodes = append(svg, svgChild("g"));
+      const nodeLayer = append(nodes, svgChild("g"));
+      for (const [index, suffix] of ["P-0", "Q-1"].entries()) {
+        const group = append(nodeLayer, svgChild("g", { id: `mermaid-1785021297984-flowchart-${suffix}` }));
+        const inner = append(group, svgChild("g"));
+        const foreignObject = append(inner, svgChild("foreignObject"));
+        append(foreignObject, auditNode("div", { overflowBy: 40 * (index + 1) }));
+      }
+      return { svg };
+    },
+    ({ hooks, svg }) => {
+      const selectors = () =>
+        hooks
+          .auditLayout()
+          .filter((finding) => finding.kind === "element-scroll-overflow")
+          .map((finding) => finding.selector);
+
+      const before = selectors();
+      assert.deepEqual(
+        before,
+        ["g > g:nth-of-type(1) > g > foreignobject > div", "g > g:nth-of-type(2) > g > foreignobject > div"],
+        "inside a Mermaid svg the display anchors to structure, never to an id that changes each render",
+      );
+
+      svg.id = "mermaid-1785099999999";
+      assert.deepEqual(selectors(), before, "regenerating the svg id leaves the display selector untouched");
+    },
+  );
+});
+
+test("a stable id outside Mermaid still anchors the display selector", () => {
+  withLayoutAudit(
+    (body) => {
+      const app = append(body, auditNode("div", { attrs: { id: "app" } }));
+      const section = append(app, auditNode("section"));
+      append(section, auditNode("div", { overflowBy: 24 }));
+      return {};
+    },
+    ({ hooks }) => {
+      const selectors = hooks
+        .auditLayout()
+        .filter((finding) => finding.kind === "element-scroll-overflow")
+        .map((finding) => finding.selector);
+      assert.deepEqual(selectors, ["div#app > section > div"], "author-written ids keep the display short");
+    },
+  );
+});
+
 function node(tag, attrs = {}, children = []) {
   const el = {
     tagName: tag.toUpperCase(),

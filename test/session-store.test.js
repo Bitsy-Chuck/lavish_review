@@ -481,6 +481,40 @@ test("findings sharing a display selector track persistence independently", asyn
   }
 });
 
+test("an identity that merely repeats the selector is not stored", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    await store.recordLayoutWarnings(session.key, {
+      layout_warnings: [
+        {
+          selector: "main > .card",
+          identity: "main > .card",
+          kind: "element-horizontal-overflow",
+          overflowPx: 24,
+          viewportWidth: 720,
+          severity: "error",
+        },
+      ],
+    });
+
+    const delivered = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(delivered.layout_warnings.length, 1);
+    assert.equal(
+      "identity" in delivered.layout_warnings[0],
+      false,
+      "a redundant identity keys identically to the selector, so storing it would only fork the record shape",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("a warning is fresh again after a clean audit resolves it", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
   try {

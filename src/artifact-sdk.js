@@ -300,6 +300,19 @@ export function createArtifactSdk(
     );
   }
 
+  // An id may anchor the display selector only if it outlives a re-render. Mermaid's do not: it
+  // mints its svg root id per render (svg#mermaid-<ms>) and derives every descendant id from it,
+  // so a display path built on one goes stale on the next reload, theme re-render, or live-svg to
+  // whiteboard swap. Skip ids anywhere inside a Mermaid-rendered svg and fall through to
+  // structural position, which is deterministic for a given diagram source.
+  function hasStableId(node) {
+    if (!node.id) return false;
+    for (let scan = node; scan; scan = scan.parentElement) {
+      if (String(scan.tagName || "").toLowerCase() === "svg" && isMermaidSvg(scan)) return false;
+    }
+    return true;
+  }
+
   function selector(el) {
     if (!el || !el.tagName) return "";
 
@@ -307,7 +320,7 @@ export function createArtifactSdk(
     let node = el;
     while (node && node.nodeType === 1 && parts.length < 5) {
       let part = node.tagName.toLowerCase();
-      if (node.id) {
+      if (hasStableId(node)) {
         part += "#" + CSS.escape(node.id);
         parts.unshift(part);
         break;
@@ -326,11 +339,13 @@ export function createArtifactSdk(
   }
 
   // The dedupe identity of an element: its full path, never capped and never carrying an id.
-  // `selector` above is built to be read by a human, so it stops at 5 parts and short-circuits on
-  // an id. Both make it ambiguous as a key - two different elements deeper than the cap render as
-  // one string, and inside a Mermaid diagram the id short-circuit makes the string change on every
-  // re-render because Mermaid regenerates its ids. Position is what stays stable across a reload,
-  // so identity uses only tag names plus :nth-of-type, all the way to the root.
+  // `selector` above is built to be read by a human, so it stops at 5 parts and anchors to a
+  // stable id when one exists - both make it ambiguous as a key, since two different elements
+  // deeper than the cap render as one string. Identity refuses ids entirely, even stable ones:
+  // agent-generated HTML repeats ids often enough that an id-anchored path can name two distinct
+  // elements, which is exactly the silent-collision class this key exists to prevent. Position is
+  // what stays stable across a reload, so identity uses only tag names plus :nth-of-type, all the
+  // way to the root.
   function identitySelector(el) {
     if (!el || !el.tagName) return "";
 
