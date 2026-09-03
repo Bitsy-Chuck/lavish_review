@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, realpathSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +18,7 @@ import {
   createArtifactSdk,
   deriveLavishQueueKey,
   fragmentsSignificantlyOverlap,
+  installReadAloudButtons,
   isModeToggleHotkeyEvent,
   isNativeInteractiveControl,
   isSvgLayoutDescendant,
@@ -45,6 +46,8 @@ import { injectLavishSdk } from "./html-transform.js";
 import { createLayoutWarningRecorder } from "./layout-log.js";
 import { bindHost, hostForUrl, linkHost, publicOrigin } from "./paths.js";
 import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
+import { imageNarration, segmentArtifact } from "./read-aloud-blocks.js";
+import { describeRendering, openReadAloud, pruneRenderings, ReadAloudConfigError, readAloudStatus } from "./tts.js";
 
 const chromeClientUrl = new URL("./chrome-client.js", import.meta.url);
 const chromeCssUrl = new URL("./chrome.css", import.meta.url);
@@ -175,6 +178,7 @@ export async function serve({
   linkHost: linkHostName = linkHost(),
   publicOrigin: publicOriginValue = publicOrigin(),
   whiteboardAssetsDir = defaultWhiteboardAssetsDir(),
+  readAloud = { open: openReadAloud, status: readAloudStatus, prune: pruneRenderings, describe: describeRendering },
 }) {
   const app = express();
   // Loopback reverse proxies (tailscale serve, an ssh-tunneled nginx) terminate
@@ -557,6 +561,162 @@ export async function serve({
     }
   });
 
+  // Read aloud. The artifact is split into blocks (see read-aloud-blocks.js). The manifest
+  // lists them; GET block audio starts (or joins) the narration of one block and streams the
+  // speech as it is produced, so playback begins within seconds; a finished rendering is cached
+  // in the session's tts directory and later plays serve the file with range support. Generation
+  // sends block content to Gemini and ElevenLabs and spends their credit, so like /share it is
+  // same-origin gated.
+  const ttsDirFor = (session) => path.join(path.dirname(store.file), "tts", session.key);
+
+  async function readAloudBlock(req, res) {
+    const session = await store.findByKey(req.params.key);
+    if (!session) {
+      res.status(404).json({ error: "session not found" });
+      return null;
+    }
+    const { version, blocks } = segmentArtifact(await readFile(session.file, "utf8"));
+    const wanted = String(req.query.v || "");
+    if (wanted && wanted !== version) {
+      res.status(409).json({ error: "the page changed; reload the block list", version });
+      return null;
+    }
+    const block = blocks[Number(req.params.index)];
+    if (!block || String(Number(req.params.index)) !== String(req.params.index)) {
+      res.status(404).json({ error: "no such block" });
+      return null;
+    }
+    const options = {
+      cacheDir: ttsDirFor(session),
+      kind: block.kind,
+      context: block.context,
+      ...(block.kind === "image" ? { narration: imageNarration(block) } : {}),
+    };
+    return { session, block, options };
+  }
+
+  app.get("/api/:key/tts/blocks", async (req, res, next) => {
+    try {
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      const { version, blocks } = segmentArtifact(await readFile(session.file, "utf8"));
+      const cacheDir = ttsDirFor(session);
+      let keep = [];
+      try {
+        keep = blocks.map(
+          (block) =>
+            readAloud.describe(block.html, {
+              cacheDir,
+              kind: block.kind,
+              context: block.context,
+              ...(block.kind === "image" ? { narration: imageNarration(block) } : {}),
+            }).hash,
+        );
+      } catch {
+        // No engine configured: nothing to keep, nothing to prune.
+        keep = null;
+      }
+      if (keep) await readAloud.prune(cacheDir, keep);
+      res.json({
+        version,
+        blocks: blocks.map((block) => ({
+          index: block.index,
+          kind: block.kind,
+          label: block.label,
+          chars: block.text.length,
+        })),
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/:key/tts/block/:index/audio", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req)) {
+        res.status(403).json({ error: "cross-origin read-aloud request rejected" });
+        return;
+      }
+      const found = await readAloudBlock(req, res);
+      if (!found) return;
+      await mkdir(found.options.cacheDir, { recursive: true });
+      let opened;
+      try {
+        opened = await readAloud.open(found.block.html, found.options);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        res.status(error instanceof ReadAloudConfigError ? 503 : 502).json({ error: message });
+        return;
+      }
+      // The cache lives under ~/.lavish-axi, a dot directory, which the file
+      // sender refuses unless the path is resolved against an explicit root.
+      const sendFile = (file, mime) =>
+        res.sendFile(path.basename(file), {
+          root: path.dirname(file),
+          dotfiles: "allow",
+          headers: { "Content-Type": mime, "Cache-Control": "no-cache" },
+        });
+      if (opened.kind === "file") {
+        sendFile(opened.file, opened.mime);
+        return;
+      }
+      const { job } = opened;
+      await job.ready;
+      if (job.state === "error") {
+        res.status(502).json({ error: job.error });
+        return;
+      }
+      if (job.state === "done") {
+        sendFile(job.file, job.mime);
+        return;
+      }
+      res.status(200).set({
+        "Content-Type": job.mime,
+        "Cache-Control": "no-store",
+        "Accept-Ranges": "none",
+        "X-Accel-Buffering": "no",
+      });
+      res.flushHeaders();
+      for (const chunk of job.chunks) res.write(chunk);
+      function onChunk(chunk) {
+        res.write(chunk);
+      }
+      function cleanup() {
+        job.off("chunk", onChunk);
+        job.off("end", finish);
+        job.off("failed", finish);
+      }
+      function finish() {
+        cleanup();
+        res.end();
+      }
+      job.on("chunk", onChunk);
+      job.on("end", finish);
+      job.on("failed", finish);
+      res.on("close", cleanup);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/:key/tts/block/:index/status", async (req, res, next) => {
+    try {
+      const found = await readAloudBlock(req, res);
+      if (!found) return;
+      try {
+        res.json(await readAloud.status(found.block.html, found.options));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        res.status(error instanceof ReadAloudConfigError ? 503 : 502).json({ error: message });
+      }
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/end", async (req, res, next) => {
     try {
       const file = await canonicalFile(req.body.file);
@@ -606,7 +766,9 @@ export async function serve({
         return;
       }
       const html = await readFile(session.file, "utf8");
-      res.type("html").send(injectLavishSdk(html, key));
+      // Read-aloud block tags first: they are pure attribute insertions on the source, and the
+      // SDK injection below appends to the head and body without moving anything else.
+      res.type("html").send(injectLavishSdk(segmentArtifact(html).tagged, key));
     } catch (error) {
       next(error);
     }
@@ -1112,6 +1274,9 @@ function encodeRfc5987Value(value) {
 // Guard state-changing, outward-facing routes (publishing to a third-party host) against CSRF: a
 // browser attaches an Origin/Referer that must match this server's own origin.
 function isSameOriginRequest(req) {
+  // Media elements may omit the Referer under a strict referrer policy; the
+  // fetch-metadata header is browser-set and cannot be forged by page script.
+  if (req.get("sec-fetch-site") === "same-origin") return true;
   const expectedOrigin = `${req.protocol}://${req.get("host")}`;
   const origin = req.get("origin");
   if (origin) {
@@ -1247,6 +1412,9 @@ function chromeIcon(paths, size = 16, strokeWidth = 1.7) {
 const chromeIcons = {
   more: chromeIcon(
     '<circle cx="12" cy="5" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="12" cy="19" r="1.4"/>',
+  ),
+  speaker: chromeIcon(
+    '<path d="M11 5 6.5 8.5H3.5v7h3L11 19V5z"/><path d="M15 9a4.2 4.2 0 0 1 0 6"/><path d="M17.7 6.5a8 8 0 0 1 0 11"/>',
   ),
   file: chromeIcon(
     '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>',
@@ -1402,7 +1570,7 @@ ${faviconTag}
 <link rel="stylesheet" href="/chrome.css">
 </head>
 <body class="${bodyClass}">
-<div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
+<div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><button class="listen-button" id="listen" type="button" title="Read this page aloud">${chromeIcons.speaker}<span id="listenLabel">Listen</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
 <div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe><div class="layout-issue-banner" id="layoutIssueBanner" hidden>This surface may have layout issues. Your agent has been notified.</div></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="sheet-grip" aria-hidden="true"></span><h2>Conversation</h2><span class="sheet-count" id="sheetCount" hidden></span><button class="sheet-toggle" id="sheetToggle" type="button" aria-controls="panel" aria-expanded="false" aria-label="Expand conversation"><span class="sheet-chevron">${chromeIcons.chevronUp}</span></button></div><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="connection-banner" id="connectionBanner" role="status" hidden>Reconnecting to Lavish...</div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="composer-error" id="submitError" role="alert" hidden><span class="composer-error-text" id="submitErrorText"></span><button class="composer-error-retry" id="submitRetry" type="button">Retry</button></div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label>Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label>Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note">Keep the update key private. ht-ml.app returns it once and it is the only way to update or delete this page later.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button></div></div>
@@ -1454,6 +1622,7 @@ const classifyScaledDownSvg=${classifyScaledDownSvg.toString()};
 const scaledDownDiagramSeverity=${scaledDownDiagramSeverity.toString()};
 const classifyVerticalOverflow=${classifyVerticalOverflow.toString()};
 const isSvgLayoutDescendant=${isSvgLayoutDescendant.toString()};
+const installReadAloudButtons=${installReadAloudButtons.toString()};
 ${mermaidHelperDecls}
 const mermaidHelpers={ ${mermaidHelperKeys} };
 (${createArtifactSdk.toString()})(deriveQueueKey, isNativeInteractiveControl, mermaidHelpers);
