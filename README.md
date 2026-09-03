@@ -153,6 +153,16 @@ pnpm link
   Per-asset and per-bundle inline caps default to 10 MB and 25 MB, overridable with `LAVISH_AXI_EXPORT_MAX_ASSET_BYTES` and `LAVISH_AXI_EXPORT_MAX_BUNDLE_BYTES`.
   Unresolved local assets or export notices such as author-set CSP meta tags and redacted file URLs are surfaced in command or browser output.
   Use `--token` or `LAVISH_AXI_HTML_APP_TOKEN` for an optional bearer token; set `LAVISH_AXI_HTML_APP_API_URL` only when overriding the ht-ml.app API base.
+- **Read aloud** - Every artifact gets one play button per content block, drawn in the left gutter, and a **Listen** button in the chrome bar that plays the page from the top.
+  The server splits the artifact into blocks: a heading with its paragraphs, a card, a step, a table, a diagram, a code block, or an image; forms, navigation, footers, and hidden elements are left out, and `data-lavish-read="skip"` leaves any element out.
+  Each block is narrated the way its kind needs: prose stays close to the author's words, a table is introduced and then read row by row, a Mermaid diagram becomes a plain-word walk-through, a code block becomes a short description, and an image is announced as "Image" with its alt text or caption, because a picture cannot be read.
+  Gemini on Vertex AI writes the narration and streams it; each paragraph is voiced at once, by ElevenLabs when `ELEVENLABS_API_KEY` is set and otherwise by Gemini TTS through the same service account, and the audio streams to the page while the rest is still being made.
+  Playback starts within seconds, moves to the next block on its own, prefetches the block after the current one, highlights the block being read, and scrolls to it.
+  Narration always needs `GOOGLE_APPLICATION_CREDENTIALS` to point at a Google service-account key with Vertex AI access; a relative path is resolved against the working directory, then the home directory.
+  Generation sends block content to those providers.
+  Finished blocks are cached next to the state file under `tts/<session>/`, keyed by a hash of the block content, engine, and voice, so a replay is instant and an edit re-voices only the blocks that changed.
+  Set `LAVISH_AXI_TTS_ENGINE` to `elevenlabs` or `gemini` to force an engine, `LAVISH_AXI_TTS_ELEVENLABS_VOICE` / `LAVISH_AXI_TTS_GEMINI_VOICE` to change the voice, and `LAVISH_AXI_TTS_ELEVENLABS_MODEL` to change the ElevenLabs model (default `eleven_v3`).
+  On `eleven_v3` the narration carries short audio tags such as `[warm]` or `[pause]`, so the voice changes its delivery with the content; other models get the same text without tags, because they would read them aloud.
 - **Live reload** - Lavish watches the HTML artifact file by default and preserves the artifact iframe scroll position across reloads. To also reload on sibling asset changes, add `data-lavish-live-reload-root` to the root element or `<meta name="lavish-live-reload" content="root">`.
 - **Feedback controls** - Native controls (radios, checkboxes, inputs, selects, buttons, labels, disclosure summaries, contenteditable) are interactive automatically, so they do not need `data-lavish-action`.
   For reversible choices, let option clicks update local state, then queue exactly one final answer from a per-question submit or Queue answer button with `window.lavish.queuePrompt()`.

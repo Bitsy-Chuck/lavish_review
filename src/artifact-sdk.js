@@ -273,6 +273,205 @@ export function resolveVisibleSpillCandidates(spillCandidates, { epsilon = 1 } =
   );
 }
 
+/**
+ * Draw one play button per read-aloud block and relay taps to the chrome.
+ *
+ * Blocks are the elements the server tagged with `data-lavish-block` (see
+ * read-aloud-blocks.js); members of one block share an index. The chrome owns
+ * playback and posts `lavish:readAloud` state messages; this only shows that
+ * state: the active block's button becomes a pause button, the block gets a
+ * highlight, and the page scrolls to it when it starts. Buttons live in a
+ * shadow tree under a `data-lavish-ui` host, so annotation and the layout
+ * audit ignore them.
+ *
+ * @param {{ window: any, document: any, parent: any }} deps The artifact window, its document, and the chrome window.
+ */
+export function installReadAloudButtons({ window, document, parent }) {
+  const BLOCK_ATTRIBUTE = "data-lavish-block";
+  const PLAY_ICON =
+    '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 1.5v9l7.5-4.5z" fill="currentColor"/></svg>';
+  const PAUSE_ICON =
+    '<svg viewBox="0 0 12 12" aria-hidden="true"><rect x="2.4" y="1.5" width="2.7" height="9" fill="currentColor"/><rect x="6.9" y="1.5" width="2.7" height="9" fill="currentColor"/></svg>';
+  const STYLE =
+    ":host{all:initial}" +
+    ".lavish-ra-btn{position:absolute;box-sizing:border-box;width:28px;height:28px;border-radius:50%;border:1px solid rgba(244,201,93,.55);background:rgba(15,17,21,.82);color:#f4c95d;display:grid;place-items:center;cursor:pointer;padding:0;margin:0;opacity:.62;box-shadow:0 2px 10px rgba(0,0,0,.35);transition:opacity 120ms ease,transform 120ms ease,background 120ms ease;font:0/0 a}" +
+    ".lavish-ra-btn:hover,.lavish-ra-btn:focus-visible,.lavish-ra-btn.active{opacity:1;transform:scale(1.06)}" +
+    ".lavish-ra-btn:focus-visible{outline:2px solid #f4c95d;outline-offset:2px}" +
+    ".lavish-ra-btn.active{background:#f4c95d;color:#17130a;border-color:#f4c95d}" +
+    ".lavish-ra-btn.loading{animation:lavish-ra-pulse 900ms ease-in-out infinite}" +
+    "@keyframes lavish-ra-pulse{0%,100%{opacity:1}50%{opacity:.45}}" +
+    ".lavish-ra-btn svg{width:12px;height:12px;display:block}" +
+    ".lavish-ra-highlight{position:absolute;pointer-events:none;border-radius:8px;box-shadow:0 0 0 2px rgba(244,201,93,.85),0 0 0 6px rgba(244,201,93,.16)}" +
+    "@media (pointer:coarse){.lavish-ra-btn{width:40px;height:40px}.lavish-ra-btn svg{width:16px;height:16px}}";
+  const SIZE = 28;
+  const GAP = 8;
+
+  const groups = new Map();
+  let shadow = null;
+  let highlight = null;
+  let current = { state: "idle", block: -1 };
+  let scheduled = false;
+  let lastScrolledBlock = -1;
+
+  function collect() {
+    groups.clear();
+    const tagged = document.querySelectorAll("[" + BLOCK_ATTRIBUTE + "]");
+    for (const el of tagged) {
+      const index = Number(el.getAttribute(BLOCK_ATTRIBUTE));
+      if (!Number.isInteger(index)) continue;
+      if (!groups.has(index)) groups.set(index, { index, members: [], button: null });
+      groups.get(index).members.push(el);
+    }
+  }
+
+  function ensureShadow() {
+    if (shadow) return shadow;
+    const host = document.createElement("div");
+    host.setAttribute("data-lavish-ui", "read-aloud");
+    host.style.cssText = "position:absolute;left:0;top:0;width:0;height:0;overflow:visible;z-index:2147483646";
+    document.documentElement.appendChild(host);
+    shadow = host.attachShadow({ mode: "open" });
+    const style = document.createElement("style");
+    style.textContent = STYLE;
+    shadow.appendChild(style);
+    highlight = document.createElement("div");
+    highlight.className = "lavish-ra-highlight";
+    highlight.hidden = true;
+    shadow.appendChild(highlight);
+    return shadow;
+  }
+
+  function buttonFor(group) {
+    if (group.button) return group.button;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "lavish-ra-btn";
+    button.setAttribute("data-block", String(group.index));
+    button.innerHTML = PLAY_ICON;
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      parent.postMessage({ type: "lavish:readAloudPlay", block: group.index }, "*");
+    });
+    ensureShadow().appendChild(button);
+    group.button = button;
+    return button;
+  }
+
+  function rectOf(el) {
+    const rect = el.getBoundingClientRect();
+    return rect && rect.width > 0 && rect.height > 0 ? rect : null;
+  }
+
+  function layout() {
+    if (!groups.size) return;
+    const scrollX = window.scrollX || 0;
+    const scrollY = window.scrollY || 0;
+    let union = null;
+    for (const group of groups.values()) {
+      const button = buttonFor(group);
+      const first = group.members.map(rectOf).find(Boolean);
+      if (!first) {
+        button.hidden = true;
+        continue;
+      }
+      button.hidden = false;
+      // The left gutter keeps the button off the content; a narrow layout has no
+      // gutter, so the button sits inside the block's top-right corner instead.
+      const left = first.left >= SIZE + GAP + 4 ? first.left - SIZE - GAP : first.right - SIZE - 4;
+      button.style.left = Math.round(left + scrollX) + "px";
+      // Top-aligned with the block; a block shorter than the button is centered on it.
+      const lift = first.height >= SIZE ? 0 : (first.height - SIZE) / 2;
+      button.style.top = Math.round(first.top + scrollY + lift) + "px";
+      const active = current.state !== "idle" && group.index === current.block;
+      button.classList.toggle("active", active);
+      button.classList.toggle("loading", active && current.state === "loading");
+      const showPause = active && (current.state === "playing" || current.state === "loading");
+      const icon = showPause ? PAUSE_ICON : PLAY_ICON;
+      if (button.innerHTML !== icon) button.innerHTML = icon;
+      button.setAttribute("aria-label", (showPause ? "Pause block " : "Play block ") + (group.index + 1));
+      if (active) {
+        for (const member of group.members) {
+          const rect = rectOf(member);
+          if (!rect) continue;
+          union = union
+            ? {
+                left: Math.min(union.left, rect.left),
+                top: Math.min(union.top, rect.top),
+                right: Math.max(union.right, rect.right),
+                bottom: Math.max(union.bottom, rect.bottom),
+              }
+            : { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+        }
+      }
+    }
+    if (highlight) {
+      highlight.hidden = !union;
+      if (union) {
+        highlight.style.left = Math.round(union.left + scrollX - 4) + "px";
+        highlight.style.top = Math.round(union.top + scrollY - 4) + "px";
+        highlight.style.width = Math.round(union.right - union.left + 8) + "px";
+        highlight.style.height = Math.round(union.bottom - union.top + 8) + "px";
+      }
+    }
+  }
+
+  // One layout per animation frame. The flag is cleared inside the callback, so a
+  // scheduler that runs callbacks synchronously cannot leave it stuck.
+  function refresh() {
+    if (scheduled) return;
+    scheduled = true;
+    const run = () => {
+      scheduled = false;
+      layout();
+    };
+    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(run);
+    else run();
+  }
+
+  function scrollToBlock(group) {
+    const first = group.members.map(rectOf).find(Boolean);
+    const target = group.members[0];
+    if (!first || !target || typeof target.scrollIntoView !== "function") return;
+    const height = window.innerHeight || 0;
+    if (first.top >= 0 && first.bottom <= height) return;
+    target.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+
+  function applyState(message) {
+    const block = Number(message.block);
+    current = { state: String(message.state || "idle"), block: Number.isInteger(block) ? block : -1 };
+    if (current.state === "playing" || current.state === "loading") {
+      const group = groups.get(current.block);
+      if (group && lastScrolledBlock !== current.block) {
+        lastScrolledBlock = current.block;
+        scrollToBlock(group);
+      }
+    }
+    if (current.state === "idle") lastScrolledBlock = -1;
+    refresh();
+  }
+
+  collect();
+  if (groups.size) {
+    ensureShadow();
+    refresh();
+    window.addEventListener("resize", refresh, { passive: true });
+    window.addEventListener("load", refresh, { once: true });
+    const Observer = window.ResizeObserver;
+    if (typeof Observer === "function" && document.body) new Observer(refresh).observe(document.body);
+    window.setTimeout(refresh, 1000);
+  }
+  window.addEventListener("message", (event) => {
+    if (event.source !== parent) return;
+    const msg = event.data || {};
+    if (msg.type === "lavish:readAloud") applyState(msg);
+  });
+  parent.postMessage({ type: "lavish:readAloudReady", blocks: groups.size }, "*");
+
+  return { refresh, layout, applyState, groups };
+}
+
 export function createArtifactSdk(
   deriveQueueKey,
   isNativeInteractive = isNativeInteractiveControl,
@@ -287,6 +486,8 @@ export function createArtifactSdk(
   let shadow = null;
   let counter = 0;
   const ids = new WeakMap();
+  /** @type {{ refresh: () => void } | null} Read-aloud buttons; positions follow layout changes. */
+  let readAloudUi = null;
 
   function uid(el) {
     if (!ids.has(el)) ids.set(el, String(++counter));
@@ -731,6 +932,7 @@ export function createArtifactSdk(
       }
     }
     embedSketchWhiteboards();
+    if (readAloudUi) readAloudUi.refresh();
   }
 
   let mermaidEnhanceScheduled = false;
@@ -1465,6 +1667,8 @@ export function createArtifactSdk(
     setStatus: (message) => parent.postMessage({ type: "lavish:status", message: String(message) }, "*"),
     snapshot,
   };
+
+  readAloudUi = installReadAloudButtons({ window, document, parent });
 
   window.addEventListener("message", (event) => {
     const msg = event.data || {};

@@ -10,6 +10,7 @@ import {
   createTwoPointerTracker,
   deriveLavishQueueKey,
   fragmentsSignificantlyOverlap,
+  installReadAloudButtons,
   isModeToggleHotkeyEvent,
   isNativeInteractiveControl,
   isSvgLayoutDescendant,
@@ -992,4 +993,199 @@ test("isSvgLayoutDescendant skips SVG internals but keeps the root <svg> and for
 test("isSvgLayoutDescendant tolerates nullish input", () => {
   assert.equal(isSvgLayoutDescendant(null), false);
   assert.equal(isSvgLayoutDescendant(undefined), false);
+});
+
+// ---------------------------------------------------------------------------
+// Read-aloud block buttons
+// ---------------------------------------------------------------------------
+
+function readAloudElement(tag) {
+  const listeners = new Map();
+  const classes = new Set();
+  const attrs = {};
+  const el = {
+    tagName: tag.toUpperCase(),
+    style: {},
+    hidden: false,
+    innerHTML: "",
+    children: [],
+    classList: {
+      toggle(name, force) {
+        const on = force === undefined ? !classes.has(name) : Boolean(force);
+        if (on) classes.add(name);
+        else classes.delete(name);
+        return on;
+      },
+      contains(name) {
+        return classes.has(name);
+      },
+    },
+    setAttribute(name, value) {
+      attrs[name] = String(value);
+    },
+    getAttribute(name) {
+      return Object.hasOwn(attrs, name) ? attrs[name] : null;
+    },
+    appendChild(child) {
+      el.children.push(child);
+      return child;
+    },
+    attachShadow() {
+      el.shadow = readAloudElement("shadow");
+      return el.shadow;
+    },
+    addEventListener(type, handler) {
+      listeners.set(type, handler);
+    },
+    dispatch(type, event = { preventDefault() {}, stopPropagation() {} }) {
+      const handler = listeners.get(type);
+      assert.ok(handler, `element has a ${type} listener`);
+      return handler(event);
+    },
+  };
+  return el;
+}
+
+function readAloudMember(index, rect) {
+  const el = readAloudElement("p");
+  el.setAttribute("data-lavish-block", String(index));
+  el.getBoundingClientRect = () => ({
+    left: rect.left,
+    top: rect.top,
+    right: rect.left + rect.width,
+    bottom: rect.top + rect.height,
+    width: rect.width,
+    height: rect.height,
+  });
+  el.scrolls = 0;
+  el.scrollIntoView = () => {
+    el.scrolls += 1;
+  };
+  return el;
+}
+
+function readAloudHarness(members) {
+  const documentElement = readAloudElement("html");
+  const document = {
+    documentElement,
+    body: {},
+    querySelectorAll(selector) {
+      assert.equal(selector, "[data-lavish-block]");
+      return members;
+    },
+    createElement: (tag) => readAloudElement(tag),
+  };
+  const windowListeners = new Map();
+  const window = {
+    scrollX: 0,
+    scrollY: 100,
+    innerHeight: 600,
+    addEventListener(type, handler) {
+      windowListeners.set(type, handler);
+    },
+    requestAnimationFrame(fn) {
+      fn();
+      return 1;
+    },
+    setTimeout() {
+      return 1;
+    },
+  };
+  const posted = [];
+  const parent = {
+    postMessage(message) {
+      posted.push(message);
+    },
+  };
+  const ui = installReadAloudButtons({ window, document, parent });
+  const host = documentElement.children[0];
+  const buttons = host ? host.shadow.children.filter((child) => child.tagName === "BUTTON") : [];
+  const highlight = host ? host.shadow.children.find((child) => child.className === "lavish-ra-highlight") : null;
+  const message = (data, source = /** @type {any} */ (parent)) => windowListeners.get("message")({ source, data });
+  return { ui, host, buttons, highlight, posted, message, documentElement };
+}
+
+test("read-aloud draws one gutter button per block inside a lavish-ui shadow host and announces the count", () => {
+  const members = [
+    readAloudMember(0, { left: 120, top: 50, width: 400, height: 40 }),
+    readAloudMember(0, { left: 120, top: 100, width: 400, height: 60 }),
+    readAloudMember(1, { left: 10, top: 200, width: 300, height: 20 }),
+  ];
+  const { host, buttons, highlight, posted } = readAloudHarness(members);
+
+  assert.equal(host.getAttribute("data-lavish-ui"), "read-aloud");
+  assert.match(host.style.cssText, /position:absolute/);
+  assert.equal(buttons.length, 2, "one button per block, not per member");
+  assert.equal(buttons[0].getAttribute("data-block"), "0");
+  assert.equal(buttons[0].getAttribute("aria-label"), "Play block 1");
+  assert.equal(buttons[0].style.left, "84px", "left gutter: 120 - 28 - 8");
+  assert.equal(buttons[0].style.top, "150px", "top 50 + scroll 100, top-aligned with a 40px block");
+  assert.equal(buttons[1].style.left, "278px", "no gutter: inside the top-right corner, 310 - 28 - 4");
+  assert.equal(buttons[1].style.top, "296px", "a 20px block centers the 28px button: 300 - 4");
+  assert.equal(highlight.hidden, true);
+  assert.deepEqual(posted, [{ type: "lavish:readAloudReady", blocks: 2 }]);
+});
+
+test("a tap on a block button asks the chrome to play that block", () => {
+  const { buttons, posted } = readAloudHarness([readAloudMember(3, { left: 100, top: 0, width: 100, height: 10 })]);
+  let prevented = 0;
+  buttons[0].dispatch("click", {
+    preventDefault: () => (prevented += 1),
+    stopPropagation() {},
+  });
+  assert.equal(prevented, 1);
+  assert.deepEqual(posted.at(-1), { type: "lavish:readAloudPlay", block: 3 });
+});
+
+test("state messages toggle the active button, the highlight, and one scroll per block", () => {
+  const members = [
+    readAloudMember(0, { left: 120, top: 50, width: 400, height: 40 }),
+    readAloudMember(1, { left: 120, top: 900, width: 400, height: 30 }),
+    readAloudMember(1, { left: 120, top: 940, width: 380, height: 30 }),
+  ];
+  const { buttons, highlight, message } = readAloudHarness(members);
+
+  message({ type: "lavish:readAloud", state: "loading", block: 1 });
+  assert.ok(buttons[1].classList.contains("active"));
+  assert.ok(buttons[1].classList.contains("loading"));
+  assert.match(buttons[1].innerHTML, /<rect/, "pause icon while loading");
+  assert.equal(buttons[1].getAttribute("aria-label"), "Pause block 2");
+  assert.equal(members[1].scrolls, 1, "an off-screen block scrolls into view");
+
+  message({ type: "lavish:readAloud", state: "playing", block: 1 });
+  assert.ok(!buttons[1].classList.contains("loading"));
+  assert.equal(members[1].scrolls, 1, "the same block does not scroll again");
+  assert.equal(highlight.hidden, false);
+  assert.equal(highlight.style.left, "116px");
+  assert.equal(highlight.style.top, "996px");
+  assert.equal(highlight.style.width, "408px");
+  assert.equal(highlight.style.height, "78px");
+  assert.ok(!buttons[0].classList.contains("active"));
+
+  message({ type: "lavish:readAloud", state: "paused", block: 1 });
+  assert.match(buttons[1].innerHTML, /<path/, "play icon while paused");
+  assert.ok(buttons[1].classList.contains("active"));
+
+  message({ type: "lavish:readAloud", state: "idle", block: -1 });
+  assert.ok(!buttons[1].classList.contains("active"));
+  assert.equal(highlight.hidden, true);
+  message({ type: "lavish:readAloud", state: "playing", block: 1 });
+  assert.equal(members[1].scrolls, 2, "after idle the block scrolls again");
+});
+
+test("read-aloud ignores messages from other windows and hides buttons of collapsed blocks", () => {
+  const members = [
+    readAloudMember(0, { left: 120, top: 50, width: 400, height: 40 }),
+    readAloudMember(1, { left: 120, top: 50, width: 0, height: 0 }),
+  ];
+  const { buttons, message } = readAloudHarness(members);
+  assert.equal(buttons[1].hidden, true);
+  message({ type: "lavish:readAloud", state: "playing", block: 0 }, { other: true });
+  assert.ok(!buttons[0].classList.contains("active"));
+});
+
+test("read-aloud with no tagged blocks adds no host and still announces zero", () => {
+  const { host, posted } = readAloudHarness([]);
+  assert.equal(host, undefined);
+  assert.deepEqual(posted, [{ type: "lavish:readAloudReady", blocks: 0 }]);
 });

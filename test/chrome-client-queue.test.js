@@ -14,6 +14,7 @@ async function createChromeHarness({
   sessionData = defaultSessionData,
   artifactSrc = "",
   narrowScreen = false,
+  audioImpl = null,
 } = {}) {
   const source = await readFile(sourceUrl, "utf8");
   const storage = new Map();
@@ -201,7 +202,36 @@ async function createChromeHarness({
     },
   };
 
+  // Stand-in for HTMLAudioElement: records src/play/pause and lets a test fire media events.
+  const audios = [];
+  class FakeAudio {
+    constructor() {
+      this.src = "";
+      this.preload = "";
+      this.plays = 0;
+      this.pauses = 0;
+      this.listeners = new Map();
+      audios.push(this);
+    }
+    addEventListener(type, handler) {
+      this.listeners.set(type, handler);
+    }
+    play() {
+      this.plays += 1;
+      return Promise.resolve();
+    }
+    pause() {
+      this.pauses += 1;
+    }
+    dispatch(type) {
+      const handler = this.listeners.get(type);
+      assert.ok(handler, `audio has a ${type} listener`);
+      return handler();
+    }
+  }
+
   const context = {
+    Audio: audioImpl || FakeAudio,
     clearTimeout: fakeClearTimeout,
     console,
     fetch: fetchImpl,
@@ -279,6 +309,7 @@ async function createChromeHarness({
   vm.runInNewContext(source, context, { filename: "chrome-client.js" });
 
   return {
+    audios,
     element,
     frame,
     postedToFrame,
@@ -2307,4 +2338,172 @@ test("Escape collapses an open sheet, but an open menu outranks it", async () =>
 
   chrome.dispatchDocumentKeydown({ key: "Escape" });
   assert.equal(body.dataset.lavishSheet, "collapsed");
+});
+
+/** @param {{ manifest?: any, statuses?: Record<string, any>, log?: string[] }} [options] */
+function readAloudFetch({ manifest, statuses = {}, log = [] } = {}) {
+  return async (url) => {
+    const target = String(url);
+    log.push(target);
+    if (target.includes("/tts/blocks")) {
+      return { ok: true, json: async () => (typeof manifest === "function" ? manifest() : manifest) };
+    }
+    if (target.includes("/status")) {
+      return { ok: true, json: async () => statuses[target] || { state: "running", paragraphs: 1 } };
+    }
+    if (target.includes("/audio")) {
+      return { ok: true, body: { getReader: () => ({ read: async () => ({ done: true }) }) } };
+    }
+    return { ok: true };
+  };
+}
+
+const THREE_BLOCKS = {
+  version: "v1",
+  blocks: [
+    { index: 0, kind: "text", label: "Title", chars: 40 },
+    { index: 1, kind: "table", label: "Table", chars: 300 },
+    { index: 2, kind: "image", label: "Image", chars: 0 },
+  ],
+};
+
+// Messages cross the harness's vm realm; copy the fields so deep-equal compares plain objects.
+function readAloudFrames(chrome) {
+  return chrome.postedToFrame
+    .filter((message) => message.type === "lavish:readAloud")
+    .map(({ type, state, block }) => ({ type, state, block }));
+}
+
+test("listen plays the blocks in order, prefetches the next one, and moves on by itself", async () => {
+  const log = [];
+  const chrome = await createChromeHarness({ fetchImpl: readAloudFetch({ manifest: THREE_BLOCKS, log }) });
+  chrome.frame.dispatch("load");
+  await flushPromises();
+  assert.equal(chrome.element("listen").title, "Read this page aloud");
+  assert.equal(chrome.element("listenLabel").textContent, "Listen");
+
+  chrome.element("listen").onclick();
+  const [audio] = chrome.audios;
+  assert.equal(audio.plays, 1, "play() runs synchronously inside the tap");
+  assert.equal(audio.src, "/api/abc/tts/block/0/audio?v=v1");
+  assert.equal(chrome.element("listenLabel").textContent, "Preparing 0:00");
+  assert.deepEqual(readAloudFrames(chrome).at(-1), { type: "lavish:readAloud", state: "loading", block: 0 });
+
+  audio.dispatch("playing");
+  assert.equal(chrome.element("listenLabel").textContent, "Pause 1/3");
+  assert.ok(chrome.element("listen").classList.contains("playing"));
+  assert.deepEqual(readAloudFrames(chrome).at(-1), { type: "lavish:readAloud", state: "playing", block: 0 });
+  await flushPromises();
+  assert.ok(log.includes("/api/abc/tts/block/1/audio?v=v1"), "the next block is prefetched");
+  assert.ok(!log.includes("/api/abc/tts/block/2/audio?v=v1"), "only one block ahead");
+
+  audio.dispatch("ended");
+  assert.equal(audio.src, "/api/abc/tts/block/1/audio?v=v1");
+  assert.equal(audio.plays, 2);
+  audio.dispatch("playing");
+  assert.equal(chrome.element("listenLabel").textContent, "Pause 2/3");
+  audio.dispatch("ended");
+  audio.dispatch("playing");
+  assert.equal(chrome.element("listenLabel").textContent, "Pause 3/3");
+  audio.dispatch("ended");
+  assert.equal(chrome.element("listenLabel").textContent, "Listen");
+  assert.ok(!chrome.element("listen").classList.contains("playing"));
+  assert.deepEqual(readAloudFrames(chrome).at(-1), { type: "lavish:readAloud", state: "idle", block: -1 });
+  assert.equal(audio.plays, 3);
+});
+
+test("a block button in the artifact plays that block; a second tap pauses and a third resumes", async () => {
+  const chrome = await createChromeHarness({ fetchImpl: readAloudFetch({ manifest: THREE_BLOCKS }) });
+  chrome.frame.dispatch("load");
+  await flushPromises();
+
+  chrome.sendFrameMessage({ type: "lavish:readAloudPlay", block: 2 });
+  const [audio] = chrome.audios;
+  assert.equal(audio.src, "/api/abc/tts/block/2/audio?v=v1");
+  audio.dispatch("playing");
+  assert.equal(chrome.element("listenLabel").textContent, "Pause 3/3");
+
+  chrome.sendFrameMessage({ type: "lavish:readAloudPlay", block: 2 });
+  assert.equal(audio.pauses, 1);
+  assert.equal(chrome.element("listenLabel").textContent, "Resume 3/3");
+  assert.deepEqual(readAloudFrames(chrome).at(-1), { type: "lavish:readAloud", state: "paused", block: 2 });
+
+  chrome.sendFrameMessage({ type: "lavish:readAloudPlay", block: 2 });
+  await flushPromises();
+  assert.equal(audio.plays, 2);
+  assert.equal(chrome.element("listenLabel").textContent, "Pause 3/3");
+
+  chrome.sendFrameMessage({ type: "lavish:readAloudPlay", block: 0 });
+  assert.equal(audio.src, "/api/abc/tts/block/0/audio?v=v1");
+  chrome.sendFrameMessage({ type: "lavish:readAloudPlay", block: 9 });
+  assert.equal(audio.src, "/api/abc/tts/block/0/audio?v=v1", "an unknown block is ignored");
+
+  chrome.sendFrameMessage({ type: "lavish:readAloudReady", blocks: 3 });
+  assert.deepEqual(readAloudFrames(chrome).at(-1), { type: "lavish:readAloud", state: "loading", block: 0 });
+});
+
+test("a changed page applies after the current block ends", async () => {
+  let manifest = THREE_BLOCKS;
+  const chrome = await createChromeHarness({ fetchImpl: readAloudFetch({ manifest: () => manifest }) });
+  chrome.frame.dispatch("load");
+  await flushPromises();
+  chrome.element("listen").onclick();
+  const [audio] = chrome.audios;
+  audio.dispatch("playing");
+
+  manifest = { version: "v2", blocks: [{ index: 0, kind: "text", label: "Only", chars: 10 }] };
+  chrome.frame.dispatch("load");
+  await flushPromises();
+  assert.equal(chrome.element("listenLabel").textContent, "Pause 1/3", "the playing block finishes first");
+
+  audio.dispatch("ended");
+  await flushPromises();
+  assert.equal(chrome.element("listenLabel").textContent, "Listen");
+  chrome.element("listen").onclick();
+  assert.equal(audio.src, "/api/abc/tts/block/0/audio?v=v2");
+});
+
+test("listen shows a visible failure with the server's reason and retries the same block", async () => {
+  const statuses = {
+    "/api/abc/tts/block/1/status?v=v1": { state: "error", error: "ElevenLabs synthesis failed: HTTP 402: no credit" },
+  };
+  const chrome = await createChromeHarness({ fetchImpl: readAloudFetch({ manifest: THREE_BLOCKS, statuses }) });
+  chrome.frame.dispatch("load");
+  await flushPromises();
+  chrome.sendFrameMessage({ type: "lavish:readAloudPlay", block: 1 });
+  chrome.runTimers(1500);
+  await flushPromises();
+  assert.equal(chrome.element("listenLabel").textContent, "Failed - retry");
+  assert.match(chrome.element("listen").title, /no credit/);
+  assert.equal(chrome.audios[0].pauses, 1);
+  assert.deepEqual(readAloudFrames(chrome).at(-1), { type: "lavish:readAloud", state: "idle", block: 1 });
+
+  chrome.element("listen").onclick();
+  assert.equal(chrome.audios[0].src, "/api/abc/tts/block/1/audio?v=v1", "retry stays on the failed block");
+  assert.equal(chrome.audios[0].plays, 2);
+});
+
+test("listen asks the server why the audio element failed", async () => {
+  const statuses = {
+    "/api/abc/tts/block/0/status?v=v1": { state: "error", error: "narration model returned no text" },
+  };
+  const chrome = await createChromeHarness({ fetchImpl: readAloudFetch({ manifest: THREE_BLOCKS, statuses }) });
+  chrome.frame.dispatch("load");
+  await flushPromises();
+  chrome.element("listen").onclick();
+  chrome.audios[0].dispatch("error");
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.element("listenLabel").textContent, "Failed - retry");
+  assert.match(chrome.element("listen").title, /returned no text/);
+});
+
+test("a page without blocks says so instead of starting audio", async () => {
+  const chrome = await createChromeHarness({ fetchImpl: readAloudFetch({ manifest: { version: "v0", blocks: [] } }) });
+  chrome.frame.dispatch("load");
+  await flushPromises();
+  chrome.element("listen").onclick();
+  assert.equal(chrome.element("listen").title, "Nothing to read on this page");
+  assert.equal(chrome.audios[0].plays, 0);
+  assert.equal(chrome.element("listenLabel").textContent, "Listen");
 });

@@ -1,4 +1,4 @@
-/* global EventSource, document, location, window */
+/* global Audio, EventSource, document, location, window */
 
 const sessionDataElement = document.getElementById("lavish-session");
 const sessionData = JSON.parse(sessionDataElement?.textContent || "{}");
@@ -22,6 +22,8 @@ const chatInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("c
 const sendButton = /** @type {HTMLButtonElement} */ (document.getElementById("send"));
 const sendAndEndButton = /** @type {HTMLButtonElement} */ (document.getElementById("sendAndEnd"));
 const annotationSwitch = /** @type {HTMLButtonElement} */ (document.getElementById("annotation"));
+const listenButton = /** @type {HTMLButtonElement} */ (document.getElementById("listen"));
+const listenLabel = /** @type {HTMLSpanElement} */ (document.getElementById("listenLabel"));
 const moreWrap = /** @type {HTMLDivElement} */ (document.getElementById("moreWrap"));
 const moreButton = /** @type {HTMLButtonElement} */ (document.getElementById("moreButton"));
 const moreMenu = /** @type {HTMLDivElement} */ (document.getElementById("moreMenu"));
@@ -974,6 +976,218 @@ async function exportArtifact() {
   }
 }
 
+// Read-aloud player. The server splits the artifact into blocks; each block has
+// its own play button inside the artifact, and this bar button plays the page
+// from the top. One <audio> element carries every block: it is created and
+// started inside the first tap (Safari and iOS refuse playback that starts
+// later), and from then on it may move to the next block on its own. The next
+// block is prefetched while the current one plays, so the hand-over is seamless.
+let listenBlocks = [];
+let listenVersion = "";
+let listenCurrent = -1;
+let listenAudio = /** @type {HTMLAudioElement | null} */ (null);
+let listenState = "idle"; // idle | loading | playing | paused
+let listenPollTimer = null;
+let listenStartedAt = 0;
+let listenManifestStale = false;
+const listenPrefetched = new Set();
+
+function listenElement() {
+  if (listenAudio) return listenAudio;
+  listenAudio = new Audio();
+  listenAudio.preload = "auto";
+  listenAudio.addEventListener("playing", () => {
+    stopListenPoll();
+    setListenState("playing");
+    prefetchListenBlock(listenCurrent + 1);
+  });
+  listenAudio.addEventListener("ended", onListenEnded);
+  listenAudio.addEventListener("error", () => {
+    if (listenState !== "idle") reportListenError("audio playback failed");
+  });
+  return listenAudio;
+}
+
+function listenBlockUrl(index, suffix) {
+  return "/api/" + key + "/tts/block/" + index + "/" + suffix + "?v=" + encodeURIComponent(listenVersion);
+}
+
+function listenPosition() {
+  return listenCurrent >= 0 && listenBlocks.length ? " " + (listenCurrent + 1) + "/" + listenBlocks.length : "";
+}
+
+function listenLabelFor(state) {
+  if (state === "playing") return "Pause" + listenPosition();
+  if (state === "paused") return "Resume" + listenPosition();
+  if (state === "loading") return "Preparing " + listenElapsed();
+  return "Listen";
+}
+
+function setListenState(state, label) {
+  listenState = state;
+  listenLabel.textContent = label || listenLabelFor(state);
+  listenButton.classList.toggle("playing", state === "playing");
+  postToFrame({ type: "lavish:readAloud", state, block: listenCurrent });
+}
+
+function stopListenPoll() {
+  if (listenPollTimer) clearTimeout(listenPollTimer);
+  listenPollTimer = null;
+}
+
+function failListen(message) {
+  stopListenPoll();
+  if (listenAudio) listenAudio.pause();
+  setListenState("idle", "Failed - retry");
+  listenButton.title = "Read-aloud failed: " + message;
+}
+
+function errorText(error) {
+  return error && error.message ? error.message : String(error);
+}
+
+// The audio element only knows that the stream broke; the server knows why.
+async function reportListenError(fallback) {
+  let message = fallback;
+  try {
+    const response = await fetch(listenBlockUrl(listenCurrent, "status"));
+    const status = response.ok ? await response.json() : {};
+    if (status.error) message = status.error;
+  } catch {
+    // keep the generic message
+  }
+  if (listenState !== "idle") failListen(message);
+}
+
+function listenElapsed() {
+  const seconds = Math.max(0, Math.round((Date.now() - listenStartedAt) / 1000));
+  return Math.floor(seconds / 60) + ":" + String(seconds % 60).padStart(2, "0");
+}
+
+async function pollListenStatus() {
+  listenPollTimer = null;
+  if (listenState !== "loading") return;
+  try {
+    const response = await fetch(listenBlockUrl(listenCurrent, "status"));
+    const status = response.ok ? await response.json() : {};
+    if (listenState !== "loading") return;
+    if (status.state === "error") {
+      failListen(status.error || "narration failed");
+      return;
+    }
+    const voiced = status.paragraphs ? ", " + status.paragraphs + " parts voiced" : "";
+    setListenState("loading");
+    listenButton.title = "Writing the narration for block " + (listenCurrent + 1) + " and voicing it" + voiced + ".";
+  } catch {
+    // the audio element reports its own errors
+  }
+  if (listenState === "loading") listenPollTimer = setTimeout(pollListenStatus, 1500);
+}
+
+// The block list comes from the server, which re-reads the artifact. While a
+// block plays, a changed list applies after that block ends: its indexes may
+// no longer match.
+async function loadListenManifest() {
+  try {
+    const response = await fetch("/api/" + key + "/tts/blocks");
+    if (!response.ok) return;
+    const manifest = await response.json();
+    const blocks = Array.isArray(manifest.blocks) ? manifest.blocks : [];
+    if (listenVersion && manifest.version !== listenVersion && listenState !== "idle") {
+      listenManifestStale = true;
+      return;
+    }
+    listenBlocks = blocks;
+    listenVersion = String(manifest.version || "");
+    listenManifestStale = false;
+    listenPrefetched.clear();
+    listenButton.title = blocks.length ? "Read this page aloud" : "Nothing to read on this page";
+    if (listenState === "idle") setListenState("idle");
+  } catch {
+    // offline: the button reports the failure when tapped
+  }
+}
+
+// Warm the server cache for the block after the current one. The response is
+// drained and dropped; the audio element's own request then starts at once.
+function prefetchListenBlock(index) {
+  if (index < 0 || index >= listenBlocks.length || listenPrefetched.has(index)) return;
+  listenPrefetched.add(index);
+  fetch(listenBlockUrl(index, "audio"))
+    .then(async (response) => {
+      if (!response.ok || !response.body) return;
+      const reader = response.body.getReader();
+      while (!(await reader.read()).done) {
+        // discard
+      }
+    })
+    .catch(() => {});
+}
+
+function playListenBlock(index) {
+  const audio = listenElement();
+  listenCurrent = index;
+  listenStartedAt = Date.now();
+  stopListenPoll();
+  audio.src = listenBlockUrl(index, "audio");
+  setListenState("loading");
+  listenButton.title = "Starting block " + (index + 1) + ".";
+  audio.play().catch((error) => {
+    if (listenState === "loading") reportListenError(errorText(error));
+  });
+  listenPollTimer = setTimeout(pollListenStatus, 1500);
+}
+
+function onListenEnded() {
+  const next = listenCurrent + 1;
+  if (listenManifestStale || next >= listenBlocks.length) {
+    listenCurrent = -1;
+    setListenState("idle");
+    if (listenManifestStale) loadListenManifest();
+    return;
+  }
+  playListenBlock(next);
+}
+
+function toggleListen() {
+  const audio = listenElement();
+  if (listenState === "loading") return;
+  if (listenState === "playing") {
+    audio.pause();
+    setListenState("paused");
+    return;
+  }
+  if (listenState === "paused") {
+    setListenState("playing");
+    audio.play().catch((error) => failListen(errorText(error)));
+    return;
+  }
+  if (!listenBlocks.length) {
+    listenButton.title = "Nothing to read on this page";
+    return;
+  }
+  // Idle: start where the last attempt stopped, or at the top.
+  playListenBlock(listenCurrent >= 0 && listenCurrent < listenBlocks.length ? listenCurrent : 0);
+}
+
+// A tap on a block button inside the artifact.
+function playListenBlockFromFrame(index) {
+  if (!Number.isInteger(index) || index < 0 || index >= listenBlocks.length) return;
+  if (index === listenCurrent && listenState === "playing") {
+    listenElement().pause();
+    setListenState("paused");
+    return;
+  }
+  if (index === listenCurrent && listenState === "paused") {
+    setListenState("playing");
+    listenElement()
+      .play()
+      .catch((error) => failListen(errorText(error)));
+    return;
+  }
+  playListenBlock(index);
+}
+
 function openShareDialog() {
   closeMenus();
   shareDialog.hidden = false;
@@ -1637,6 +1851,10 @@ window.addEventListener("message", (event) => {
   if (msg.type === "lavish:sendQueuedPrompts") sendQueued();
   if (msg.type === "lavish:endSession") endSession().catch(handleEndSessionFailure);
   if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();
+  if (msg.type === "lavish:readAloudPlay") playListenBlockFromFrame(Number(msg.block));
+  if (msg.type === "lavish:readAloudReady") {
+    postToFrame({ type: "lavish:readAloud", state: listenState, block: listenCurrent });
+  }
 });
 
 loadFrame();
@@ -1675,6 +1893,7 @@ window.visualViewport?.addEventListener("scroll", syncKeyboardInset);
 copyPathButton.onclick = copyFilePath;
 reloadArtifactButton.onclick = reloadArtifact;
 copySnapshotButton.onclick = copyDomSnapshot;
+listenButton.onclick = toggleListen;
 exportArtifactButton.onclick = exportArtifact;
 shareArtifactButton.onclick = openShareDialog;
 shareCloseButton.onclick = closeShareDialog;
@@ -1725,6 +1944,7 @@ document.addEventListener(
   true,
 );
 frame.addEventListener("load", () => {
+  loadListenManifest();
   postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation && !ended });
   // Replay the pre-reload scroll position so hot reloads don't jump the artifact to the top.
   postToFrame({ type: "lavish:restoreScroll", x: lastScroll.x, y: lastScroll.y });

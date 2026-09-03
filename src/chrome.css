@@ -227,6 +227,45 @@ body.lavish {
   left: 16px;
   background: var(--accent-ink);
 }
+.listen-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--fg-dim);
+  border-radius: 9px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: var(--text-sm);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.listen-button:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--steel-700);
+  color: var(--fg);
+}
+.listen-button.playing {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+.listen-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+@media (max-width: 560px) {
+  .listen-button {
+    width: 34px;
+    padding: 0;
+    justify-content: center;
+  }
+  .listen-button span {
+    display: none;
+  }
+}
 .more-wrap {
   position: relative;
   flex-shrink: 0;
@@ -1186,6 +1225,10 @@ body.layout-gate-active iframe#artifact {
   }
   .more-button {
     width: 44px;
+    height: 44px;
+  }
+  .listen-button {
+    min-width: 44px;
     height: 44px;
   }
   .annotate-switch {
