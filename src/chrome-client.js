@@ -1229,18 +1229,37 @@ async function publishShare(event) {
     shareUrlInput.value = data.url || "";
     shareUpdateKeyInput.value = data.update_key || "";
     const unresolvedAssets = Array.isArray(data.unresolved_local_assets) ? data.unresolved_local_assets : [];
+    const uploadedAssets = Array.isArray(data.uploaded_assets) ? data.uploaded_assets : [];
     const notices = Array.isArray(data.notices) ? data.notices : [];
     const warningCount = unresolvedAssets.length;
+    const uploadedCount = uploadedAssets.length;
     const noticeCount = notices.length;
     const noticeSummary = noticeCount ? noticeText(noticeCount) : "";
-    shareStatus.textContent =
-      warningCount > 0
-        ? `Published with ${warningCount === 1 ? "1 unresolved local asset" : `${warningCount} unresolved local assets`}${noticeSummary ? ` and ${noticeSummary}` : ""}.${passwordProtected ? " This page is PASSWORD-PROTECTED; viewers also need the password." : ""}`
-        : noticeCount > 0
-          ? `Published with ${noticeSummary}.${passwordProtected ? " This page is PASSWORD-PROTECTED; viewers also need the password." : ""}`
-          : passwordProtected
-            ? "Published. This page is PASSWORD-PROTECTED; viewers also need the password."
-            : "Published. Anyone with the link can view this page.";
+    const parts = [];
+    if (warningCount > 0) {
+      const refs = unresolvedAssets.map((asset) => asset.ref).join(", ");
+      parts.push(
+        `Published with ${warningCount === 1 ? "1 unresolved local asset" : `${warningCount} unresolved local assets`} (${refs})${noticeSummary ? ` and ${noticeSummary}` : ""}.`,
+      );
+      // The hosted page shows these files as broken; say why so the author can shrink or fix them.
+      for (const asset of unresolvedAssets) {
+        if (asset.reason) parts.push(/[.!?]$/.test(asset.reason) ? asset.reason : `${asset.reason}.`);
+      }
+    } else if (noticeCount > 0) {
+      parts.push(`Published with ${noticeSummary}.`);
+    } else {
+      parts.push("Published.");
+    }
+    if (uploadedCount > 0) {
+      parts.push(
+        uploadedCount === 1
+          ? "1 local asset was uploaded as a separate file."
+          : `${uploadedCount} local assets were uploaded as separate files.`,
+      );
+    }
+    if (passwordProtected) parts.push("This page is PASSWORD-PROTECTED; viewers also need the password.");
+    else if (warningCount === 0 && noticeCount === 0) parts.push("Anyone with the link can view this page.");
+    shareStatus.textContent = parts.join(" ");
     shareResult.hidden = false;
     shareUrlInput.focus();
     shareUrlInput.select();

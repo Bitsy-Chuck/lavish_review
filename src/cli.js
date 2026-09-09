@@ -21,7 +21,12 @@ import {
   exportWarningSummaries,
   splitExportWarnings,
 } from "./export-bundle.js";
-import { publishToHtmlApp } from "./html-app.js";
+import {
+  formatMegabytes,
+  HTML_APP_MAX_ASSET_BYTES,
+  HTML_APP_MAX_REQUEST_BYTES,
+  shareArtifactToHtmlApp,
+} from "./html-app.js";
 import { clientHost, defaultPort, ensureStateDir, hostForUrl, serverLogFile, stateFile } from "./paths.js";
 import { findPlaybook, listPlaybooks, playbookIds, PLAYBOOK_ROUTER_HELP } from "./playbooks.js";
 import { resolveDesignAssetPath, serve } from "./server.js";
@@ -130,7 +135,7 @@ export function createHomeOutput({ bin, sessions, includeSessions = true }) {
       'Rendered Mermaid diagrams in `.mermaid` containers become embedded, editable Excalidraw whiteboards in the browser (click a diagram to unlock editing; a Fullscreen action opens it over the whole viewport) - flowchart, sequence, class, ER, and state diagrams convert to editable shapes; other types embed as an image to draw on. Scenes autosave locally; when a reload detects a changed Mermaid source, the reviewer explicitly chooses to re-convert and discard saved edits or keep editing the saved scene. Standalone and exported copies still render plain Mermaid. Queue feedback adds a prompt to the Conversation panel; when the user sends it, poll returns a tag "whiteboard" prompt carrying a bounded edit summary plus local scenePath (.excalidraw JSON) and previewPath (PNG) files - read the summary first, open the files only when needed, then apply the edits by updating the Mermaid source in the artifact (never try to write the scene back). Agents can also author free-draw whiteboards directly - UI mockups, wireframes, arbitrary shapes: a `.lavish-sketch` container with Excalidraw scene JSON in a `script[type="application/lavish-sketch+json"]` child becomes the same editable whiteboard, and its non-script content is the fallback shown by standalone and exported copies. See `lavish-axi playbook sketch` before authoring one',
       "Run `lavish-axi end <html-file>` to end a session as the agent - ending it this way still allows a plain reopen later. When the user ends it from the browser instead, a later `lavish-axi <html-file>` refuses to reopen it without `--reopen`",
       "Run `lavish-axi export <html-file> [--out <path>]` to write a portable copy of the artifact - one HTML file with its LOCAL assets inlined - so it opens with no Lavish server and no sibling files. Remote CDN/font references are left as links, so it needs network to render those. Users can also export from the browser chrome's overflow menu",
-      "Run `lavish-axi share <html-file> [--password <pw>] [--token <t>]` to publish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and get back a visitable URL. Shares are PUBLIC by default, so anyone with the link can open them. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Local assets are inlined; remote refs load over the network. It returns the url plus a secret update_key for managing the page later. Use --token or LAVISH_AXI_HTML_APP_TOKEN only when you have an optional bearer token; it is never required. Users can also publish from the browser chrome's overflow menu",
+      `Run \`lavish-axi share <html-file> [--password <pw>] [--token <t>]\` to publish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and get back a visitable URL. Shares are PUBLIC by default, so anyone with the link can open them. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Local assets are inlined while they fit and uploaded as separate site files when they do not; remote refs load over the network. ${SHARE_LIMITS_HINT} It returns the url plus a secret update_key for managing the page later; uploaded_assets and unresolved_local_assets list what was uploaded and what could not be hosted. Use --token or LAVISH_AXI_HTML_APP_TOKEN only when you have an optional bearer token; it is never required. Users can also publish from the browser chrome's overflow menu`,
       "Run `lavish-axi stop` to shut down the background server (it also self-stops when idle or after the last session ends with nothing connected)",
       `Run \`lavish-axi playbook <playbook_id>\` for focused artifact guidance. ${PLAYBOOK_ROUTER_HELP}`,
       DESIGN_SYSTEM_HINT,
@@ -440,11 +445,12 @@ function assetWarningSummaries(warnings) {
   return exportWarningSummaries(warnings);
 }
 
-// Publish the artifact as a visitable page on third-party ht-ml.app. Builds the same local-inlined
-// HTML as `export` (remote refs left as links), then POSTs it to ht-ml.app's `/v1/sites` API,
-// sending the artifact to ht-ml.app's servers. The service is not part of Lavish, needs no
-// account or API key, and returns the share URL plus the secret update_key for
-// managing the page later. Server-independent.
+// Publish the artifact as a visitable page on third-party ht-ml.app. Inlines local assets the
+// way `export` does, but only within the budget that keeps the page under ht-ml.app's request
+// cap, POSTs the page to ht-ml.app's `/v1/sites` API, then uploads the local files the budget
+// left as references as separate site assets. The service is not part of Lavish, needs no
+// account or API key, and returns the share URL plus the secret update_key for managing the
+// page later. Server-independent.
 async function shareCommand(args) {
   const file = firstPositionalArg(args, ["--password", "--token"]);
   if (!file) {
@@ -456,17 +462,40 @@ async function shareCommand(args) {
   const token = optionalFlagString(flagValue(args, "--token"));
   const root = path.dirname(absolute);
   const source = await readFile(absolute, "utf8");
-  const { html, warnings } = await buildSelfContainedHtml(source, {
-    baseDir: root,
-    confineDir: root,
-    resolveAbsolute: resolveDesignAssetPath,
+  let shared;
+  try {
+    shared = await shareArtifactToHtmlApp(source, {
+      baseDir: root,
+      confineDir: root,
+      resolveAbsolute: resolveDesignAssetPath,
+      password,
+      token,
+    });
+  } catch (error) {
+    const tooLarge = error && typeof error === "object" && "code" in error && error.code === "TOO_LARGE";
+    throw new AxiError(
+      error instanceof Error ? error.message : String(error),
+      tooLarge ? "TOO_LARGE" : "PUBLISH_FAILED",
+      tooLarge ? ["Shrink the inline data in the HTML itself, or split the page"] : [],
+    );
+  }
+  return createShareOutput({
+    source: absolute,
+    site: shared.site,
+    warnings: shared.warnings,
+    uploaded: shared.uploaded,
+    passwordProtected: Boolean(password),
   });
-  const site = await publishToHtmlApp(html, { password, token });
-  return createShareOutput({ source: absolute, site, warnings, passwordProtected: Boolean(password) });
 }
 
-export function createShareOutput({ source, site, warnings, passwordProtected = false }) {
+export const SHARE_LIMITS_HINT =
+  `ht-ml.app accepts pages up to ${formatMegabytes(HTML_APP_MAX_REQUEST_BYTES)} MB. ` +
+  `Local assets that do not fit inline are uploaded as separate files on the same site, each up to ${formatMegabytes(HTML_APP_MAX_ASSET_BYTES)} MB; ` +
+  `a bigger file, or one the page references only through ./, poster, <track>, or CSS url(), is reported as an unresolved local asset.`;
+
+export function createShareOutput({ source, site, warnings, uploaded = [], passwordProtected = false }) {
   const allWarnings = Array.isArray(warnings) ? warnings : [];
+  const uploadedAssets = Array.isArray(uploaded) ? uploaded : [];
   const { unresolved, notices } = splitExportWarnings(allWarnings);
   const isPasswordProtected = Boolean(passwordProtected);
   const result = {
@@ -479,32 +508,38 @@ export function createShareOutput({ source, site, warnings, passwordProtected = 
       public: !isPasswordProtected,
       visibility: isPasswordProtected ? "private" : "public",
       password_protected: isPasswordProtected,
+      uploaded_assets: uploadedAssets.length,
       unresolved_local_assets: unresolved.length,
       notices: notices.length,
     },
   };
   const passwordNote = isPasswordProtected ? " This page is PASSWORD-PROTECTED; viewers also need the password." : "";
   if (allWarnings.length) result.warnings = exportWarningSummaries(allWarnings);
+  if (uploadedAssets.length) result.uploaded_assets = uploadedAssets;
   if (unresolved.length) result.unresolved_local_assets = assetWarningSummaries(unresolved);
   if (notices.length) result.notices = assetWarningSummaries(notices);
+  const uploadNote = uploadedAssets.length
+    ? ` ${uploadedAssets.length === 1 ? "1 local asset that did not fit inline was uploaded as a separate file on the same site" : `${uploadedAssets.length} local assets that did not fit inline were uploaded as separate files on the same site`} (see uploaded_assets).`
+    : "";
   const noticeNote = notices.length ? " Export notices are available in notices." : "";
   const hostNote =
     "ht-ml.app (https://ht-ml.app), a third-party host not part of Lavish, hosts the page, so it needs no Lavish server.";
   if (unresolved.length) {
     result.next_step =
-      `Published ${isPasswordProtected ? "a PASSWORD-PROTECTED page at " : ""}${site.url}, but some LOCAL assets could not be inlined and were left as references (see unresolved_local_assets); inspect the hosted page and fix missing local assets before sharing it.${passwordNote}${noticeNote} ` +
+      `Published ${isPasswordProtected ? "a PASSWORD-PROTECTED page at " : ""}${site.url}, but some LOCAL assets could not be inlined or uploaded and were left as references (see unresolved_local_assets); inspect the hosted page and fix or shrink those local assets before sharing it.${passwordNote}${uploadNote}${noticeNote} ` +
+      `${SHARE_LIMITS_HINT} ` +
       `Remote CDN/font references are intentionally left as links and render where there is network access. ` +
       `The update_key is a secret shown only once; keep it to update or delete the page later (there is no recovery). ` +
       hostNote;
   } else if (isPasswordProtected) {
     result.next_step =
-      `Published a PASSWORD-PROTECTED page: ${site.url} - share this URL with the user and provide the password separately; viewers also need the password. ` +
+      `Published a PASSWORD-PROTECTED page: ${site.url} - share this URL with the user and provide the password separately; viewers also need the password.${uploadNote} ` +
       `${noticeNote ? `${noticeNote} ` : ""}` +
       `The update_key is a secret shown only once; keep it to update or delete the page later (there is no recovery). ` +
       hostNote;
   } else {
     result.next_step =
-      `Published a PUBLIC page that anyone with the link can view: ${site.url} - share this URL with the user. ` +
+      `Published a PUBLIC page that anyone with the link can view: ${site.url} - share this URL with the user.${uploadNote} ` +
       `${noticeNote ? `${noticeNote} ` : ""}` +
       `The update_key is a secret shown only once; keep it to update or delete the page later (there is no recovery). ` +
       hostNote;
@@ -1014,7 +1049,7 @@ const COMMAND_HELP = {
   poll: `Usage: lavish-axi poll <html-file> [--agent-reply "..."]\n\nThis command long-polls indefinitely for queued user prompts and browser-reported layout_warnings, then returns them to the agent. It stays silent while it waits - that is normal, never kill it. Fix and re-check fresh error-severity layout_warnings before involving the human; persistent or low-severity findings may be surfaced with a note when the cause is not obvious. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. If your harness limits how long a foreground command may run, run the poll as a background task and wait for it to finish; if it still gets killed or times out, just re-run it - queued feedback is never lost. Use --agent-reply after applying prior feedback to display your response in Lavish Editor before waiting again. When status is ended, stop polling and do not reopen the session uninvited - deliver remaining updates directly in this conversation instead.\n`,
   end: `Usage: lavish-axi end <html-file>\n\nEnd a Lavish Editor session as the agent. A session ended this way still reopens normally on the next \`lavish-axi <html-file>\`, unlike a user ending it from the browser, which requires --reopen.\n`,
   export: `Usage: lavish-axi export <html-file> [--out <path>]\n\nWrite a portable copy of an artifact: one HTML file with its LOCAL assets inlined (relative-path stylesheets, scripts, images, and fonts become inline <style>/<script> blocks and data URIs). Remote CDN/font references (https URLs) are left as links for the browser to load, so the file needs network to render those. Lavish makes no outbound requests - it only reads local files, confined to the artifact's directory. Defaults to writing <name>.export.html next to the source; pass --out to choose a path. The Lavish annotation SDK is never included in an export.\n`,
-  share: `Usage: lavish-axi share <html-file> [--password <pw>] [--token <t>]\n\nPublish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and print a visitable URL. Shares are PUBLIC by default: anyone with the link can open the page, and it may be indexed or scraped. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Builds the same local-inlined HTML as 'export' (local assets inlined; remote CDN/font URLs left as links and are not blocked by CSP on ht-ml.app, but still load over the viewer's network), then POSTs it to ht-ml.app's /v1 API. Creating a site needs no account or API key. The response includes the url plus a secret update_key (shown once) for updating or deleting the page later. Set LAVISH_AXI_HTML_APP_TOKEN (or pass --token) to attach an optional bearer token; it is never required. The annotation SDK is never included.\n`,
+  share: `Usage: lavish-axi share <html-file> [--password <pw>] [--token <t>]\n\nPublish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and print a visitable URL. Shares are PUBLIC by default: anyone with the link can open the page, and it may be indexed or scraped. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Inlines local assets the way 'export' does while they fit ht-ml.app's page cap, POSTs the page to ht-ml.app's /v1 API, then uploads the local files that did not fit as separate site assets. ${SHARE_LIMITS_HINT} Remote CDN/font URLs are left as links; they are not blocked by CSP on ht-ml.app, but still load over the viewer's network. Creating a site needs no account or API key. The response includes the url plus a secret update_key (shown once) for updating or deleting the page later, uploaded_assets, and unresolved_local_assets. Set LAVISH_AXI_HTML_APP_TOKEN (or pass --token) to attach an optional bearer token; it is never required. The annotation SDK is never included.\n`,
   stop: `Usage: lavish-axi stop [--port <port>]\n\nShut down the background Lavish Editor server. The server also stops itself when no browser or poll has been connected for a while (LAVISH_AXI_IDLE_TIMEOUT_MS, default 30m) and immediately when the last session ends with nothing connected.\n`,
   playbook: `Usage: lavish-axi playbook [playbook_id]\n\nList focused artifact guidance playbooks, or show one playbook by ID. Known IDs: diagram, table, comparison, plan, code, input, slides.\n\n${PLAYBOOK_ROUTER_HELP}\n\nExamples:\n  lavish-axi playbook\n  lavish-axi playbook diagram\n  lavish-axi playbook input\n`,
   design: `Usage: lavish-axi design\n\nShow a copy-pasteable local design snippet for Tailwind CSS browser runtime v4 + DaisyUI v5 + themes, Mermaid diagram tooling, a content-to-playbook router, an optional layout safety CSS snippet, plus technical reference for DaisyUI components. These assets are vendored and served locally from Lavish's /design/ routes - no CDN, no network egress. ${PLAYBOOK_ROUTER_HELP} Lavish artifacts stay portable HTML. This local design snippet is the design fallback, not the default: inspect the subject project before falling back, and paste the layout safety CSS only when useful for dense nested grid/flex layouts, badges, wide fonts, or local media. ${DESIGN_PRIORITY_RULE}\n`,

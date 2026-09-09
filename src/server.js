@@ -41,7 +41,7 @@ import {
   exportWarningSummaries,
   splitExportWarnings,
 } from "./export-bundle.js";
-import { publishToHtmlApp } from "./html-app.js";
+import { shareArtifactToHtmlApp } from "./html-app.js";
 import { injectLavishSdk } from "./html-transform.js";
 import { createLayoutWarningRecorder } from "./layout-log.js";
 import { bindHost, hostForUrl, linkHost, publicOrigin } from "./paths.js";
@@ -516,10 +516,11 @@ export async function serve({
     }
   });
 
-  // Hosted share: build the local-inlined artifact and publish it to ht-ml.app, a third-party
-  // hosting service not part of Lavish, returning the share URL. Publishing sends the artifact
-  // to ht-ml.app's servers. Remote CDN/font references are left intact for the viewer's browser
-  // to load.
+  // Hosted share: inline local assets within ht-ml.app's page budget, publish the page to
+  // ht-ml.app, a third-party hosting service not part of Lavish, upload the local files that did
+  // not fit inline as separate site assets, and return the share URL. Publishing sends the
+  // artifact to ht-ml.app's servers. Remote CDN/font references are left intact for the viewer's
+  // browser to load.
   // Publishing creates a public third-party page unless a password is supplied, so this is gated
   // behind a same-origin check - a cross-origin page must not be able to drive a publish via the
   // loopback server.
@@ -537,21 +538,23 @@ export async function serve({
       const body = req.body || {};
       const source = await readFile(session.file, "utf8");
       const root = path.dirname(session.file);
-      const { html, warnings } = await buildSelfContainedHtml(source, {
-        baseDir: root,
-        confineDir: root,
-        resolveAbsolute: resolveDesignAssetPath,
-      });
-      let site;
+      let shared;
       try {
-        site = await publishToHtmlApp(html, { password: optionalBodyString(body.password) });
+        shared = await shareArtifactToHtmlApp(source, {
+          baseDir: root,
+          confineDir: root,
+          resolveAbsolute: resolveDesignAssetPath,
+          password: optionalBodyString(body.password),
+        });
       } catch (error) {
         res.status(502).json({ error: error instanceof Error ? error.message : String(error) });
         return;
       }
+      const { site, warnings, uploaded } = shared;
       const { unresolved, notices } = splitExportWarnings(warnings);
       res.json({
         ...site,
+        ...(uploaded.length ? { uploaded_assets: uploaded } : {}),
         ...(warnings.length ? { warnings: exportWarningSummaries(warnings) } : {}),
         ...(unresolved.length ? { unresolved_local_assets: exportWarningSummaries(unresolved) } : {}),
         ...(notices.length ? { notices: exportWarningSummaries(notices) } : {}),
@@ -1572,7 +1575,7 @@ ${faviconTag}
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><button class="listen-button" id="listen" type="button" title="Read this page aloud">${chromeIcons.speaker}<span id="listenLabel">Listen</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
 <div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe><div class="layout-issue-banner" id="layoutIssueBanner" hidden>This surface may have layout issues. Your agent has been notified.</div></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="sheet-grip" aria-hidden="true"></span><h2>Conversation</h2><span class="sheet-count" id="sheetCount" hidden></span><button class="sheet-toggle" id="sheetToggle" type="button" aria-controls="panel" aria-expanded="false" aria-label="Expand conversation"><span class="sheet-chevron">${chromeIcons.chevronUp}</span></button></div><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="connection-banner" id="connectionBanner" role="status" hidden>Reconnecting to Lavish...</div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="composer-error" id="submitError" role="alert" hidden><span class="composer-error-text" id="submitErrorText"></span><button class="composer-error-retry" id="submitRetry" type="button">Retry</button></div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
-<div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label>Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label>Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note">Keep the update key private. ht-ml.app returns it once and it is the only way to update or delete this page later.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
+<div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app. Local assets are inlined while the page fits ht-ml.app's 6.3 MB cap, and the rest are uploaded as separate files of up to 4.5 MB each; a file it cannot host is named here after publishing. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label>Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label>Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note">Keep the update key private. ht-ml.app returns it once and it is the only way to update or delete this page later.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p></div></div>
 <div class="whiteboard-overlay" id="whiteboardOverlay" hidden><div class="whiteboard-shell"><div class="whiteboard-error" id="whiteboardError" hidden></div><button class="whiteboard-close" id="whiteboardClose" type="button" aria-label="Close whiteboard"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button><iframe id="whiteboardFrame" title="Excalidraw whiteboard" sandbox="allow-scripts allow-popups"></iframe></div></div>

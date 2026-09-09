@@ -1965,6 +1965,111 @@ test("POST /api/:key/share returns unresolved local asset warnings", async () =>
   }
 });
 
+test("POST /api/:key/share uploads the local assets that do not fit inline as separate site files", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  // Two 3 MB files: the first fits the roughly 4.6 MB inline budget, the second does not and is
+  // uploaded through ht-ml.app's assets API instead of failing the whole publish.
+  await mkdir(path.join(dir, "media"));
+  await writeFile(path.join(dir, "media", "first.bin"), Buffer.alloc(3 * 1024 * 1024, 0x41));
+  await writeFile(path.join(dir, "media", "second.bin"), Buffer.alloc(3 * 1024 * 1024, 0x42));
+  await writeFile(
+    artifact,
+    '<!doctype html><html><body><img src="media/first.bin"><img src="media/second.bin"></body></html>',
+  );
+
+  const requests = [];
+  const htmlApp = await startFakeHtmlApp(requests);
+  const previousApiUrl = process.env.LAVISH_AXI_HTML_APP_API_URL;
+  process.env.LAVISH_AXI_HTML_APP_API_URL = `http://127.0.0.1:${htmlApp.port}`;
+
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+
+    const shareRes = await fetch(`${base}/api/${session.key}/share`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({}),
+    });
+    const body = await shareRes.json();
+
+    assert.equal(shareRes.status, 200);
+    assert.equal(body.url, "https://abc123.ht-ml.app/");
+    assert.deepEqual(body.uploaded_assets, ["media/second.bin"]);
+    assert.equal("warnings" in body, false);
+    assert.equal("unresolved_local_assets" in body, false);
+
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].url, "/v1/sites");
+    assert.match(requests[0].body.html_content, /<img src="data:application\/octet-stream;base64,QUFB/);
+    assert.match(requests[0].body.html_content, /<img src="media\/second\.bin">/);
+    assert.ok(Buffer.byteLength(JSON.stringify(requests[0].body)) < 6_291_456);
+    assert.equal(requests[1].method, "POST");
+    assert.equal(requests[1].url, "/v1/sites/abc123/assets?relative_path=media/second.bin");
+    assert.equal(requests[1].headers.authorization, "Bearer uk_secret");
+    assert.match(String(requests[1].headers["content-type"]), /^multipart\/form-data; boundary=/);
+    assert.match(requests[1].raw, /filename="second\.bin"/);
+    assert.ok(requests[1].raw.length > 3 * 1024 * 1024);
+  } finally {
+    await server.close();
+    await htmlApp.close();
+    restoreEnv("LAVISH_AXI_HTML_APP_API_URL", previousApiUrl);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/:key/share reports a page that ht-ml.app cannot host instead of a raw gateway error", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  // Inline data in the page itself cannot be budgeted away, so the publish stops before any upload.
+  await writeFile(
+    artifact,
+    `<!doctype html><html><body><img src="data:application/octet-stream;base64,${"QUJD".repeat(1_600_000)}"></body></html>`,
+  );
+
+  const requests = [];
+  const htmlApp = await startFakeHtmlApp(requests);
+  const previousApiUrl = process.env.LAVISH_AXI_HTML_APP_API_URL;
+  process.env.LAVISH_AXI_HTML_APP_API_URL = `http://127.0.0.1:${htmlApp.port}`;
+
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+
+    const shareRes = await fetch(`${base}/api/${session.key}/share`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({}),
+    });
+    const body = await shareRes.json();
+
+    assert.equal(shareRes.status, 502);
+    assert.match(
+      body.error,
+      /the page is 6\.4 MB before any local asset is inlined, but ht-ml\.app accepts at most 6\.3 MB per page/,
+    );
+    assert.equal(requests.length, 0);
+  } finally {
+    await server.close();
+    await htmlApp.close();
+    restoreEnv("LAVISH_AXI_HTML_APP_API_URL", previousApiUrl);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("POST /api/:key/share rejects cross-origin browser requests", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
@@ -3486,14 +3591,17 @@ async function startFakeHtmlApp(requests, responseBody = null) {
       raw += chunk;
     });
     req.on("end", () => {
+      const isJson = String(req.headers["content-type"] || "").startsWith("application/json");
       requests.push({
         method: req.method,
         url: req.url,
         headers: req.headers,
-        body: raw ? JSON.parse(raw) : null,
+        body: isJson && raw ? JSON.parse(raw) : null,
+        raw,
       });
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(body));
+      // Asset uploads answer like ht-ml.app does; everything else answers with the site.
+      res.end(JSON.stringify(req.url.includes("/assets") ? { message: "Asset uploaded successfully" } : body));
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve()));

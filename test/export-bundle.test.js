@@ -5,7 +5,12 @@ import path from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 
-import { buildSelfContainedHtml, exportFileName, splitExportWarnings } from "../src/export-bundle.js";
+import {
+  buildSelfContainedHtml,
+  exportFileName,
+  exportWarningSummaries,
+  splitExportWarnings,
+} from "../src/export-bundle.js";
 import { injectArtifactBaseLayer } from "../src/html-transform.js";
 
 // Exports and shares carry the same viewport meta and containment layer the served artifact gets,
@@ -3382,4 +3387,51 @@ test("exportFileName derives a portable .export.html name", () => {
   assert.equal(exportFileName("/a/b/report.html"), "report.export.html");
   assert.equal(exportFileName("/a/b/plan.htm"), "plan.export.html");
   assert.equal(exportFileName("/a/b/index.html"), "index.export.html");
+});
+
+test("too-large warnings carry the resolved local path so a share can deliver the file another way", async () => {
+  const html = '<!doctype html><html><body><img src="media/big.png"><img src="media/big.png"></body></html>';
+  const { warnings } = await buildSelfContainedHtml(html, {
+    baseDir: "/art",
+    maxAssetBytes: 1024,
+    readLocalFile: async () => Buffer.alloc(2048, 1),
+  });
+
+  assert.equal(warnings.length, 2);
+  for (const warning of warnings) {
+    assert.equal(warning.kind, "too-large");
+    assert.equal(warning.ref, "media/big.png");
+    assert.equal(portablePathKey(warning.path || ""), "/art/media/big.png");
+  }
+  // Output summaries never expose the local path.
+  assert.deepEqual(Object.keys(exportWarningSummaries(warnings)[0]).sort(), ["kind", "reason", "ref"]);
+});
+
+test("too-large warnings for design assets mapped from outside the artifact carry no path", async () => {
+  const html = '<!doctype html><html><head><script src="/design/tailwindcss-browser.js"></script></head></html>';
+  const { warnings } = await buildSelfContainedHtml(html, {
+    baseDir: "/art",
+    confineDir: "/art",
+    maxAssetBytes: 1024,
+    resolveAbsolute: () => "/pkg/dist/design/tailwindcss-browser.js",
+    readLocalFile: async () => Buffer.alloc(2048, 1),
+  });
+
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].kind, "too-large");
+  assert.equal(warnings[0].ref, "/design/tailwindcss-browser.js");
+  assert.equal("path" in warnings[0], false);
+});
+
+test("a failed asset upload counts as an unresolved local asset", () => {
+  const { unresolved, notices } = splitExportWarnings([
+    { kind: "upload-failed", ref: "media/poster.png", reason: "ht-ml.app refused the upload" },
+    { kind: "csp-meta", ref: "script-src 'self'" },
+  ]);
+
+  assert.deepEqual(
+    unresolved.map((warning) => warning.kind),
+    ["upload-failed"],
+  );
+  assert.equal(notices.length, 1);
 });

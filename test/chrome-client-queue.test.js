@@ -587,7 +587,10 @@ test("chrome client surfaces share warnings from the server response", async () 
   await submit({ preventDefault() {} });
   await flushPromises();
 
-  assert.equal(chrome.element("shareStatus").textContent, "Published with 1 unresolved local asset and 1 notice.");
+  assert.equal(
+    chrome.element("shareStatus").textContent,
+    "Published with 1 unresolved local asset (missing.png) and 1 notice.",
+  );
   assert.equal(chrome.element("shareResult").hidden, false);
 });
 
@@ -2506,4 +2509,52 @@ test("a page without blocks says so instead of starting audio", async () => {
   assert.equal(chrome.element("listen").title, "Nothing to read on this page");
   assert.equal(chrome.audios[0].plays, 0);
   assert.equal(chrome.element("listenLabel").textContent, "Listen");
+});
+
+test("chrome client reports uploaded assets and why unresolved ones are missing", async () => {
+  const reason = "media/huge.mp4 is 6.6 MB, but ht-ml.app accepts separate assets only up to 4.5 MB";
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({
+        url: "https://abc123.ht-ml.app/",
+        update_key: "uk_secret",
+        uploaded_assets: ["media/a.mp4", "media/b.png"],
+        warnings: [{ kind: "too-large", ref: "media/huge.mp4", reason }],
+        unresolved_local_assets: [{ kind: "too-large", ref: "media/huge.mp4", reason }],
+      }),
+    }),
+  });
+  const submit = chrome.element("shareForm").listeners.get("submit");
+
+  await submit({ preventDefault() {} });
+  await flushPromises();
+
+  assert.equal(
+    chrome.element("shareStatus").textContent,
+    `Published with 1 unresolved local asset (media/huge.mp4). ${reason}. 2 local assets were uploaded as separate files.`,
+  );
+  assert.equal(chrome.element("shareResult").hidden, false);
+});
+
+test("chrome client counts one uploaded asset on a clean public publish", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({
+        url: "https://abc123.ht-ml.app/",
+        update_key: "uk_secret",
+        uploaded_assets: ["media/a.mp4"],
+      }),
+    }),
+  });
+  const submit = chrome.element("shareForm").listeners.get("submit");
+
+  await submit({ preventDefault() {} });
+  await flushPromises();
+
+  assert.equal(
+    chrome.element("shareStatus").textContent,
+    "Published. 1 local asset was uploaded as a separate file. Anyone with the link can view this page.",
+  );
 });

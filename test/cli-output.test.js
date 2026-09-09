@@ -1842,3 +1842,41 @@ async function startFakeHtmlApp(requests) {
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };
 }
+
+test("share output lists the local assets uploaded as separate files", () => {
+  const output = createShareOutput({
+    source: "/tmp/report.html",
+    site: { url: "https://x.ht-ml.app/", site_id: "x", update_key: "uk_secret", status: "active" },
+    warnings: [],
+    uploaded: ["media/a.mp4", "media/b.png"],
+  });
+
+  assert.equal(output.share.uploaded_assets, 2);
+  assert.deepEqual(output.uploaded_assets, ["media/a.mp4", "media/b.png"]);
+  assert.match(output.next_step, /2 local assets that did not fit inline were uploaded as separate files/);
+  assert.match(output.next_step, /share this URL with the user/);
+});
+
+test("share output explains the ht-ml.app limits when a local asset could not be hosted", () => {
+  const output = createShareOutput({
+    source: "/tmp/report.html",
+    site: { url: "https://x.ht-ml.app/", site_id: "x", update_key: "uk_secret", status: "active" },
+    warnings: [
+      {
+        kind: "too-large",
+        ref: "media/huge.mp4",
+        reason: "media/huge.mp4 is 6.6 MB, but ht-ml.app accepts separate assets only up to 4.5 MB",
+      },
+    ],
+    uploaded: ["media/a.mp4"],
+  });
+
+  assert.equal(output.share.uploaded_assets, 1);
+  assert.equal(output.share.unresolved_local_assets, 1);
+  assert.equal("uploaded_assets" in output, true);
+  assert.match(output.next_step, /could not be inlined or uploaded/);
+  assert.match(output.next_step, /1 local asset that did not fit inline was uploaded as a separate file/);
+  assert.match(output.next_step, /ht-ml\.app accepts pages up to 6\.3 MB/);
+  assert.match(output.next_step, /each up to 4\.5 MB/);
+  assert.doesNotMatch(output.next_step, /share this URL/);
+});

@@ -104,6 +104,7 @@ const UNRESOLVED_LOCAL_ASSET_WARNING_KINDS = new Set([
   "srcdoc-resource",
   "too-large",
   "unmapped-root-absolute",
+  "upload-failed",
   "unterminated-script-src",
   "unsupported-css-import",
   "unsupported-frame",
@@ -123,7 +124,7 @@ const UNRESOLVED_LOCAL_ASSET_WARNING_KINDS = new Set([
  * @param {number} [options.maxAssetBytes] Per-asset inline cap; larger local files are left as references with a warning.
  * @param {number} [options.maxBundleBytes] Per-bundle inline cap across all inlined local assets.
  * @param {number} [options.maxDepth] Local stylesheet-import recursion guard.
- * @returns {Promise<{ html: string, warnings: Array<{ kind: string, ref: string, reason?: string }> }>}
+ * @returns {Promise<{ html: string, warnings: Array<{ kind: string, ref: string, reason?: string, path?: string }> }>}
  */
 export async function buildSelfContainedHtml(html, options = {}) {
   const confineDir = options.confineDir ? path.resolve(options.confineDir) : null;
@@ -147,7 +148,9 @@ export async function buildSelfContainedHtml(html, options = {}) {
     ),
     maxDepth: Number.isFinite(options.maxDepth) ? options.maxDepth : DEFAULT_MAX_DEPTH,
     inlinedBytes: 0,
-    warnings: /** @type {Array<{ kind: string, ref: string, reason?: string }>} */ ([]),
+    // `path` is set on too-large warnings: the resolved local file the caller may deliver another
+    // way (hosted shares upload it as a separate site asset). Output summaries never expose it.
+    warnings: /** @type {Array<{ kind: string, ref: string, reason?: string, path?: string }>} */ ([]),
     // Inline ES-module graph inlining (e.g. Mermaid's `/design/...` entry + its ./chunks tree). Each
     // reachable module is base64'd ONCE into a `data:text/javascript` URL, and every import specifier
     // is rewritten to a stable bare id resolved through a single injected `<script type="importmap">`.
@@ -3392,7 +3395,7 @@ async function readBudgeted(descriptor, ref, ctx, options = {}) {
   const countBytes = options.countBytes !== false;
   const remainingBundleBytes = ctx.maxBundleBytes - ctx.inlinedBytes;
   if (remainingBundleBytes <= 0) {
-    ctx.warnings.push({ kind: "too-large", ref, reason: `would exceed per-bundle cap ${ctx.maxBundleBytes}` });
+    ctx.warnings.push(tooLargeWarning(descriptor, ref, `would exceed per-bundle cap ${ctx.maxBundleBytes}`));
     return null;
   }
   let buffer;
@@ -3409,26 +3412,43 @@ async function readBudgeted(descriptor, ref, ctx, options = {}) {
     if (error && error.code === "OUTSIDE_ROOT") {
       ctx.warnings.push({ kind: "outside-root", ref });
     } else if (error && error.code === "TOO_LARGE") {
-      ctx.warnings.push({ kind: "too-large", ref, reason: error instanceof Error ? error.message : String(error) });
+      ctx.warnings.push(tooLargeWarning(descriptor, ref, error instanceof Error ? error.message : String(error)));
     } else {
       ctx.warnings.push({ kind: "load-failed", ref, reason: error instanceof Error ? error.message : String(error) });
     }
     return null;
   }
   if (buffer.length > ctx.maxAssetBytes) {
-    ctx.warnings.push({
-      kind: "too-large",
-      ref,
-      reason: `${buffer.length} bytes exceeds per-asset cap ${ctx.maxAssetBytes}`,
-    });
+    ctx.warnings.push(
+      tooLargeWarning(descriptor, ref, `${buffer.length} bytes exceeds per-asset cap ${ctx.maxAssetBytes}`),
+    );
     return null;
   }
   if (countBytes && ctx.inlinedBytes + buffer.length > ctx.maxBundleBytes) {
-    ctx.warnings.push({ kind: "too-large", ref, reason: `would exceed per-bundle cap ${ctx.maxBundleBytes}` });
+    ctx.warnings.push(tooLargeWarning(descriptor, ref, `would exceed per-bundle cap ${ctx.maxBundleBytes}`));
     return null;
   }
   if (countBytes) ctx.inlinedBytes += buffer.length;
   return buffer;
+}
+
+// A too-large warning carries the resolved local path so a caller can deliver the file another
+// way; design assets mapped from outside the artifact directory carry no path because no
+// site-relative reference can reach them.
+function tooLargeWarning(descriptor, ref, reason) {
+  const warning = { kind: "too-large", ref, reason };
+  if (descriptor && descriptor.path && !descriptor.allowOutsideRoot) warning.path = descriptor.path;
+  return warning;
+}
+
+/**
+ * Read a local file with the same real-path confinement the default bundler read applies, and
+ * no size caps, for callers that deliver a file the bundle left as a reference.
+ * @param {string} absPath
+ * @param {string | null} confineDir
+ */
+export function readConfinedFile(absPath, confineDir) {
+  return guardedRead(absPath, confineDir);
 }
 
 // Default local read: resolve the real (symlink-followed) path and refuse to read anything that
