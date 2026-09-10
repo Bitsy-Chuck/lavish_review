@@ -36,7 +36,7 @@ export function sanitizeExportText(value, terms = []) {
     )
     .replace(/(?:https?:\/\/|file:\/\/|www\.)[^\s<>"'`\\)]+/gi, "[URL removed]")
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, REDACTED)
-    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, REDACTED)
+    .replace(/\b(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi, REDACTED)
     .replace(/(?:\/(?:home|Users|private|tmp|mnt|var)\/|[A-Z]:\\Users\\)[^\s<>"'`]+/gi, "[path removed]")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, "[address removed]")
     .replace(PROVIDERS, "service")

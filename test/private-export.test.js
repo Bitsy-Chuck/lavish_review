@@ -45,6 +45,21 @@ test("private export blocks external dependencies without fetching them", async 
   assert.ok(warnings.some((w) => w.kind === "privacy-removed-resource"));
 });
 
+test("private export removes compact job IDs from text and JSON downloads", async (t) => {
+  const root = await fixture(t);
+  const jobId = "307fa0d0cfca43769827d20a10a29245";
+  const job = { job_id: jobId, status: "running", seed: 95075118, duration: 25 };
+  await writeFile(path.join(root, "job.json"), JSON.stringify(job));
+  const source = `<p>App job: ${jobId}</p><a href="job.json" download>Job</a>`;
+  const { html } = await buildPrivateExportHtml(source, { baseDir: root, confineDir: root });
+  assert.ok(!html.includes(jobId));
+  const decoded = JSON.parse(
+    Buffer.from(html.match(/data:application\/json;base64,([^"\s]+)/)[1], "base64").toString(),
+  );
+  assert.deepEqual(decoded, { ...job, job_id: "[redacted]" });
+  assert.deepEqual(JSON.parse(await readFile(path.join(root, "job.json"), "utf8")), job);
+});
+
 test("private export sanitizes JSON data URIs and embedded text", async () => {
   const payload = Buffer.from(
     JSON.stringify({
