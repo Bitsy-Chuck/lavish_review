@@ -117,7 +117,7 @@ export function isNativeInteractiveControl(el) {
     el &&
     el.closest &&
     el.closest(
-      "button,input,select,textarea,option,optgroup,label,summary,[contenteditable]:not([contenteditable='false'])",
+      "button,input,select,textarea,option,optgroup,label,summary,a[download],[contenteditable]:not([contenteditable='false'])",
     )
   );
 }
@@ -1658,6 +1658,20 @@ export function createArtifactSdk(
     testHooks.handleWhiteboardControl = handleWhiteboardControl;
     return;
   }
+
+  document.addEventListener(
+    "click",
+    (event) => {
+      if (!(event.target instanceof Element)) return;
+      const link = /** @type {HTMLAnchorElement | null} */ (event.target.closest("a[download]"));
+      if (!link || typeof link.href !== "string") return;
+      const target = new URL(link.href, window.location.href);
+      if (target.origin !== window.location.origin || !target.pathname.startsWith("/artifact/")) return;
+      target.searchParams.set("download", "1");
+      link.href = target.href;
+    },
+    true,
+  );
 
   /** @type {Window & { lavish?: unknown }} */ (window).lavish = {
     queuePrompt,

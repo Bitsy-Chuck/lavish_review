@@ -342,7 +342,7 @@ test("artifact SDK lets disclosure controls handle their own clicks", () => {
   );
   const clickHandler = js.slice(js.indexOf('"click"'), js.indexOf("setAnnotationMode", js.indexOf('"click"')));
 
-  assert.match(js, /button,input,select,textarea,option,optgroup,label,summary,\[contenteditable\]/);
+  assert.match(js, /button,input,select,textarea,option,optgroup,label,summary,a\[download\],\[contenteditable\]/);
   assert.doesNotMatch(js, /summary,details,\[contenteditable\]/);
   assert.doesNotMatch(nativeInteractive, /matches\(["']details["']\)/);
   assert.match(js, /isInteractiveControl\(event\.target\)/);
@@ -1207,6 +1207,11 @@ test("/artifact serves files copied under the artifact directory", async () => {
     assert.equal(svg.status, 200);
     assert.match(svg.headers.get("content-type") || "", /image\/svg\+xml/);
     assert.match(await svg.text(), /<svg/);
+    assert.equal(svg.headers.get("content-disposition"), null);
+    const download = await fetch(`${base}/artifact/${session.key}/assets/icon.svg?download=1`);
+    assert.equal(download.status, 200);
+    assert.match(download.headers.get("content-disposition") || "", /attachment; filename="icon.svg"/);
+    assert.match(await download.text(), /<svg/);
   } finally {
     await server.close();
     await rm(parent, { recursive: true, force: true });
@@ -1725,7 +1730,7 @@ test("export warns for unresolvable local imports nested inside an inlined modul
   }
 });
 
-test("GET /api/:key/export inlines local assets and leaves remote references intact", async () => {
+test("GET /api/:key/export embeds local assets and removes external references", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await writeFile(
@@ -1735,7 +1740,13 @@ test("GET /api/:key/export inlines local assets and leaves remote references int
       `<body><img src="pic.png"><h1>Hi</h1><script src="/sdk.js?key=stale"></script></body></html>`,
   );
   await writeFile(path.join(dir, "local.css"), ".btn{color:green}");
-  await writeFile(path.join(dir, "pic.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  await writeFile(
+    path.join(dir, "pic.png"),
+    Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    ),
+  );
 
   const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
   try {
@@ -1753,11 +1764,11 @@ test("GET /api/:key/export inlines local assets and leaves remote references int
     const body = await exportRes.text();
     // local stylesheet + image inlined
     assert.match(body, /<style>\.btn\{color:green\}<\/style>/);
-    assert.match(body, /<img src="data:image\/png;base64,iVBORw==">/);
+    assert.match(body, /<img src="data:image\/png;base64,[A-Za-z0-9+/=]+">/);
     // injected SDK stripped
     assert.doesNotMatch(body, /sdk\.js/);
-    // remote stylesheet left intact (not fetched/inlined)
-    assert.match(body, /<link rel="stylesheet" href="https:\/\/cdn\.example\/app\.css">/);
+    // External references are removed without fetching them.
+    assert.doesNotMatch(body, /cdn\.example/);
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
@@ -1784,7 +1795,7 @@ test("GET /api/:key/export sends a safe download filename header", async () => {
     assert.equal(exportRes.status, 200);
     assert.equal(
       exportRes.headers.get("content-disposition"),
-      "attachment; filename=\"r_sum_ draft.export.html\"; filename*=UTF-8''r%C3%A9sum%C3%A9%20draft.export.html",
+      "attachment; filename=\"artifact.export.html\"; filename*=UTF-8''artifact.export.html",
     );
   } finally {
     await server.close();
@@ -1812,9 +1823,9 @@ test("GET /api/:key/export reports unresolved local asset warning count", async 
 
     assert.equal(exportRes.status, 200);
     assert.equal(exportRes.headers.get("x-lavish-export-warning-count"), "1");
-    assert.equal(exportRes.headers.get("x-lavish-export-notice-count"), "0");
+    assert.equal(exportRes.headers.get("x-lavish-export-notice-count"), "1");
     assert.equal(exportRes.headers.get("x-lavish-export-warnings"), null);
-    assert.match(body, /<img src="missing\.png">/);
+    assert.match(body, /<img src="about:blank">/);
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });

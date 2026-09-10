@@ -711,6 +711,7 @@ function matchesSelector(el, selector) {
     return matchesSelector(el, ".mermaid") || el.getAttribute("data-lavish-mermaid") !== null;
   }
   if (selector === "[data-lavish-ui]") return el.getAttribute("data-lavish-ui") !== null;
+  if (selector === "a[download]") return el.tagName.toLowerCase() === "a" && el.getAttribute("download") !== null;
   if (selector === "form" || selector === "fieldset") return el.tagName.toLowerCase() === selector;
   if (selector === "[data-lavish-question]") return el.getAttribute("data-lavish-question") !== null;
   if (selector === "[contenteditable]:not([contenteditable='false'])") {
@@ -733,6 +734,13 @@ test("isNativeInteractiveControl leaves details body descendants annotatable", (
   assert.equal(isNativeInteractiveControl(details), false);
   assert.equal(isNativeInteractiveControl(bodyText), false);
   assert.equal(isNativeInteractiveControl(bodyLink), false);
+});
+
+test("download links remain usable while annotation is enabled", () => {
+  const icon = node("span");
+  const link = node("a", { href: "request.json", download: "" }, [icon]);
+  assert.equal(isNativeInteractiveControl(link), true);
+  assert.equal(isNativeInteractiveControl(icon), true);
 });
 
 test("isNativeInteractiveControl allows details as a text selection ancestor", () => {

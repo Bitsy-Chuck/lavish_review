@@ -719,8 +719,8 @@ test("export output reports the written file and reassures it needs no server", 
   assert.equal(output.export.output, "/tmp/report.export.html");
   assert.equal(output.export.unresolved_local_assets, 0);
   assert.equal(output.export.bytes, Buffer.byteLength("<html></html>"));
-  assert.match(output.next_step, /no Lavish server/);
-  assert.match(output.next_step, /remote CDN\/font references are left as links/);
+  assert.match(output.next_step, /sanitized copy offline/);
+  assert.match(output.next_step, /external references are removed/);
 });
 
 test("export output surfaces local assets that could not be inlined", () => {
@@ -792,11 +792,11 @@ test("export command writes a portable HTML file next to the artifact", async ()
     );
 
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /report\.export\.html/);
-    const exported = await readFile(`${dir}/report.export.html`, "utf8");
-    // local stylesheet inlined; remote stylesheet left as a link; SDK stripped
+    assert.match(result.stdout, /artifact\.export\.html/);
+    const exported = await readFile(`${dir}/artifact.export.html`, "utf8");
+    // Local CSS is embedded. External resources and the SDK are removed.
     assert.match(exported, /<style>\.btn\{color:rebeccapurple\}<\/style>/);
-    assert.match(exported, /<link rel="stylesheet" href="https:\/\/cdn\.example\/app\.css">/);
+    assert.doesNotMatch(exported, /cdn\.example/);
     assert.doesNotMatch(exported, /sdk\.js/);
   } finally {
     await rm(dir, { force: true, recursive: true });

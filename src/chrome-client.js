@@ -919,8 +919,7 @@ function copyDomSnapshot() {
 }
 
 function exportFileName() {
-  const base = (filePath.split(/[\\/]/).pop() || "artifact.html").replace(/\.html?$/i, "");
-  return (base || "artifact") + ".export.html";
+  return "artifact.export.html";
 }
 
 function setExportLabel(text) {

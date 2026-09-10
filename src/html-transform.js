@@ -1,4 +1,4 @@
-import { parse } from "parse5";
+import { Parser, defaultTreeAdapter } from "parse5";
 
 import { LAYOUT_SAFETY_CSS_SNIPPET, LAYOUT_SAFETY_OPT_OUT_ATTRIBUTE } from "./design-reference.js";
 
@@ -125,7 +125,13 @@ function documentStructure(source) {
   // parse5 treats a leading BOM as a body text token. Replace only that code point with ordinary
   // HTML whitespace so source offsets stay exact while the explicit html/head structure is parsed.
   const parseSource = source.startsWith("\uFEFF") ? ` ${source.slice(1)}` : source;
-  const document = parse(parseSource, { sourceCodeLocationInfo: true, scriptingEnabled: true });
+  const parser = new Parser({ sourceCodeLocationInfo: true, scriptingEnabled: true, treeAdapter: defaultTreeAdapter });
+  // Only the head is needed. Do not tokenize large embedded videos in the body.
+  for (let offset = 0; offset < parseSource.length; offset += 4096) {
+    parser.tokenizer.write(parseSource.slice(offset, offset + 4096), offset + 4096 >= parseSource.length);
+    if (parser.headElement && !parser.openElements.items.includes(parser.headElement)) break;
+  }
+  const document = parser.document;
   const html = document.childNodes.find((node) => "tagName" in node && node.tagName === "html");
   const headNode = html && "childNodes" in html ? html.childNodes.find((node) => node.nodeName === "head") : undefined;
   // A node named "head" is always an element, but `find` widens to ChildNode - narrow it back before

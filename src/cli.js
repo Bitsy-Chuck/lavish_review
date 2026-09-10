@@ -15,12 +15,8 @@ import {
   RESPONSIVE_LAYOUT_RULES,
   WRITING_STYLE_RULES,
 } from "./design-reference.js";
-import {
-  buildSelfContainedHtml,
-  exportFileName,
-  exportWarningSummaries,
-  splitExportWarnings,
-} from "./export-bundle.js";
+import { exportFileName, exportWarningSummaries, splitExportWarnings } from "./export-bundle.js";
+import { buildPrivateExportHtml } from "./private-export.js";
 import {
   formatMegabytes,
   HTML_APP_MAX_ASSET_BYTES,
@@ -134,7 +130,7 @@ export function createHomeOutput({ bin, sessions, includeSessions = true }) {
       "Run `lavish-axi poll <html-file>` to wait for user feedback or browser-reported layout_warnings. It long-polls and stays silent until the user sends feedback, ends the session, or the real browser reports fresh layout_warnings, so leave it running - never kill it. Fix and re-check fresh error-severity layout_warnings before involving the human; if the poll says every current warning is persistent or low-severity, proceed with a note instead of looping. If your harness limits how long a foreground command may run, run the poll as a background task; if it gets killed or times out anyway, just re-run it - queued feedback is never lost. When it reports the session ended, stop polling and do not reopen it uninvited - deliver remaining updates in this conversation instead",
       'Rendered Mermaid diagrams in `.mermaid` containers become embedded, editable Excalidraw whiteboards in the browser (click a diagram to unlock editing; a Fullscreen action opens it over the whole viewport) - flowchart, sequence, class, ER, and state diagrams convert to editable shapes; other types embed as an image to draw on. Scenes autosave locally; when a reload detects a changed Mermaid source, the reviewer explicitly chooses to re-convert and discard saved edits or keep editing the saved scene. Standalone and exported copies still render plain Mermaid. Queue feedback adds a prompt to the Conversation panel; when the user sends it, poll returns a tag "whiteboard" prompt carrying a bounded edit summary plus local scenePath (.excalidraw JSON) and previewPath (PNG) files - read the summary first, open the files only when needed, then apply the edits by updating the Mermaid source in the artifact (never try to write the scene back). Agents can also author free-draw whiteboards directly - UI mockups, wireframes, arbitrary shapes: a `.lavish-sketch` container with Excalidraw scene JSON in a `script[type="application/lavish-sketch+json"]` child becomes the same editable whiteboard, and its non-script content is the fallback shown by standalone and exported copies. See `lavish-axi playbook sketch` before authoring one',
       "Run `lavish-axi end <html-file>` to end a session as the agent - ending it this way still allows a plain reopen later. When the user ends it from the browser instead, a later `lavish-axi <html-file>` refuses to reopen it without `--reopen`",
-      "Run `lavish-axi export <html-file> [--out <path>]` to write a portable copy of the artifact - one HTML file with its LOCAL assets inlined - so it opens with no Lavish server and no sibling files. Remote CDN/font references are left as links, so it needs network to render those. Users can also export from the browser chrome's overflow menu",
+      "Run `lavish-axi export <html-file> [--out <path>]` to write a sanitized offline copy. Local media and downloadable files are embedded. Recognized credentials, service identifiers, local paths, external URLs, and supported media metadata are removed. Use export redaction markers for private names and visible media details. Users can also export from the browser chrome's overflow menu",
       `Run \`lavish-axi share <html-file> [--password <pw>] [--token <t>]\` to publish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and get back a visitable URL. Shares are PUBLIC by default, so anyone with the link can open them. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Local assets are inlined while they fit and uploaded as separate site files when they do not; remote refs load over the network. ${SHARE_LIMITS_HINT} It returns the url plus a secret update_key for managing the page later; uploaded_assets and unresolved_local_assets list what was uploaded and what could not be hosted. Use --token or LAVISH_AXI_HTML_APP_TOKEN only when you have an optional bearer token; it is never required. Users can also publish from the browser chrome's overflow menu`,
       "Run `lavish-axi stop` to shut down the background server (it also self-stops when idle or after the last session ends with nothing connected)",
       `Run \`lavish-axi playbook <playbook_id>\` for focused artifact guidance. ${PLAYBOOK_ROUTER_HELP}`,
@@ -392,10 +388,7 @@ async function endCommand(args) {
   return { session: { file: absolute, status: response.status || "ended" } };
 }
 
-// Produce a portable copy of an artifact: one HTML file with its LOCAL assets (relative-path
-// stylesheets, scripts, images, fonts) inlined as data URIs. Remote CDN/font references are left
-// as-is for the browser to load, so the export needs network to render those. Lavish makes no
-// outbound requests - export is a pure local file transform, server-independent.
+// Build the same sanitized offline document as the browser Export button.
 async function exportCommand(args) {
   const file = firstPositionalArg(args, ["--out"]);
   if (!file) {
@@ -404,9 +397,9 @@ async function exportCommand(args) {
   await assertHtmlFile(file);
   const absolute = await canonicalFile(file);
   const root = path.dirname(absolute);
-  const output = path.resolve(flagValue(args, "--out") || path.join(root, exportFileName(absolute)));
+  const output = path.resolve(flagValue(args, "--out") || path.join(root, exportFileName("artifact.html")));
   const source = await readFile(absolute, "utf8");
-  const { html, warnings } = await buildSelfContainedHtml(source, {
+  const { html, warnings } = await buildPrivateExportHtml(source, {
     baseDir: root,
     confineDir: root,
     resolveAbsolute: resolveDesignAssetPath,
@@ -432,11 +425,11 @@ export function createExportOutput({ source, output, html, warnings }) {
   if (notices.length) result.notices = exportWarningSummaries(notices);
   if (unresolved.length) {
     result.next_step =
-      "Some LOCAL assets could not be inlined and were left as references (see unresolved_local_assets); they will break once the file is moved. Remote CDN/font references are intentionally left as links and render where there is network access.";
+      "Some LOCAL assets could not be inlined and were removed (see unresolved_local_assets). Review the sanitized copy before sharing.";
   } else if (notices.length) {
-    result.next_step = `Wrote ${output} with export notices (see notices). Open it directly or host it anywhere - it needs no Lavish server. Local assets are inlined; remote CDN/font references are left as links, so it needs network to render those.`;
+    result.next_step = `Wrote ${output} with export notices (see notices). Open the sanitized copy offline. Local attachments are embedded; external references are removed. Review visible media before sharing.`;
   } else {
-    result.next_step = `Wrote ${output}. Open it directly or host it anywhere - it needs no Lavish server. Local assets are inlined; remote CDN/font references are left as links, so it needs network to render those.`;
+    result.next_step = `Wrote ${output}. Open the sanitized copy offline. Local attachments are embedded; external references are removed. Review visible media before sharing.`;
   }
   return result;
 }
@@ -1048,8 +1041,8 @@ const COMMAND_HELP = {
   open: `Usage: lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n\nOpen or resume a Lavish Editor review session for an HTML artifact. Use --no-open when you need to ensure the server/session exists without opening another browser window. Use --no-gate to skip the open-time layout curtain for this browser open. If the user explicitly ended the session from the browser, this refuses to reopen it and returns guidance instead - pass --reopen to force it open when the user asks for further review or something important needs their visual attention. Sessions ended by the agent (\`lavish-axi end\`) reopen normally without the flag.\n`,
   poll: `Usage: lavish-axi poll <html-file> [--agent-reply "..."]\n\nThis command long-polls indefinitely for queued user prompts and browser-reported layout_warnings, then returns them to the agent. It stays silent while it waits - that is normal, never kill it. Fix and re-check fresh error-severity layout_warnings before involving the human; persistent or low-severity findings may be surfaced with a note when the cause is not obvious. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. If your harness limits how long a foreground command may run, run the poll as a background task and wait for it to finish; if it still gets killed or times out, just re-run it - queued feedback is never lost. Use --agent-reply after applying prior feedback to display your response in Lavish Editor before waiting again. When status is ended, stop polling and do not reopen the session uninvited - deliver remaining updates directly in this conversation instead.\n`,
   end: `Usage: lavish-axi end <html-file>\n\nEnd a Lavish Editor session as the agent. A session ended this way still reopens normally on the next \`lavish-axi <html-file>\`, unlike a user ending it from the browser, which requires --reopen.\n`,
-  export: `Usage: lavish-axi export <html-file> [--out <path>]\n\nWrite a portable copy of an artifact: one HTML file with its LOCAL assets inlined (relative-path stylesheets, scripts, images, and fonts become inline <style>/<script> blocks and data URIs). Remote CDN/font references (https URLs) are left as links for the browser to load, so the file needs network to render those. Lavish makes no outbound requests - it only reads local files, confined to the artifact's directory. Defaults to writing <name>.export.html next to the source; pass --out to choose a path. The Lavish annotation SDK is never included in an export.\n`,
-  share: `Usage: lavish-axi share <html-file> [--password <pw>] [--token <t>]\n\nPublish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and print a visitable URL. Shares are PUBLIC by default: anyone with the link can open the page, and it may be indexed or scraped. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Inlines local assets the way 'export' does while they fit ht-ml.app's page cap, POSTs the page to ht-ml.app's /v1 API, then uploads the local files that did not fit as separate site assets. ${SHARE_LIMITS_HINT} Remote CDN/font URLs are left as links; they are not blocked by CSP on ht-ml.app, but still load over the viewer's network. Creating a site needs no account or API key. The response includes the url plus a secret update_key (shown once) for updating or deleting the page later, uploaded_assets, and unresolved_local_assets. Set LAVISH_AXI_HTML_APP_TOKEN (or pass --token) to attach an optional bearer token; it is never required. The annotation SDK is never included.\n`,
+  export: `Usage: lavish-axi export <html-file> [--out <path>]\n\nWrite a sanitized offline HTML copy. Embed local media and downloadable files. Remove recognized credentials, service identifiers, request IDs, local paths, external references, and supported media metadata. No remote resources are fetched. Defaults to artifact.export.html; pass --out to choose a path. The source remains unchanged. Use data-export-private, a lavish-export-redact JSON meta list, and data-export-src or data-export-href alternatives for private content. Automatic rules cannot identify every name or visible detail; review the export before sharing.\n`,
+  share: `Usage: lavish-axi share <html-file> [--password <pw>] [--token <t>]\n\nPublish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and print a visitable URL. Shares are PUBLIC by default: anyone with the link can open the page, and it may be indexed or scraped. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Publishes the source without export sanitization. Export first and share that file for a sanitized publication. Inlines local assets while they fit ht-ml.app's page cap, POSTs the page to ht-ml.app's /v1 API, then uploads the local files that did not fit as separate site assets. ${SHARE_LIMITS_HINT} Remote CDN/font URLs are left as links; they are not blocked by CSP on ht-ml.app, but still load over the viewer's network. Creating a site needs no account or API key. The response includes the url plus a secret update_key (shown once) for updating or deleting the page later, uploaded_assets, and unresolved_local_assets. Set LAVISH_AXI_HTML_APP_TOKEN (or pass --token) to attach an optional bearer token; it is never required. The annotation SDK is never included.\n`,
   stop: `Usage: lavish-axi stop [--port <port>]\n\nShut down the background Lavish Editor server. The server also stops itself when no browser or poll has been connected for a while (LAVISH_AXI_IDLE_TIMEOUT_MS, default 30m) and immediately when the last session ends with nothing connected.\n`,
   playbook: `Usage: lavish-axi playbook [playbook_id]\n\nList focused artifact guidance playbooks, or show one playbook by ID. Known IDs: diagram, table, comparison, plan, code, input, slides.\n\n${PLAYBOOK_ROUTER_HELP}\n\nExamples:\n  lavish-axi playbook\n  lavish-axi playbook diagram\n  lavish-axi playbook input\n`,
   design: `Usage: lavish-axi design\n\nShow a copy-pasteable local design snippet for Tailwind CSS browser runtime v4 + DaisyUI v5 + themes, Mermaid diagram tooling, a content-to-playbook router, an optional layout safety CSS snippet, plus technical reference for DaisyUI components. These assets are vendored and served locally from Lavish's /design/ routes - no CDN, no network egress. ${PLAYBOOK_ROUTER_HELP} Lavish artifacts stay portable HTML. This local design snippet is the design fallback, not the default: inspect the subject project before falling back, and paste the layout safety CSS only when useful for dense nested grid/flex layouts, badges, wide fonts, or local media. ${DESIGN_PRIORITY_RULE}\n`,

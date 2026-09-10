@@ -104,16 +104,17 @@ Staleness is hash-based (`mermaidSourceHash`): a live reload that changes the di
 "Queue feedback" exports the scene and a PNG server-side (`POST .../feedback-files`), then queues a normal prompt with `tag: "whiteboard"` and an `excalidraw-scene` target carrying a bounded edit summary (diffed from the conversion baseline by `summarizeSceneEdits` in `src/whiteboard-core.js` using the stable ids), local `scenePath`/`previewPath`, `sourceHash`, and bounded stats; poll guidance tells the agent to read the summary first and update the Mermaid source, never the scene file.
 The Mermaid source in the artifact stays authoritative; there is no scene→Mermaid reverse conversion.
 
-### Export (local-asset inlining)
+### Private export and asset bundling
 
-`src/export-bundle.js` (`buildSelfContainedHtml`) inlines only an artifact's **local** assets: local stylesheets/classic scripts become inline `<style>`/`<script>`, and local images/fonts/icons, confined fetchable `file://` refs, and CSS `url(...)`/`@import` become data URIs (recursively, resolved relative to each stylesheet).
-Remote references are deliberately left as links; the user-facing contract, including the size-cap env vars and their defaults, lives in README's Export and sharing bullet.
-The transform makes **no outbound requests** (no fetching, no SSRF); its only security surface is local file reading, which is confined to the artifact directory both lexically (`confineDir`) and by **real-path/symlink resolution** in the default `readLocalFile` (`guardedRead`), so a symlink inside the directory can't exfiltrate an outside file (e.g. `~/.ssh/id_rsa`) into a shared bundle.
-Absolute `file://` paths in non-inlined regions are redacted to `about:blank` so local paths do not leak into exports or hosted shares; the injected Lavish SDK is stripped; in-document fragment refs (`#a`, encoded `%23a`) are left alone; and inlined `</script>`/`</style>` are escaped so they can't break out.
-The transform records `warnings` rather than failing, split into unresolved local assets (such as `load-failed`, `outside-root`, `too-large`, or unsupported local references left external) and notices (such as `csp-meta` or `file-url-redacted`).
-It is dependency-injectable (`readLocalFile`, `resolveAbsolute`, `confineDir`, size caps) so it is testable without disk; the server passes `resolveAbsolute: resolveDesignAssetPath` to inline legacy `/design/*` references from the packaged assets.
-The chrome's **Export standalone HTML** overflow-menu item `GET`s `/api/:key/export`; the CLI exposes the same transform as `lavish-axi export`, server-independently.
-Lavish itself sets **no** `Content-Security-Policy` on any response (the sandboxed iframe relies on the `sandbox` attribute, not CSP), but author-set CSP meta tags are preserved and reported as export notices because they may still block exported inline assets.
+`src/private-export.js` owns default export sanitization. Browser and CLI exports call `buildPrivateExportHtml`; neither exposes an opt-out.
+It applies explicit redaction terms and media alternatives, bundles confined local attachments, then sanitizes text, data URIs, and supported media metadata.
+Private originals must never be replaced by sanitized copies. Alternate export assets use the same real-path confinement guard.
+Large embedded media is masked before HTML parsing. Head inspection stops after the head closes, so video payloads cannot exhaust the parser heap.
+Download anchors bypass annotation and exported downloads use local Blob URLs.
+The privacy rules, limitations, markers, and size limits are owned by README's Private offline export section.
+`src/export-bundle.js` remains the generic local-asset bundler used by hosted sharing. It makes no outbound requests.
+Private exports enable local anchor inlining; generic shares retain their existing remote-reference behavior.
+Author-set CSP meta tags remain preserved and reported because they can block inline export resources. Lavish sets no response CSP.
 
 ### Hosted sharing (ht-ml.app)
 

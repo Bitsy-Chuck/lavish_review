@@ -43,6 +43,9 @@ const EXT_MIME = {
   ".vtt": "text/vtt",
   ".json": "application/json",
   ".txt": "text/plain",
+  ".sh": "text/plain",
+  ".csv": "text/csv",
+  ".md": "text/markdown",
   ".pdf": "application/pdf",
 };
 
@@ -124,6 +127,7 @@ const UNRESOLVED_LOCAL_ASSET_WARNING_KINDS = new Set([
  * @param {number} [options.maxAssetBytes] Per-asset inline cap; larger local files are left as references with a warning.
  * @param {number} [options.maxBundleBytes] Per-bundle inline cap across all inlined local assets.
  * @param {number} [options.maxDepth] Local stylesheet-import recursion guard.
+ * @param {boolean} [options.inlineDownloads] Inline local anchor targets for portable downloads.
  * @returns {Promise<{ html: string, warnings: Array<{ kind: string, ref: string, reason?: string, path?: string }> }>}
  */
 export async function buildSelfContainedHtml(html, options = {}) {
@@ -148,6 +152,7 @@ export async function buildSelfContainedHtml(html, options = {}) {
     ),
     maxDepth: Number.isFinite(options.maxDepth) ? options.maxDepth : DEFAULT_MAX_DEPTH,
     inlinedBytes: 0,
+    inlineDownloads: options.inlineDownloads === true,
     // `path` is set on too-large warnings: the resolved local file the caller may deliver another
     // way (hosted shares upload it as a separate site asset). Output summaries never expose it.
     warnings: /** @type {Array<{ kind: string, ref: string, reason?: string, path?: string }>} */ ([]),
@@ -578,6 +583,9 @@ async function transformStartTag(tag, attrs, selfClosing, baseDir, ctx, parentTa
   let next = attrs;
   if (inHtmlNamespace && MEDIA_TAGS.has(tagName)) {
     next = await inlineMediaAttrs(tagName, next, baseDir, ctx, parentTag);
+  }
+  if (inHtmlNamespace && tagName === "a" && ctx.inlineDownloads) {
+    next = await inlineAttr(next, "href", baseDir, ctx);
   }
   if (SVG_REF_TAGS.has(tagName) && inSvgNamespace) {
     next = await inlineAttr(next, "href", baseDir, ctx);
@@ -3447,8 +3455,8 @@ function tooLargeWarning(descriptor, ref, reason) {
  * @param {string} absPath
  * @param {string | null} confineDir
  */
-export function readConfinedFile(absPath, confineDir) {
-  return guardedRead(absPath, confineDir);
+export function readConfinedFile(absPath, confineDir, readOptions = {}) {
+  return guardedRead(absPath, confineDir, readOptions);
 }
 
 // Default local read: resolve the real (symlink-followed) path and refuse to read anything that

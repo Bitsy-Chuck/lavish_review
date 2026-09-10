@@ -35,12 +35,8 @@ import {
   saveWhiteboard,
   writeWhiteboardFeedbackFiles,
 } from "./whiteboard-store.js";
-import {
-  buildSelfContainedHtml,
-  exportFileName,
-  exportWarningSummaries,
-  splitExportWarnings,
-} from "./export-bundle.js";
+import { exportFileName, exportWarningSummaries, splitExportWarnings } from "./export-bundle.js";
+import { buildPrivateExportHtml } from "./private-export.js";
 import { shareArtifactToHtmlApp } from "./html-app.js";
 import { injectLavishSdk } from "./html-transform.js";
 import { createLayoutWarningRecorder } from "./layout-log.js";
@@ -501,13 +497,13 @@ export async function serve({
       }
       const source = await readFile(session.file, "utf8");
       const root = path.dirname(session.file);
-      const { html, warnings } = await buildSelfContainedHtml(source, {
+      const { html, warnings } = await buildPrivateExportHtml(source, {
         baseDir: root,
         confineDir: root,
         resolveAbsolute: resolveDesignAssetPath,
       });
       const { unresolved, notices } = splitExportWarnings(warnings);
-      res.setHeader("content-disposition", exportContentDisposition(session.file));
+      res.setHeader("content-disposition", exportContentDisposition("artifact.html"));
       res.setHeader("x-lavish-export-warning-count", String(unresolved.length));
       res.setHeader("x-lavish-export-notice-count", String(notices.length));
       res.type("html").send(html);
@@ -792,6 +788,7 @@ export async function serve({
         res.status(403).send("Forbidden");
         return;
       }
+      if (req.query.download === "1") res.attachment(path.basename(file));
       res.sendFile(file, { dotfiles: "allow" });
     } catch (error) {
       next(error);
